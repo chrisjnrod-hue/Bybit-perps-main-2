@@ -43,6 +43,15 @@ async function start() {
     logger.info('Starting app...');
     // init DB
     db.init();
+
+    // Probe Bybit hosts to pick a working base (helps in environments with multiple mirrors)
+    try {
+      const bybitRest = require('./services/bybitRest');
+      await bybitRest.probeHosts(3000);
+    } catch (e) {
+      logger.debug({ e }, 'probeHosts call failed (continuing)');
+    }
+
     // start REST poller (symbol discovery + root seeding)
     poller.start();
     // start websockets manager (batched)
