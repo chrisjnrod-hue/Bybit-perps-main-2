@@ -19,22 +19,36 @@ module.exports = {
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
 
     // Run initial seed/scan flow immediately (non-blocking).
-    this.initialScan()
-      .then(async () => {
-        try {
-          // Immediately run one scan now (will send signals but NOT open trades due to flag above)
-          await this.scanOnce();
-        } catch (err) {
-          logger.error({ err }, 'Immediate scanOnce after initialSeed failed');
+    (async () => {
+      try {
+        logger.info('poller: starting initialScan (deploy-time)');
+        await this.initialScan();
+        logger.info('poller: initialScan complete — checking symbol count before immediate scan');
+
+        const db = dbModule.get();
+        const symCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
+        logger.info({ symCount }, 'poller: symbols table count after initialScan');
+
+        if (symCount === 0) {
+          logger.warn('poller: initialScan found 0 symbols — check bybitRest.fetchAllSymbols connectivity');
+        } else {
+          logger.info('poller: starting immediate scanOnce after initialSeed (signals will be sent, opens remain gated)');
+          try {
+            await this.scanOnce();
+            logger.info('poller: immediate scanOnce completed');
+          } catch (err) {
+            logger.error({ err }, 'poller: immediate scanOnce failed');
+          }
         }
-      })
-      .catch(err => logger.error({ err }, 'initialScan failed'));
+      } catch (err) {
+        logger.error({ err }, 'initialScan failed');
+      }
+    })();
 
     // Scheduling: either aligned-to-5m or interval-based.
     if (config.ROOT_MIDSCAN_INTERVAL === 0) {
       this.scheduleAlignedTo5m();
     } else {
-      // Interval path: run scan every ROOT_MIDSCAN_INTERVAL seconds
       setInterval(() => this.scanOnce(), config.ROOT_MIDSCAN_INTERVAL * 1000);
 
       // Also ensure opening trades is enabled at the next 5-minute boundary
@@ -60,7 +74,10 @@ module.exports = {
   async initialScan() {
     logger.info('Starting initial symbol discovery and seeding root TF klines');
     const all = await bybit.fetchAllSymbols();
-    const usdt = all.filter(s => (s.symbol || '').toUpperCase().endsWith('USDT'));
+    if (!Array.isArray(all) || all.length === 0) {
+      logger.warn('poller.initialScan: fetchAllSymbols returned no symbols (empty array)');
+    }
+    const usdt = (all || []).filter(s => (s.symbol || '').toUpperCase().endsWith('USDT'));
     const filtered = usdt.filter(s => !config.EXCLUDE_STABLES.some(st => (s.symbol || '').includes(st)));
     const db = dbModule.get();
     const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
