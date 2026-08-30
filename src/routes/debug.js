@@ -12,6 +12,9 @@ const router = express.Router();
 const pino = require('pino');
 const logger = pino();
 
+const fs = require('fs');
+const path = require('path');
+
 const dbModule = require('../db'); // do NOT call dbModule.get() here
 const wsManager = require('../services/bybitWs');
 const poller = require('../services/poller');
@@ -144,6 +147,7 @@ router.get('/scan/next', (req, res) => {
 // Trigger a manual full scan once (paginated)
 router.post('/scan', async (req, res) => {
   try {
+    // Ensure DB ready before heavy operations
     getDbOrThrow();
     await poller.scanOnce();
     res.json({ ok: true, message: 'scanOnce executed; check logs for details' });
@@ -161,6 +165,7 @@ router.post('/scan/symbol', async (req, res) => {
     const body = req.body || {};
     const symbol = body.symbol;
     if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required in JSON body' });
+    // poller.scanSymbolRoots should exist in poller module
     if (typeof poller.scanSymbolRoots !== 'function') {
       return res.status(500).json({ ok: false, error: 'poller.scanSymbolRoots not available' });
     }
@@ -225,12 +230,10 @@ router.post('/seed', async (req, res) => {
 });
 
 /*
- * New debug endpoints for Bybit probing diagnostics and reprobe:
- *  - GET /debug/bybit/probe-status  -> returns chosenBase, last probe host/path and response snippet
- *  - POST /debug/bybit/probe        -> triggers a fresh probeHosts(timeoutMs) and returns chosen base
+ * Bybit debug endpoints
  */
 
-// GET probe status
+// GET /debug/bybit/probe-status (existing)
 router.get('/bybit/probe-status', (req, res) => {
   try {
     const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: null };
@@ -241,7 +244,7 @@ router.get('/bybit/probe-status', (req, res) => {
   }
 });
 
-// Trigger reprobe (synchronous - waits for probe to finish)
+// POST /debug/bybit/probe (existing)
 router.post('/bybit/probe', async (req, res) => {
   try {
     const body = req.body || {};
@@ -254,6 +257,69 @@ router.post('/bybit/probe', async (req, res) => {
     res.json({ ok: true, chosenBase: base, probeInfo: info });
   } catch (err) {
     logger.error({ err }, 'bybit/probe handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * NEW: POST /debug/bybit/seed
+ * - Fetches symbols via bybitRest.fetchAllSymbols() (which will fallback to CoinGecko)
+ * - Inserts them into the symbols table (INSERT OR REPLACE)
+ */
+router.post('/bybit/seed', async (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    if (typeof bybitRest.fetchAllSymbols !== 'function') {
+      return res.status(500).json({ ok: false, error: 'bybitRest.fetchAllSymbols not available' });
+    }
+
+    // optional allow passing a source override or limiting count in body (not required)
+    const body = req.body || {};
+    const limit = body.limit && Number.isFinite(Number(body.limit)) ? Number(body.limit) : null;
+
+    const symbols = await bybitRest.fetchAllSymbols();
+    if (!Array.isArray(symbols) || symbols.length === 0) {
+      return res.status(500).json({ ok: false, error: 'fetchAllSymbols returned no symbols' });
+    }
+
+    const toInsert = limit ? symbols.slice(0, limit) : symbols;
+    const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
+    const now = Date.now();
+    const insertMany = db.transaction((rows) => {
+      for (const it of rows) {
+        if (!it || !it.symbol) continue;
+        const base = it.base || String(it.symbol).replace(/USDT$/i, '');
+        const quote = it.quote || 'USDT';
+        insert.run(it.symbol, base, quote, now);
+      }
+    });
+    insertMany(toInsert);
+    logger.info({ count: toInsert.length }, 'bybit/seed: symbols saved into DB');
+    res.json({ ok: true, inserted: toInsert.length });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'bybit/seed handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * NEW: GET /debug/bybit/db-info
+ * - Returns the expected DB path and whether the file exists and its size (helps verify persistence)
+ */
+router.get('/bybit/db-info', (req, res) => {
+  try {
+    // Derive the same default DB path used in db.js:
+    const candidatePath = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'db.sqlite');
+    let stat = null;
+    try {
+      stat = fs.statSync(candidatePath);
+    } catch (e) {
+      stat = null;
+    }
+    res.json({ ok: true, dbPath: candidatePath, exists: !!stat, sizeBytes: stat ? stat.size : 0 });
+  } catch (err) {
+    logger.error({ err }, 'bybit/db-info handler error');
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
