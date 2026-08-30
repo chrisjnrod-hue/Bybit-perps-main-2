@@ -1,3 +1,11 @@
+/**
+ * src/services/poller.js
+ *
+ * - Fast initialScan: persist symbols quickly
+ * - Background concurrent kline seeding for top N symbols
+ * - Non-blocking probe on startup, open-trade gating until first aligned boundary
+ */
+
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
 const config = require('../config');
@@ -5,11 +13,17 @@ const logger = require('pino')();
 const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const marketData = require('./marketData');
-const signalManager = require('./signalManager'); // used to control opening trades
+const signalManager = require('./signalManager');
 
-const limiter = new Bottleneck({ minTime: 100 });
+const limiter = new Bottleneck({ minTime: 50 });
+
+// Configurable environment values (defaults provided)
+const SEED_TOP_SYMBOLS = Number(process.env.SEED_TOP_SYMBOLS || 100);
+const SEED_CONCURRENCY = Number(process.env.SEED_CONCURRENCY || 6);
+const SEED_KLINES_LIMIT = Number(process.env.SEED_KLINES_LIMIT || 200);
 
 let isRunning = false;
+
 module.exports = {
   start() {
     if (isRunning) return;
@@ -18,40 +32,35 @@ module.exports = {
     // Prevent opening trades until we've passed the next aligned 5m boundary.
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
 
-    // Run initial seed/scan flow immediately (non-blocking).
+    // Start host probe in background (do not block startup)
+    try {
+      bybit.probeHosts(3000)
+        .then((base) => {
+          if (base) logger.info({ base }, 'probeHosts completed in background');
+          else logger.warn('probeHosts completed in background with no selected base');
+        })
+        .catch((e) => logger.debug({ e }, 'probeHosts background failure'));
+    } catch (e) {
+      logger.debug({ e }, 'probeHosts startup call failed');
+    }
+
+    // Run initialScan immediately (fast)
     (async () => {
       try {
         logger.info('poller: starting initialScan (deploy-time)');
         await this.initialScan();
-        logger.info('poller: initialScan complete — checking symbol count before immediate scan');
-
-        const db = dbModule.get();
-        const symCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
-        logger.info({ symCount }, 'poller: symbols table count after initialScan');
-
-        if (symCount === 0) {
-          logger.warn('poller: initialScan found 0 symbols — check bybitRest.fetchAllSymbols connectivity');
-        } else {
-          logger.info('poller: starting immediate scanOnce after initialSeed (signals will be sent, opens remain gated)');
-          try {
-            await this.scanOnce();
-            logger.info('poller: immediate scanOnce completed');
-          } catch (err) {
-            logger.error({ err }, 'poller: immediate scanOnce failed');
-          }
-        }
+        logger.info('poller: initialScan completed (fast symbol seed)');
       } catch (err) {
-        logger.error({ err }, 'initialScan failed');
+        logger.error({ err }, 'poller: initialScan failed');
       }
     })();
 
-    // Scheduling: either aligned-to-5m or interval-based.
+    // Scheduling
     if (config.ROOT_MIDSCAN_INTERVAL === 0) {
       this.scheduleAlignedTo5m();
     } else {
       setInterval(() => this.scanOnce(), config.ROOT_MIDSCAN_INTERVAL * 1000);
-
-      // Also ensure opening trades is enabled at the next 5-minute boundary
+      // also enable open trades at next aligned boundary
       const msToNext5 = () => {
         const d = new Date();
         const m = d.getUTCMinutes();
@@ -71,55 +80,93 @@ module.exports = {
     }
   },
 
+  /**
+   * initialScan:
+   * - fetchAllSymbols (Bybit primary, filtered) and persist quickly
+   * - schedule backgroundSeedKlines() to fetch klines concurrently for top N symbols
+   */
   async initialScan() {
-    logger.info('Starting initial symbol discovery and seeding root TF klines');
+    logger.info('Starting initial symbol discovery (fast)');
+
     const all = await bybit.fetchAllSymbols();
     if (!Array.isArray(all) || all.length === 0) {
-      logger.warn('poller.initialScan: fetchAllSymbols returned no symbols (empty array)');
+      logger.warn('poller.initialScan: fetchAllSymbols returned no symbols');
     }
-    const usdt = (all || []).filter(s => (s.symbol || '').toUpperCase().endsWith('USDT'));
-    const filtered = usdt.filter(s => !config.EXCLUDE_STABLES.some(st => (s.symbol || '').includes(st)));
+
+    const filtered = (all || []).filter(s => s && s.symbol);
     const db = dbModule.get();
     const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
     const now = Date.now();
-    for (const s of filtered) {
-      insert.run(s.symbol, s.base || s.symbol.replace(/USDT$/, ''), s.quote || 'USDT', now);
-    }
-    logger.info({ count: filtered.length }, 'Symbols saved');
-
-    for (const s of filtered) {
-      try {
-        await marketData.updateSymbolMarketData(s.symbol);
-      } catch (err) {
-        logger.debug({ err, symbol: s.symbol }, 'marketData update failed during initial seed');
-      }
-    }
-
-    for (const s of filtered) {
-      for (const tf of config.ROOT_TFS) {
-        await this.seedKlinesForSymbol(s.symbol, tf);
-      }
-    }
-    logger.info('Initial seeding complete');
-  },
-
-  async seedKlinesForSymbol(symbol, timeframe) {
-    const interval = timeframe === 'D' ? 'D' : String(timeframe);
-    const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
-    if (!klines || klines.length === 0) return;
-    const db = dbModule.get();
-    const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     const insertMany = db.transaction((rows) => {
-      for (const k of rows) insert.run(symbol, timeframe, k.open_time, k.open, k.high, k.low, k.close, k.volume);
+      for (const s of rows) {
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT$/i, ''), s.quote || 'USDT', now);
+      }
     });
-    insertMany(klines);
+    insertMany(filtered);
+    logger.info({ count: filtered.length }, 'Symbols saved (initialScan)');
+
+    // start background seeding (non-blocking)
+    setImmediate(() => this.backgroundSeedKlines(filtered));
+  },
+
+  /**
+   * backgroundSeedKlines:
+   * - seed klines concurrently for the top SEED_TOP_SYMBOLS symbols
+   * - chunked batching with limiter to avoid bursts
+   */
+  async backgroundSeedKlines(allSymbols) {
     try {
-      await macdUtil.computeAndStoreMacd(symbol, timeframe);
+      if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
+        logger.info('backgroundSeedKlines: no symbols to seed');
+        return;
+      }
+
+      const toSeed = allSymbols.slice(0, SEED_TOP_SYMBOLS);
+      logger.info({ count: toSeed.length, topN: SEED_TOP_SYMBOLS }, 'backgroundSeedKlines: starting seeding for top symbols');
+
+      for (let i = 0; i < toSeed.length; i += SEED_CONCURRENCY) {
+        const batch = toSeed.slice(i, i + SEED_CONCURRENCY);
+        const jobs = batch.map(sym => limiter.schedule(() => this.seedKlinesForSymbol(sym.symbol)));
+        await Promise.all(jobs);
+      }
+
+      logger.info('backgroundSeedKlines: completed top-N seeding');
     } catch (err) {
-      logger.debug({ err }, 'macd compute on seed failed');
+      logger.error({ err }, 'backgroundSeedKlines: error during seeding');
     }
   },
 
+  /**
+   * seedKlinesForSymbol(symbol, timeframe)
+   * - attempts to fetch klines and store them; computes MACD but continues on failure
+   */
+  async seedKlinesForSymbol(symbol, timeframe) {
+    const tfs = timeframe ? [timeframe] : (config.ROOT_TFS || []);
+    for (const tf of tfs) {
+      const interval = tf === 'D' ? 'D' : String(tf);
+      try {
+        const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, SEED_KLINES_LIMIT));
+        if (!klines || klines.length === 0) continue;
+        const db = dbModule.get();
+        const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+        const insertMany = db.transaction((rows) => {
+          for (const k of rows) insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
+        });
+        insertMany(klines);
+        try {
+          await macdUtil.computeAndStoreMacd(symbol, tf);
+        } catch (e) {
+          logger.debug({ e, symbol, tf }, 'MACD compute failed for seed (continuing)');
+        }
+      } catch (err) {
+        logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: failed to fetch klines (skipping)');
+      }
+    }
+  },
+
+  /**
+   * scanOnce: iterate symbols and check for root signals
+   */
   async scanOnce() {
     const db = dbModule.get();
     const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
@@ -130,11 +177,12 @@ module.exports = {
   },
 
   async scanSymbolRoots(symbol) {
-    const tfList = config.ROOT_TFS;
+    const tfList = config.ROOT_TFS || [];
     for (const tf of tfList) {
       const db = dbModule.get();
       const rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
       if (rows.length < 2) {
+        // try to seed quickly for missing tf
         await this.seedKlinesForSymbol(symbol, tf);
         continue;
       }
@@ -170,7 +218,6 @@ module.exports = {
       setTimeout(async () => {
         try {
           await this.scanOnce();
-          // After the first aligned scan has run, enable openings
           if (!firstBoundaryPassed) {
             firstBoundaryPassed = true;
             try {
