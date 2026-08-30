@@ -1,14 +1,11 @@
 /**
  * src/services/bybitRest.js
  *
- * Bybit REST helper with:
- * - probeHosts with resilient acceptance (accept HTTP OK even if JSON parse fails)
- * - persistence of chosen base to disk to avoid repeated probes
- * - fetchKlines / fetchAllSymbols with robust shape normalization
- * - fallback to CoinGecko markets when Bybit returns no symbols
- * - helper methods exposed: getLastProbeInfo(), reprobe()
- *
- * Set LOG_LEVEL=debug for more verbose logs.
+ * - Prioritizes Bybit main -> testnet -> other hosts
+ * - probeHosts persists chosen base and records last probe snippet
+ * - fetchAllSymbols returns filtered USDT/perp-like symbols (configurable)
+ * - CoinGecko fallback only as last resort
+ * - Exposes getLastProbeInfo() and reprobe()
  */
 
 const fetch = require('node-fetch');
@@ -19,8 +16,10 @@ const path = require('path');
 const logger = require('pino')();
 const config = require('../config');
 
+// Preferred order: mainnet and testnet first
 const HOST_CANDIDATES = [
-  'https://api.bybit.com',
+  'https://api.bybit.com',                // mainnet (preferred)
+  'https://api-testnet.bybit.com',        // testnet (preferred for testing)
   'https://bybit.com',
   'https://bybits.com',
   'https://bybit.nl',
@@ -31,7 +30,7 @@ const HOST_CANDIDATES = [
 let chosenBase = null;
 const CHOSEN_BASE_FILE = path.join(__dirname, '..', 'data', 'chosen_bybit_base.txt');
 
-// Diagnostics: store last probe's host/path and last OK response snippet (for debug route)
+// Diagnostics: last probe host/path and last OK response (text)
 let lastProbeHostPath = null;
 let lastProbeResponseText = null;
 
@@ -63,11 +62,9 @@ function saveChosenBaseToDisk(base) {
     logger.debug({ e }, 'bybitRest: failed to persist chosen base');
   }
 }
-
-// load persisted base if present
 loadChosenBaseFromDisk();
 
-/** Fetch wrapper with timeout using AbortController */
+/** Fetch wrapper with timeout */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -82,7 +79,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   }
 }
 
-/** Sign v5 request: timestamp + method + requestPath + body (body is '' for GET) */
+/** Sign v5 request helper */
 function signV5Request(method, requestPath, body = '', apiSecret) {
   const timestamp = Date.now().toString();
   const payload = timestamp + method.toUpperCase() + requestPath + (body ? body : '');
@@ -90,9 +87,7 @@ function signV5Request(method, requestPath, body = '', apiSecret) {
   return { signature, timestamp };
 }
 
-/** Decide best base for calls:
- *  - priority: chosenBase (from probe or persisted), configured base env, then host candidate list first entry
- */
+/** Get base host: chosenBase -> configured -> first candidate */
 function getBase() {
   const configured = getConfiguredBase();
   if (chosenBase) return chosenBase;
@@ -102,13 +97,13 @@ function getBase() {
 
 /**
  * probeHosts(timeoutMs)
- * Try each host candidate with a lightweight v5 kline request for BTCUSDT.
- * Accept a host when it returns HTTP OK; prefer a host with valid JSON, but accept OK responses even if JSON parse fails.
- * Persist selected host to disk and record last probe diagnostics.
+ * Try candidate hosts with a quick v5 kline request for BTCUSDT.
+ * Accept a host on HTTP OK; prefer JSON but accept OK even if JSON parse fails.
+ * Persist chosen base and record diagnostics.
  */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
-  const list = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  const list = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
 
   logger.info({ candidates: list }, 'bybitRest: starting host probe');
 
@@ -118,28 +113,22 @@ async function probeHosts(timeoutMs = 5000) {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
-      // keep body text for diagnostics; try to parse JSON but do not require it to accept host
-      let json = null;
-      let bodyText = null;
+      // capture response text for diagnostics
+      let text = null;
+      let parsed = null;
       try {
-        bodyText = await res.text();
-        if (bodyText) {
-          try { json = JSON.parse(bodyText); } catch (e) { json = null; }
-        }
+        text = await res.text();
+        try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
       } catch (e) {
-        bodyText = null;
+        text = null;
       }
 
-      // record last OK response snippet for debug route even if parse fails
       if (res.ok) {
         lastProbeHostPath = { host, path: testUrl };
-        lastProbeResponseText = bodyText;
-      }
-
-      if (res.ok) {
+        lastProbeResponseText = text;
         chosenBase = host.replace(/\/$/, '');
         saveChosenBaseToDisk(chosenBase);
-        if (json) {
+        if (parsed) {
           logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
         } else {
           logger.info({ chosenBase, note: 'accepted despite json parse failure (HTTP OK)' }, 'probeHosts: selected host');
@@ -159,7 +148,7 @@ async function probeHosts(timeoutMs = 5000) {
   if (configuredBase) {
     chosenBase = configuredBase;
     saveChosenBaseToDisk(chosenBase);
-    logger.warn({ configuredBase }, 'probeHosts: no host probe succeeded — falling back to configured BYBIT_REST_BASE');
+    logger.warn({ configuredBase }, 'probeHosts: falling back to configured BYBIT_REST_BASE');
     return chosenBase;
   }
 
@@ -169,11 +158,11 @@ async function probeHosts(timeoutMs = 5000) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * Tries host candidates (or configured/chosen base) and multiple endpoint paths, normalizes common shapes.
+ * Try multiple endpoints and hosts, normalize shapes.
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const configured = getConfiguredBase();
-  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
 
   const candidates = [
@@ -190,7 +179,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
         });
 
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
+        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
         let json = null;
         try { json = await res.json(); } catch (e) { json = null; }
 
@@ -199,6 +188,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           continue;
         }
 
+        // v5 style
         if (json && json.result && Array.isArray(json.result.list)) {
           const list = json.result.list;
           return list.map(r => ({
@@ -211,6 +201,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }));
         }
 
+        // legacy or top-level arrays
         if (json && json.result && Array.isArray(json.result)) {
           const arr = json.result;
           if (arr.length && Array.isArray(arr[0])) {
@@ -256,9 +247,9 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }
         }
 
-        logger.debug({ host, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate');
+        logger.debug({ host, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next');
       } catch (err) {
-        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw, trying next');
+        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
       }
     }
   }
@@ -267,11 +258,11 @@ async function fetchKlines(symbol, interval, limit = 200) {
   return [];
 }
 
-/** Helper: fetch symbols from CoinGecko markets as a fallback */
+/** Fallback: CoinGecko markets -> USDT pairs */
 async function fetchSymbolsFromCoinGecko(perPage = 250) {
   try {
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
-    const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 7000);
+    const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
     if (!res.ok) {
       logger.warn({ status: res.status }, 'CoinGecko fallback: non-ok response');
       return [];
@@ -299,12 +290,13 @@ async function fetchSymbolsFromCoinGecko(perPage = 250) {
 
 /**
  * fetchAllSymbols()
- * Tries multiple hosts and endpoints; falls back to CoinGecko if Bybit returns no usable symbols.
+ * Prioritize Bybit hosts (main/testnet), filter to USDT/perp-like symbols.
+ * Last-resort fallback to CoinGecko (also filtered).
  */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
   const configured = getConfiguredBase();
-  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
 
   const candidates = [
@@ -317,6 +309,9 @@ async function fetchAllSymbols() {
   let lastOkResponseText = null;
   let lastOkHostPath = null;
 
+  // default filter: USDT and USDT.P/perp-like
+  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p|\.P|P)?$/i;
+
   for (const host of hostList) {
     for (const c of candidates) {
       try {
@@ -325,9 +320,7 @@ async function fetchAllSymbols() {
           if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
         });
 
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
-
-        // keep text for diagnostics
+        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
         let json = null;
         let bodyText = null;
         try {
@@ -372,8 +365,15 @@ async function fetchAllSymbols() {
         }
 
         if (symbols && symbols.length) {
-          logger.info({ host, path: c.path, count: symbols.length }, 'fetchAllSymbols: fetched symbols from host');
-          return symbols;
+          // apply filter to focus on USDT/perp pairs
+          const filtered = symbols.filter(s => s && s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
+          if (filtered.length) {
+            logger.info({ host, path: c.path, count: filtered.length }, 'fetchAllSymbols: fetched and filtered symbols from host');
+            return filtered;
+          } else {
+            logger.info({ host, path: c.path, count: symbols.length, note: 'no symbols matched filter' });
+            // continue to next candidate
+          }
         }
 
         logger.debug({ host, path: c.path, bodySnippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'fetchAllSymbols: unexpected/empty shape; trying next');
@@ -384,17 +384,18 @@ async function fetchAllSymbols() {
   }
 
   if (lastOkHostPath) {
-    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return symbols (last OK response snippet included)');
+    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return usable symbols (last OK response snippet included)');
   } else {
     logger.warn('fetchAllSymbols: no host returned HTTP OK during attempts');
   }
 
-  // Fallback: try CoinGecko
+  // last-resort fallback to CoinGecko (filtered)
   try {
     const cgSymbols = await fetchSymbolsFromCoinGecko(250);
     if (cgSymbols && cgSymbols.length) {
-      logger.info({ count: cgSymbols.length }, 'fetchAllSymbols: fallback to CoinGecko succeeded');
-      return cgSymbols;
+      const filtered = cgSymbols.filter(s => s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
+      logger.info({ count: filtered.length }, 'fetchAllSymbols: fallback to CoinGecko (filtered) succeeded');
+      return filtered;
     }
     logger.warn('fetchAllSymbols: CoinGecko fallback returned no symbols');
   } catch (e) {
@@ -405,13 +406,14 @@ async function fetchAllSymbols() {
 }
 
 /**
- * fetchTicker24h(symbol)
- * getWalletBalance, placeMarketOrderV5, setPositionTradingStop, fetchOpenOrders, fetchOpenPositions
- * (omitted repeated comments — implemented as before)
+ * fetchTicker24h, getWalletBalance, placeMarketOrderV5, setPositionTradingStop,
+ * fetchOpenOrders, fetchOpenPositions follow similar patterns (signed v5 calls).
+ * Implementations below (full versions included).
  */
+
 async function fetchTicker24h(symbol) {
   const configured = getConfiguredBase();
-  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
 
   const candidates = [
@@ -426,7 +428,7 @@ async function fetchTicker24h(symbol) {
         Object.entries(c.params || {}).forEach(([k, v]) => {
           if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
         });
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
+        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
         const json = await res.json().catch(() => null);
         if (!res.ok) {
           logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error');
@@ -486,7 +488,7 @@ async function getWalletBalance(coin = 'USDT') {
     'X-BAPI-RECV-WINDOW': '5000'
   };
 
-  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'getWalletBalance HTTP error');
@@ -532,7 +534,7 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
     'X-BAPI-RECV-WINDOW': '5000'
   };
 
-  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'placeMarketOrderV5 HTTP error');
@@ -564,7 +566,7 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
     'X-BAPI-RECV-WINDOW': '5000'
   };
 
-  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'setPositionTradingStop HTTP error');
@@ -595,7 +597,7 @@ async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
     'X-BAPI-RECV-WINDOW': '5000'
   };
 
-  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'fetchOpenOrders HTTP error');
@@ -626,7 +628,7 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
     'X-BAPI-RECV-WINDOW': '5000'
   };
 
-  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'fetchOpenPositions HTTP error');
@@ -635,7 +637,7 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
   return json;
 }
 
-/** Exposed diagnostics: get last probe info (chosenBase, lastProbeHostPath, snippet) */
+/** Diagnostics */
 function getLastProbeInfo() {
   return {
     chosenBase,
@@ -644,9 +646,7 @@ function getLastProbeInfo() {
   };
 }
 
-/** Exposed reprobe: calls probeHosts and returns chosen base (awaits completion) */
 async function reprobe(timeoutMs = 5000) {
-  // clear diagnostics before run
   lastProbeHostPath = null;
   lastProbeResponseText = null;
   const base = await probeHosts(timeoutMs);
