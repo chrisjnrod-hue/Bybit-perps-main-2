@@ -80,7 +80,6 @@ module.exports = {
     const db = dbModule.get();
     const row = db.prepare('SELECT close FROM klines WHERE symbol=? ORDER BY open_time DESC LIMIT 1').get(symbol);
     if (row) return row.close;
-    // fallback: symbol price in symbols table
     const srow = db.prepare('SELECT price FROM symbols WHERE symbol = ?').get(symbol);
     if (srow && srow.price) return srow.price;
     return 0;
@@ -186,15 +185,15 @@ module.exports = {
     try {
       if (config.OPENTRADE) {
         const resp = await bybit.setPositionTradingStop({ symbol: tradeRow.symbol, stopLoss: newSl });
-        meta.breakeven_applied = meta.breakeven_applied || finalize || true;
-        meta.breakeven_started = meta.breakeven_started || true;
+        meta.breakeven_applied = meta.breakeven_applied || finalize;
+        meta.breakeven_started = true;
         meta.lastBreakevenAt = Date.now();
         meta.lastBreakevenResp = resp;
         db.prepare('UPDATE trades SET sl = ?, meta = ? WHERE id = ?').run(newSl, JSON.stringify(meta), tId);
         logger.info({ tradeId: tId, symbol: tradeRow.symbol, newSl, resp }, 'SL updated on exchange and in DB');
       } else {
-        meta.breakeven_applied = meta.breakeven_applied || finalize || true;
-        meta.breakeven_started = meta.breakeven_started || true;
+        meta.breakeven_applied = meta.breakeven_applied || finalize;
+        meta.breakeven_started = true;
         meta.lastBreakevenAt = Date.now();
         db.prepare('UPDATE trades SET sl = ?, meta = ? WHERE id = ?').run(newSl, JSON.stringify(meta), tId);
         logger.info({ tradeId: tId, symbol: tradeRow.symbol, newSl }, 'Local SL updated (OPENTRADE=false)');
