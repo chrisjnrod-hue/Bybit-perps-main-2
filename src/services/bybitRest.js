@@ -1,26 +1,16 @@
 /**
  * src/services/bybitRest.js
  *
- * Bybit REST helper with:
- * - multi-host resilience (multiple mainnet hosts tried)
- * - startup host probing (optional explicit probeHosts() call)
- * - robust parsing/normalization of kline and symbols responses
- * - v5 signed request helpers for private endpoints (open orders / positions)
+ * Complete Bybit REST helper:
+ *  - probeHosts with resilient acceptance (accept HTTP OK even if JSON parse fails)
+ *  - fetchKlines / fetchAllSymbols with robust shape normalization
+ *  - fetchTicker24h helper
+ *  - v5-signed helpers for wallet, order create, trading-stop, open orders/positions
  *
- * Exports:
- *  - probeHosts(timeoutMs)
- *  - getBase()
- *  - fetchKlines(symbol, interval, limit)
- *  - fetchAllSymbols()
- *  - fetchTicker24h(symbol)
- *  - getWalletBalance(coin)
- *  - placeMarketOrderV5(order)
- *  - setPositionTradingStop(opts)
- *  - fetchOpenOrders({category, symbol})
- *  - fetchOpenPositions({category, symbol})
+ * Set LOG_LEVEL=debug for more verbose logs.
  */
 
-const fetch = require('node-fetch'); // explicit
+const fetch = require('node-fetch');
 const crypto = require('crypto');
 const { URL } = require('url');
 const logger = require('pino')();
@@ -44,6 +34,7 @@ function getConfiguredBase() {
   return String(envBase).replace(/\/$/, '');
 }
 
+/** Fetch wrapper with timeout using AbortController */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -58,6 +49,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   }
 }
 
+/** Sign v5 request: timestamp + method + requestPath + body (body is '' for GET) */
 function signV5Request(method, requestPath, body = '', apiSecret) {
   const timestamp = Date.now().toString();
   const payload = timestamp + method.toUpperCase() + requestPath + (body ? body : '');
@@ -65,6 +57,9 @@ function signV5Request(method, requestPath, body = '', apiSecret) {
   return { signature, timestamp };
 }
 
+/** Decide best base for calls:
+ *  - priority: chosenBase (from probe), configured base env, then host candidate list first entry
+ */
 function getBase() {
   const configured = getConfiguredBase();
   if (chosenBase) return chosenBase;
@@ -87,7 +82,6 @@ async function probeHosts(timeoutMs = 5000) {
     const testUrl = `${host.replace(/\/$/, '')}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=1`;
     try {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
-
       // Log HTTP status so it's visible in logs
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
@@ -135,11 +129,13 @@ async function probeHosts(timeoutMs = 5000) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * Normalizes kline responses across bybit endpoints; tries host candidates with chosenBase prioritized.
+ * Tries host candidates (or configured/chosen base) and multiple endpoint paths, normalizes common shapes.
+ * Returns array of { open_time, open, high, low, close, volume }
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  // If probe chose a base, prioritize it.
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
 
   const candidates = [
@@ -178,7 +174,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }));
         }
 
-        // legacy shapes...
+        // legacy: json.result is array-of-arrays or array-of-objects
         if (json && json.result && Array.isArray(json.result)) {
           const arr = json.result;
           if (arr.length && Array.isArray(arr[0])) {
@@ -202,6 +198,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }
         }
 
+        // top-level array
         if (Array.isArray(json)) {
           if (json.length && Array.isArray(json[0])) {
             return json.map(r => ({
@@ -311,15 +308,267 @@ async function fetchAllSymbols() {
   return [];
 }
 
-/* The rest of the file (fetchTicker24h, getWalletBalance, placeMarketOrderV5, setPositionTradingStop,
-   fetchOpenOrders, fetchOpenPositions) remains unchanged from previous iteration — omitted here for brevity.
-   If you need the complete file including these helper functions I can paste the full file (they were included
-   in previous messages). */
+/**
+ * fetchTicker24h(symbol)
+ * Normalizes ticker shapes from various endpoints.
+ */
+async function fetchTicker24h(symbol) {
+  const configured = getConfiguredBase();
+  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
+
+  const candidates = [
+    { path: '/v5/market/tickers', params: { symbol } },
+    { path: '/v2/public/tickers', params: { symbol } }
+  ];
+
+  for (const host of hostList) {
+    for (const c of candidates) {
+      try {
+        const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
+        Object.entries(c.params || {}).forEach(([k, v]) => {
+          if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+        });
+        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
+        const json = await res.json().catch(() => null);
+        if (!res.ok) {
+          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error');
+          continue;
+        }
+
+        // v5: { result: { list: [ {...} ] } }
+        if (json && json.result && Array.isArray(json.result.list) && json.result.list.length) {
+          const t = json.result.list[0];
+          return {
+            last_price: t.lastPrice || t.last || t.close || t.price || null,
+            last: t.lastPrice || t.last || t.close || t.price || null,
+            close: t.close || t.last || t.price || null,
+            volume: t.turnover24h || t.volume || t.volume_24h || null,
+            volume_24h: t.turnover24h || t.volume || null
+          };
+        }
+
+        // legacy / v2: top-level array or result array
+        if (json && (Array.isArray(json) || (json.result && Array.isArray(json.result)))) {
+          const arr = Array.isArray(json) ? json : json.result;
+          if (arr.length && arr[0]) {
+            const t = arr[0];
+            return {
+              last_price: t.last_price || t.last || t.close || t.price || null,
+              last: t.last_price || t.last || t.close || t.price || null,
+              close: t.close || t.last || t.price || null,
+              volume: t.volume || t.volume_24h || null,
+              volume_24h: t.volume || null
+            };
+          }
+        }
+
+        logger.debug({ host, path: c.path, body: json }, 'fetchTicker24h: unexpected shape, trying next');
+      } catch (err) {
+        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchTicker24h: candidate threw');
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * getWalletBalance(coin)
+ * Signed v5 call to account wallet-balance.
+ */
+async function getWalletBalance(coin = 'USDT') {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('getWalletBalance requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const requestPath = `/v5/account/wallet-balance?coin=${encodeURIComponent(coin)}`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'getWalletBalance HTTP error');
+    throw new Error(`getWalletBalance HTTP ${res.status}`);
+  }
+
+  // Normalise: result.list[0] or result[coin] or top-level result
+  if (json && json.result) {
+    if (Array.isArray(json.result.list) && json.result.list.length) return json.result.list[0];
+    if (json.result[coin]) return json.result[coin];
+    return json.result;
+  }
+  return json;
+}
+
+/**
+ * placeMarketOrderV5(order)
+ * Signed v5 POST to create an order. Returns the parsed JSON from Bybit.
+ *
+ * Note: Field names for takeProfit/stopLoss may differ depending on Bybit version — adjust if you see errors.
+ */
+async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', qty, reduceOnly = false, tp = null, sl = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('placeMarketOrderV5 requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = {
+    category,
+    symbol,
+    side,
+    orderType: 'Market',
+    qty: String(qty),
+    reduceOnly: Boolean(reduceOnly)
+  };
+  if (tp) bodyObj.takeProfit = String(tp);
+  if (sl) bodyObj.stopLoss = String(sl);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/order/create`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'placeMarketOrderV5 HTTP error');
+    throw new Error(`placeMarketOrderV5 HTTP ${res.status}`);
+  }
+  return json;
+}
+
+/**
+ * setPositionTradingStop({ category, symbol, stopLoss })
+ * Signed v5 POST to set position trading stop (stop loss/take profit).
+ */
+async function setPositionTradingStop({ category = 'linear', symbol, stopLoss }) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('setPositionTradingStop requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = { category, symbol };
+  if (typeof stopLoss !== 'undefined' && stopLoss !== null) bodyObj.stopLoss = String(stopLoss);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/position/trading-stop`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'setPositionTradingStop HTTP error');
+    throw new Error(`setPositionTradingStop HTTP ${res.status}`);
+  }
+  return json;
+}
+
+/**
+ * fetchOpenOrders / fetchOpenPositions
+ * Signed GET calls to Bybit v5 private endpoints.
+ */
+async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error('fetchOpenOrders requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+
+  const params = new URLSearchParams();
+  if (category) params.append('category', category);
+  if (symbol) params.append('symbol', symbol);
+  const requestPath = `/v5/order/realtime${params.toString() ? `?${params.toString()}` : ''}`;
+
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'fetchOpenOrders HTTP error');
+    throw new Error(`fetchOpenOrders HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error('fetchOpenPositions requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+
+  const params = new URLSearchParams();
+  if (category) params.append('category', category);
+  if (symbol) params.append('symbol', symbol);
+  const requestPath = `/v5/position/list${params.toString() ? `?${params.toString()}` : ''}`;
+
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'fetchOpenPositions HTTP error');
+    throw new Error(`fetchOpenPositions HTTP ${res.status}`);
+  }
+  return json;
+}
 
 module.exports = {
   probeHosts,
   getBase,
   fetchKlines,
   fetchAllSymbols,
-  // other helpers should be exported if present in your copy
+  fetchTicker24h,
+  getWalletBalance,
+  placeMarketOrderV5,
+  setPositionTradingStop,
+  fetchOpenOrders,
+  fetchOpenPositions
 };
