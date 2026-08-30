@@ -7,14 +7,9 @@
  * - robust parsing/normalization of kline and symbols responses
  * - v5 signed request helpers for private endpoints (open orders / positions)
  *
- * Usage:
- *  - Option A (recommended): call `await require('./src/services/bybitRest').probeHosts()` during startup
- *    (e.g. in src/index.js after db.init()) to pick the fastest working host.
- *  - Option B: let the module operate without probing — it will try configured BYBIT_REST_BASE then fallbacks per-call.
- *
  * Exports:
- *  - probeHosts(timeoutMs)           -> Promise<string | null>  (resolves to chosen base or null)
- *  - getBase()                       -> string (best-effort base URL)
+ *  - probeHosts(timeoutMs)
+ *  - getBase()
  *  - fetchKlines(symbol, interval, limit)
  *  - fetchAllSymbols()
  *  - fetchTicker24h(symbol)
@@ -23,14 +18,6 @@
  *  - setPositionTradingStop(opts)
  *  - fetchOpenOrders({category, symbol})
  *  - fetchOpenPositions({category, symbol})
- *
- * Requirements:
- *  - node-fetch (already present in project dependencies); Node 18+ has fetch builtin but we use node-fetch to be explicit.
- *  - If you call fetchOpenOrders / fetchOpenPositions you MUST set BYBIT_API_KEY and BYBIT_API_SECRET in Render environment.
- *
- * Notes:
- *  - probeHosts performs light GET requests to the v5 kline endpoint for a single sample symbol (BTCUSDT).
- *  - All functions log informative debug messages via pino; set LOG_LEVEL=debug in env for verbose logs.
  */
 
 const fetch = require('node-fetch'); // keep explicit for older Node or consistent behavior
@@ -244,7 +231,8 @@ async function fetchKlines(symbol, interval, limit = 200) {
  *  { symbol, base, quote, status }
  */
 async function fetchAllSymbols() {
-  logger.debug('bybitRest.fetchAllSymbols: start');
+  // changed to INFO so this entry is visible in Render logs at default info level
+  logger.info('bybitRest.fetchAllSymbols: start');
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
