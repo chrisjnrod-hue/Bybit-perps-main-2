@@ -17,6 +17,10 @@
  *  - getBase()                       -> string (best-effort base URL)
  *  - fetchKlines(symbol, interval, limit)
  *  - fetchAllSymbols()
+ *  - fetchTicker24h(symbol)
+ *  - getWalletBalance(coin)
+ *  - placeMarketOrderV5(order)
+ *  - setPositionTradingStop(opts)
  *  - fetchOpenOrders({category, symbol})
  *  - fetchOpenPositions({category, symbol})
  *
@@ -36,7 +40,6 @@ const logger = require('pino')();
 const config = require('../config'); // your repo's config module
 
 // Candidate mainnet hostnames (ordered). Add/remove hosts as you prefer.
-// Frankfurt/Europe often routes well to bybit.com or bybit.nl; we include common mirrors.
 const HOST_CANDIDATES = [
   'https://api.bybit.com',
   'https://bybit.com',
@@ -241,6 +244,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
  *  { symbol, base, quote, status }
  */
 async function fetchAllSymbols() {
+  logger.debug('bybitRest.fetchAllSymbols: start');
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
@@ -318,6 +322,175 @@ async function fetchAllSymbols() {
   return [];
 }
 
+async function fetchTicker24h(symbol) {
+  const configured = getConfiguredBase();
+  const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
+  if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
+
+  const candidates = [
+    { path: '/v5/market/tickers', params: { symbol } },
+    { path: '/v2/public/tickers', params: { symbol } }
+  ];
+
+  for (const host of hostList) {
+    for (const c of candidates) {
+      try {
+        const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
+        Object.entries(c.params || {}).forEach(([k, v]) => {
+          if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+        });
+        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
+        const json = await res.json().catch(() => null);
+        if (!res.ok) {
+          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error');
+          continue;
+        }
+
+        // v5: { result: { list: [ {...} ] } }
+        if (json && json.result && Array.isArray(json.result.list) && json.result.list.length) {
+          const t = json.result.list[0];
+          return {
+            last_price: t.lastPrice || t.last || t.close || t.price || null,
+            last: t.lastPrice || t.last || t.close || t.price || null,
+            close: t.close || t.last || t.price || null,
+            volume: t.turnover24h || t.volume || t.volume_24h || null,
+            volume_24h: t.turnover24h || t.volume || null
+          };
+        }
+
+        // legacy / v2: top-level array or result array
+        if (json && (Array.isArray(json) || (json.result && Array.isArray(json.result)))) {
+          const arr = Array.isArray(json) ? json : json.result;
+          if (arr.length && arr[0]) {
+            const t = arr[0];
+            return {
+              last_price: t.last_price || t.last || t.close || t.price || null,
+              last: t.last_price || t.last || t.close || t.price || null,
+              close: t.close || t.last || t.price || null,
+              volume: t.volume || t.volume_24h || null,
+              volume_24h: t.volume || null
+            };
+          }
+        }
+
+        logger.debug({ host, path: c.path, body: json }, 'fetchTicker24h: unexpected shape, trying next');
+      } catch (err) {
+        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchTicker24h: candidate threw');
+      }
+    }
+  }
+
+  return null;
+}
+
+async function getWalletBalance(coin = 'USDT') {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('getWalletBalance requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const requestPath = `/v5/account/wallet-balance?coin=${encodeURIComponent(coin)}`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'getWalletBalance HTTP error');
+    throw new Error(`getWalletBalance HTTP ${res.status}`);
+  }
+
+  // normalise: result.list[0] or result[coin] or top-level result
+  if (json && json.result) {
+    if (Array.isArray(json.result.list) && json.result.list.length) return json.result.list[0];
+    // some endpoints return map by coin
+    if (json.result[coin]) return json.result[coin];
+    return json.result;
+  }
+  return json;
+}
+
+async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', qty, reduceOnly = false, tp = null, sl = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('placeMarketOrderV5 requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = {
+    category,
+    symbol,
+    side,
+    orderType: 'Market',
+    qty: String(qty),
+    reduceOnly: Boolean(reduceOnly)
+  };
+  if (tp) bodyObj.takeProfit = String(tp);
+  if (sl) bodyObj.stopLoss = String(sl);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/order/create`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'placeMarketOrderV5 HTTP error');
+    throw new Error(`placeMarketOrderV5 HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function setPositionTradingStop({ category = 'linear', symbol, stopLoss }) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('setPositionTradingStop requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = { category, symbol };
+  if (typeof stopLoss !== 'undefined' && stopLoss !== null) bodyObj.stopLoss = String(stopLoss);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/position/trading-stop`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 8000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'setPositionTradingStop HTTP error');
+    throw new Error(`setPositionTradingStop HTTP ${res.status}`);
+  }
+  return json;
+}
+
 /**
  * fetchOpenOrders / fetchOpenPositions
  * These call Bybit v5 private endpoints and require BYBIT_API_KEY and BYBIT_API_SECRET in env (or config).
@@ -392,6 +565,10 @@ module.exports = {
   getBase,
   fetchKlines,
   fetchAllSymbols,
+  fetchTicker24h,
+  getWalletBalance,
+  placeMarketOrderV5,
+  setPositionTradingStop,
   fetchOpenOrders,
   fetchOpenPositions
 };
