@@ -144,13 +144,23 @@ router.get('/scan/next', (req, res) => {
   }
 });
 
-// Trigger a manual full scan once (paginated)
-router.post('/scan', async (req, res) => {
+// Trigger a manual full scan once (backgrounded)
+router.post('/scan', (req, res) => {
   try {
-    // Ensure DB ready before heavy operations
     getDbOrThrow();
-    await poller.scanOnce();
-    res.json({ ok: true, message: 'scanOnce executed; check logs for details' });
+
+    // Schedule the scan to run in background and return immediately
+    setImmediate(async () => {
+      try {
+        logger.info('Manual background scan started');
+        await poller.scanOnce();
+        logger.info('Manual background scan completed');
+      } catch (err) {
+        logger.error({ err }, 'Manual background scan failed');
+      }
+    });
+
+    return res.json({ ok: true, message: 'scan scheduled in background; check logs for progress' });
   } catch (err) {
     if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
     logger.error({ err }, 'manual scan error');
@@ -165,12 +175,14 @@ router.post('/scan/symbol', async (req, res) => {
     const body = req.body || {};
     const symbol = body.symbol;
     if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required in JSON body' });
-    // poller.scanSymbolRoots should exist in poller module
     if (typeof poller.scanSymbolRoots !== 'function') {
       return res.status(500).json({ ok: false, error: 'poller.scanSymbolRoots not available' });
     }
-    await poller.scanSymbolRoots(symbol);
-    res.json({ ok: true, message: `scanSymbolRoots executed for ${symbol}` });
+    // run symbol scan in background for responsiveness
+    setImmediate(() => {
+      poller.scanSymbolRoots(symbol).catch(err => logger.error({ err }, 'scanSymbolRoots error'));
+    });
+    res.json({ ok: true, message: `scanSymbolRoots scheduled for ${symbol}` });
   } catch (err) {
     if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
     logger.error({ err }, 'scan/symbol error');
@@ -265,7 +277,7 @@ router.post('/bybit/probe', async (req, res) => {
  * POST /debug/bybit/seed
  * - Fetches symbols via bybitRest.fetchAllSymbols() (which will fallback to CoinGecko)
  * - Inserts them into the symbols table (INSERT OR REPLACE)
- * - Returns inserted count plus verification (savedCount and sample rows) to ensure persistence in same process
+ * - Returns inserted count plus verification (savedCount and sample rows) and forces WAL checkpoint
  */
 router.post('/bybit/seed', async (req, res) => {
   try {
@@ -296,6 +308,14 @@ router.post('/bybit/seed', async (req, res) => {
     insertMany(toInsert);
     logger.info({ count: toInsert.length }, 'bybit/seed: symbols saved into DB');
 
+    // Force a WAL checkpoint so data is visible in the main DB file and across restarts
+    try {
+      db.exec('PRAGMA wal_checkpoint(TRUNCATE);'); // flush and truncate WAL
+      logger.info('SQLite WAL checkpoint completed');
+    } catch (ckErr) {
+      logger.debug({ ckErr }, 'WAL checkpoint failed (non-fatal)');
+    }
+
     // Verification: read back count and a sample of saved rows (same DB handle)
     const savedCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
     const sampleRows = db.prepare('SELECT symbol, base, quote FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT 10').all();
@@ -311,18 +331,28 @@ router.post('/bybit/seed', async (req, res) => {
 /*
  * GET /debug/bybit/db-info
  * - Returns the expected DB path and whether the file exists and its size (helps verify persistence)
+ * - Also lists files in the data directory so you can see db.sqlite-wal
  */
 router.get('/bybit/db-info', (req, res) => {
   try {
-    // Derive the same default DB path used in db.js:
-    const candidatePath = process.env.DB_PATH || path.join(__dirname, '..', '..', 'data', 'db.sqlite');
-    let stat = null;
+    const dataDir = path.join(__dirname, '..', 'data');
+    let files = [];
     try {
-      stat = fs.statSync(candidatePath);
+      const names = fs.readdirSync(dataDir);
+      files = names.map(n => {
+        try {
+          const s = fs.statSync(path.join(dataDir, n));
+          return { name: n, sizeBytes: s.size };
+        } catch (e) {
+          return { name: n, error: String(e) };
+        }
+      });
     } catch (e) {
-      stat = null;
+      // directory may not exist yet
+      files = [];
     }
-    res.json({ ok: true, dbPath: candidatePath, exists: !!stat, sizeBytes: stat ? stat.size : 0 });
+    const mainPath = process.env.DB_PATH || path.join(__dirname, '..', 'data', 'db.sqlite');
+    res.json({ ok: true, dbPath: mainPath, files });
   } catch (err) {
     logger.error({ err }, 'bybit/db-info handler error');
     res.status(500).json({ ok: false, error: String(err) });
