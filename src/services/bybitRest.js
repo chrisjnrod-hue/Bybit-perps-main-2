@@ -1,10 +1,11 @@
 /**
  * src/services/bybitRest.js
  *
- * - Ensures chosenBase (from probeHosts or config) is always tried first and exclusively on first attempt.
- * - If chosenBase attempt fails to return usable symbols, falls back to the rest of candidates.
- * - Persists chosen base to disk and keeps probe diagnostics.
- * - Filtering to USDT/perp-like symbols still applies.
+ * - Ensures chosenBase (from probeHosts or config) is tried first exclusively.
+ * - Falls back to candidate hosts only if chosenBase fails.
+ * - Persists chosenBase to disk and records probe diagnostics.
+ * - Filters returned symbols to USDT/perp-like by default (configurable via SYMBOL_FILTER_REGEX).
+ * - Full helper implementations (klines, ticker, signed v5 account/order calls).
  */
 
 const fetch = require('node-fetch');
@@ -17,8 +18,8 @@ const config = require('../config');
 
 // Preferred order: mainnet and testnet first
 const HOST_CANDIDATES = [
-  'https://api.bybit.com',                // mainnet (preferred)
-  'https://api-testnet.bybit.com',        // testnet (preferred for testing)
+  'https://api.bybit.com',
+  'https://api-testnet.bybit.com',
   'https://bybit.com',
   'https://bybits.com',
   'https://bybit.nl',
@@ -29,7 +30,7 @@ const HOST_CANDIDATES = [
 let chosenBase = null;
 const CHOSEN_BASE_FILE = path.join(__dirname, '..', 'data', 'chosen_bybit_base.txt');
 
-// Diagnostics
+// Diagnostics: last probe host/path and last OK response text
 let lastProbeHostPath = null;
 let lastProbeResponseText = null;
 
@@ -63,7 +64,7 @@ function saveChosenBaseToDisk(base) {
 }
 loadChosenBaseFromDisk();
 
-/** Fetch wrapper with timeout */
+/** Fetch wrapper with timeout using AbortController */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -111,6 +112,7 @@ async function probeHosts(timeoutMs = 5000) {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
+      // capture text for diagnostics
       let text = null;
       let parsed = null;
       try {
@@ -153,27 +155,51 @@ async function probeHosts(timeoutMs = 5000) {
   return null;
 }
 
+/** Helper: fetch symbols from CoinGecko markets as a fallback */
+async function fetchSymbolsFromCoinGecko(perPage = 250) {
+  try {
+    const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
+    const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
+    if (!res.ok) {
+      logger.warn({ status: res.status }, 'CoinGecko fallback: non-ok response');
+      return [];
+    }
+    const arr = await res.json().catch(() => null);
+    if (!Array.isArray(arr)) return [];
+    const mapped = [];
+    const seen = new Set();
+    for (const it of arr) {
+      if (!it || !it.symbol) continue;
+      const base = String(it.symbol).toUpperCase();
+      const candidate = `${base}USDT`;
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
+      }
+    }
+    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
+    return mapped;
+  } catch (err) {
+    logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
+    return [];
+  }
+}
+
 /**
  * fetchAllSymbols()
- * Behavior change: if chosenBase exists, try only chosenBase first (exclusive). Only if that attempt fails,
- * fall back to trying the full candidate list. This prevents mixing hosts and ensures consistency.
+ * Behavior: if chosenBase exists, try it exclusively first. If that fails or returns no usable symbols,
+ * fall back to trying the full host list. Last-resort fallback to CoinGecko.
  */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
 
-  // default filter: USDT and USDT.P/perp-like
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p|\.P|P)?$/i;
-
   const configured = getConfiguredBase();
   let hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
 
-  // Ensure chosenBase is first in list if present
   if (chosenBase) {
     if (!hostList.includes(chosenBase)) hostList.unshift(chosenBase);
-    else {
-      // Move chosenBase to front
-      hostList = [chosenBase, ...hostList.filter(h => h !== chosenBase)];
-    }
+    else hostList = [chosenBase, ...hostList.filter(h => h !== chosenBase)];
   }
 
   const candidates = [
@@ -186,7 +212,6 @@ async function fetchAllSymbols() {
   let lastOkResponseText = null;
   let lastOkHostPath = null;
 
-  // Helper to attempt a single host (used for chosenBase-first exclusive attempt and fallbacks)
   async function attemptHostForSymbols(host, timeoutMs = 8000) {
     for (const c of candidates) {
       try {
@@ -197,7 +222,6 @@ async function fetchAllSymbols() {
 
         const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, timeoutMs);
 
-        // keep text for diagnostics
         let json = null;
         let bodyText = null;
         try {
@@ -208,7 +232,7 @@ async function fetchAllSymbols() {
         }
 
         if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status }, 'attemptHostForSymbols: HTTP error, trying next candidate path');
+          logger.debug({ host, path: c.path, status: res.status }, 'attemptHostForSymbols: HTTP error');
           continue;
         }
 
@@ -248,51 +272,42 @@ async function fetchAllSymbols() {
             return { symbols: filtered };
           } else {
             logger.info({ host, path: c.path, count: symbols.length, note: 'no symbols matched filter' });
-            // return empties as explicit result to let caller decide whether to continue or not
             return { symbols: [], rawCount: symbols.length };
           }
         }
-
-        // no symbols parsed on this candidate path; try next candidate path
-        logger.debug({ host, path: c.path, bodySnippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'attemptHostForSymbols: no usable symbols on this path');
       } catch (err) {
-        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'attemptHostForSymbols: candidate threw, trying next path');
+        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'attemptHostForSymbols: candidate threw');
       }
     }
-    // No candidate path for this host returned usable symbols
     return { symbols: null };
   }
 
-  // 1) If chosenBase exists, try it exclusively first (fast, consistent)
+  // 1) If chosenBase exists, try exclusively first
   if (chosenBase) {
     logger.info({ chosenBase }, 'fetchAllSymbols: attempting chosenBase exclusively first');
     try {
       const result = await attemptHostForSymbols(chosenBase, 8000);
       if (Array.isArray(result.symbols) && result.symbols.length) {
-        // success with chosenBase; ensure diagnostic lastProbe fields reflect chosenBase selection
-        lastOkHostPath = lastOkHostPath || { host: chosenBase, path: '/v5/market/instruments' };
         lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
+        lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
         return result.symbols;
       } else if (Array.isArray(result.symbols) && result.symbols.length === 0) {
-        // chosenBase returned shapes but none matched filter; log and fall back
-        logger.warn({ chosenBase, rawCount: result.rawCount }, 'fetchAllSymbols: chosenBase returned symbols but none matched filter; falling back to other hosts');
+        logger.warn({ chosenBase, rawCount: result.rawCount }, 'fetchAllSymbols: chosenBase returned symbols but none matched filter; falling back');
       } else {
-        logger.warn({ chosenBase }, 'fetchAllSymbols: chosenBase attempt failed to produce symbols; falling back to other hosts');
+        logger.warn({ chosenBase }, 'fetchAllSymbols: chosenBase attempt failed to produce symbols; falling back');
       }
     } catch (e) {
-      logger.debug({ e }, 'fetchAllSymbols: chosenBase exclusive attempt threw, falling back to all candidates');
+      logger.debug({ e }, 'fetchAllSymbols: chosenBase exclusive attempt threw, falling back');
     }
   }
 
-  // 2) Fallback: try full host list in order (configured -> candidates)
+  // 2) Fallback to full list (skip chosenBase if already tried)
   for (const host of hostList) {
-    // skip chosenBase here because we already tried it exclusively
     if (chosenBase && host.replace(/\/$/, '') === chosenBase) continue;
     try {
       const result = await attemptHostForSymbols(host, 8000);
       if (Array.isArray(result.symbols) && result.symbols.length) {
         logger.info({ host }, 'fetchAllSymbols: succeeded using fallback host');
-        // If we didn't have a chosenBase before, we can set this host as chosenBase now
         if (!chosenBase) {
           chosenBase = host.replace(/\/$/, '');
           saveChosenBaseToDisk(chosenBase);
@@ -300,24 +315,22 @@ async function fetchAllSymbols() {
         }
         return result.symbols;
       } else {
-        // No usable symbols found on this host; continue
         logger.debug({ host }, 'fetchAllSymbols: this host returned no usable filtered symbols, trying next host');
         continue;
       }
     } catch (err) {
-      logger.debug({ host, err: err && err.message ? err.message : String(err) }, 'fetchAllSymbols: host attempt threw, trying next host');
+      logger.debug({ host, err: err && err.message ? err.message : String(err) }, 'fetchAllSymbols: host attempt threw');
       continue;
     }
   }
 
-  // If we reach here: no host returned usable filtered symbols
   if (lastOkHostPath) {
     logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return usable symbols (last OK snippet included)');
   } else {
     logger.warn('fetchAllSymbols: no host returned HTTP OK during attempts');
   }
 
-  // Last-resort fallback to CoinGecko (still filtered)
+  // Last-resort CoinGecko fallback (filtered)
   try {
     const cgSymbols = await fetchSymbolsFromCoinGecko(250);
     if (cgSymbols && cgSymbols.length) {
@@ -333,39 +346,9 @@ async function fetchAllSymbols() {
   return [];
 }
 
-/** Helper: fetch symbols from CoinGecko markets as a fallback */
-async function fetchSymbolsFromCoinGecko(perPage = 250) {
-  try {
-    const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
-    const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
-    if (!res.ok) {
-      logger.warn({ status: res.status }, 'CoinGecko fallback: non-ok response');
-      return [];
-    }
-    const arr = await res.json().catch(() => null);
-    if (!Array.isArray(arr)) return [];
-    const mapped = [];
-    const seen = new Set();
-    for (const it of arr) {
-      if (!it || !it.symbol) continue;
-      const base = String(it.symbol).toUpperCase();
-      const candidate = `${base}USDT`;
-      if (!seen.has(candidate)) {
-        seen.add(candidate);
-        mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
-      }
-    }
-    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
-    return mapped;
-  } catch (err) {
-    logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
-    return [];
-  }
-}
-
 /**
  * fetchKlines(symbol, interval, limit)
- * Tries host candidates (preferring chosenBase) and multiple endpoint paths, normalizes common shapes.
+ * Tries chosenBase first then fallback hosts.
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const configured = getConfiguredBase();
@@ -394,7 +377,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
         try { json = await res.json(); } catch (e) { json = null; }
 
         if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error (non-OK)');
+          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error');
           continue;
         }
 
@@ -467,12 +450,8 @@ async function fetchKlines(symbol, interval, limit = 200) {
 }
 
 /**
- * Other signed helpers (fetchTicker24h, getWalletBalance, placeMarketOrderV5, setPositionTradingStop,
- * fetchOpenOrders, fetchOpenPositions) remain unchanged in behavior and use getBase() to pick the host.
- * They will prefer chosenBase where set.
+ * fetchTicker24h(symbol)
  */
-
-// fetchTicker24h implementation (unchanged utility)
 async function fetchTicker24h(symbol) {
   const configured = getConfiguredBase();
   let hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
@@ -534,6 +513,179 @@ async function fetchTicker24h(symbol) {
   return null;
 }
 
+/**
+ * Signed/private endpoints: getWalletBalance, placeMarketOrderV5, setPositionTradingStop, fetchOpenOrders, fetchOpenPositions
+ * Uses v5 signing (timestamp + method + requestPath + body) HMAC-SHA256
+ */
+
+async function getWalletBalance(coin = 'USDT') {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('getWalletBalance requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const requestPath = `/v5/account/wallet-balance?coin=${encodeURIComponent(coin)}`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'getWalletBalance HTTP error');
+    throw new Error(`getWalletBalance HTTP ${res.status}`);
+  }
+
+  if (json && json.result) {
+    if (Array.isArray(json.result.list) && json.result.list.length) return json.result.list[0];
+    if (json.result[coin]) return json.result[coin];
+    return json.result;
+  }
+  return json;
+}
+
+async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', qty, reduceOnly = false, tp = null, sl = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('placeMarketOrderV5 requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = {
+    category,
+    symbol,
+    side,
+    orderType: 'Market',
+    qty: String(qty),
+    reduceOnly: Boolean(reduceOnly)
+  };
+  if (tp) bodyObj.takeProfit = String(tp);
+  if (sl) bodyObj.stopLoss = String(sl);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/order/create`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'placeMarketOrderV5 HTTP error');
+    throw new Error(`placeMarketOrderV5 HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function setPositionTradingStop({ category = 'linear', symbol, stopLoss }) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('setPositionTradingStop requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+  }
+
+  const bodyObj = { category, symbol };
+  if (typeof stopLoss !== 'undefined' && stopLoss !== null) bodyObj.stopLoss = String(stopLoss);
+
+  const bodyStr = JSON.stringify(bodyObj);
+  const requestPath = `/v5/position/trading-stop`;
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'setPositionTradingStop HTTP error');
+    throw new Error(`setPositionTradingStop HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error('fetchOpenOrders requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+
+  const params = new URLSearchParams();
+  if (category) params.append('category', category);
+  if (symbol) params.append('symbol', symbol);
+  const requestPath = `/v5/order/realtime${params.toString() ? `?${params.toString()}` : ''}`;
+
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'fetchOpenOrders HTTP error');
+    throw new Error(`fetchOpenOrders HTTP ${res.status}`);
+  }
+  return json;
+}
+
+async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
+  const apiKey = process.env.BYBIT_API_KEY;
+  const apiSecret = process.env.BYBIT_API_SECRET;
+  if (!apiKey || !apiSecret) throw new Error('fetchOpenPositions requires BYBIT_API_KEY and BYBIT_API_SECRET env vars');
+
+  const params = new URLSearchParams();
+  if (category) params.append('category', category);
+  if (symbol) params.append('symbol', symbol);
+  const requestPath = `/v5/position/list${params.toString() ? `?${params.toString()}` : ''}`;
+
+  const base = getBase();
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
+
+  const url = `${base}${requestPath}`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-BAPI-API-KEY': apiKey,
+    'X-BAPI-TIMESTAMP': timestamp,
+    'X-BAPI-SIGN': signature,
+    'X-BAPI-RECV-WINDOW': '5000'
+  };
+
+  const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
+  const json = await res.json().catch(() => null);
+  if (!res.ok) {
+    logger.warn({ url, status: res.status, body: json }, 'fetchOpenPositions HTTP error');
+    throw new Error(`fetchOpenPositions HTTP ${res.status}`);
+  }
+  return json;
+}
+
 /** Diagnostics helpers */
 function getLastProbeInfo() {
   return {
@@ -556,14 +708,12 @@ module.exports = {
   fetchKlines,
   fetchAllSymbols,
   fetchTicker24h,
-  getWalletBalance: async function (coin) {
-    // implementation omitted here in snippet for brevity — use existing implementation in your codebase
-    throw new Error('getWalletBalance not implemented in snippet; keep your existing function here');
-  },
-  placeMarketOrderV5: async function () { throw new Error('placeMarketOrderV5 placeholder'); },
-  setPositionTradingStop: async function () { throw new Error('setPositionTradingStop placeholder'); },
-  fetchOpenOrders: async function () { throw new Error('fetchOpenOrders placeholder'); },
-  fetchOpenPositions: async function () { throw new Error('fetchOpenPositions placeholder'); },
+  getWalletBalance,
+  placeMarketOrderV5,
+  setPositionTradingStop,
+  fetchOpenOrders,
+  fetchOpenPositions,
+  // diagnostics
   getLastProbeInfo,
   reprobe
 };
