@@ -1,16 +1,23 @@
 /**
  * src/services/bybitRest.js
  *
- * Bybit REST helper with:
- * - probeHosts (resilient)
- * - fetchKlines / fetchAllSymbols with robust shape normalization
- * - fallback to CoinGecko markets when Bybit returns no symbols
- * - v5-signed helpers (wallet, orders, trading-stop, open orders/positions)
+ * Complete Bybit REST helper:
+ *  - non-blocking probe support (drive from index.js)
+ *  - persistence of chosen base to disk to avoid repeated probes
+ *  - robust probe logic (accept HTTP OK even if JSON parse fails)
+ *  - fetchKlines / fetchAllSymbols with normalization
+ *  - fallback to CoinGecko market list when Bybit returns no symbols
+ *  - fetchTicker24h helper
+ *  - v5-signed helpers for wallet, orders, trading-stop, open orders/positions
+ *
+ * Set LOG_LEVEL=debug for more verbose logs.
  */
 
 const fetch = require('node-fetch');
 const crypto = require('crypto');
 const { URL } = require('url');
+const fs = require('fs');
+const path = require('path');
 const logger = require('pino')();
 const config = require('../config');
 
@@ -24,6 +31,7 @@ const HOST_CANDIDATES = [
 ];
 
 let chosenBase = null;
+const CHOSEN_BASE_FILE = path.join(__dirname, '..', 'data', 'chosen_bybit_base.txt');
 
 function getConfiguredBase() {
   const envBase = process.env.BYBIT_REST_BASE || (config && config.BYBIT_REST_BASE);
@@ -31,6 +39,33 @@ function getConfiguredBase() {
   return String(envBase).replace(/\/$/, '');
 }
 
+function loadChosenBaseFromDisk() {
+  try {
+    if (fs.existsSync(CHOSEN_BASE_FILE)) {
+      const b = String(fs.readFileSync(CHOSEN_BASE_FILE, 'utf8') || '').trim();
+      if (b) {
+        chosenBase = b.replace(/\/$/, '');
+        logger.info({ chosenBase }, 'bybitRest: loaded chosenBase from disk');
+      }
+    }
+  } catch (e) {
+    logger.debug({ e }, 'bybitRest: failed to read chosen base file');
+  }
+}
+
+function saveChosenBaseToDisk(base) {
+  try {
+    fs.mkdirSync(path.dirname(CHOSEN_BASE_FILE), { recursive: true });
+    fs.writeFileSync(CHOSEN_BASE_FILE, String(base || ''), 'utf8');
+  } catch (e) {
+    logger.debug({ e }, 'bybitRest: failed to persist chosen base');
+  }
+}
+
+// Attempt to load persisted base immediately
+loadChosenBaseFromDisk();
+
+/** Fetch wrapper with timeout using AbortController */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -45,6 +80,7 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   }
 }
 
+/** Sign v5 request: timestamp + method + requestPath + body (body is '' for GET) */
 function signV5Request(method, requestPath, body = '', apiSecret) {
   const timestamp = Date.now().toString();
   const payload = timestamp + method.toUpperCase() + requestPath + (body ? body : '');
@@ -52,6 +88,9 @@ function signV5Request(method, requestPath, body = '', apiSecret) {
   return { signature, timestamp };
 }
 
+/** Decide best base for calls:
+ *  - priority: chosenBase (from probe or persisted), configured base env, then host candidate list first entry
+ */
 function getBase() {
   const configured = getConfiguredBase();
   if (chosenBase) return chosenBase;
@@ -59,6 +98,12 @@ function getBase() {
   return HOST_CANDIDATES[0];
 }
 
+/**
+ * probeHosts(timeoutMs)
+ * Try each host candidate with a lightweight v5 kline request for BTCUSDT.
+ * Accept a host when it returns HTTP OK; prefer a host with valid JSON, but accept OK responses even if JSON parse fails.
+ * When selecting a host, persist it to disk.
+ */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
   const list = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
@@ -79,13 +124,13 @@ async function probeHosts(timeoutMs = 5000) {
       }
 
       if (res.ok) {
-        if (json) {
-          chosenBase = host.replace(/\/$/, '');
-          logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
-          return chosenBase;
-        }
         chosenBase = host.replace(/\/$/, '');
-        logger.info({ chosenBase, note: 'accepted despite json parse failure (HTTP OK)' }, 'probeHosts: selected host');
+        saveChosenBaseToDisk(chosenBase);
+        if (json) {
+          logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
+        } else {
+          logger.info({ chosenBase, note: 'accepted despite json parse failure (HTTP OK)' }, 'probeHosts: selected host');
+        }
         return chosenBase;
       } else {
         logger.debug({ host, status: res.status }, 'probeHosts: non-ok response, trying next');
@@ -99,8 +144,9 @@ async function probeHosts(timeoutMs = 5000) {
 
   const configuredBase = getConfiguredBase();
   if (configuredBase) {
-    logger.warn({ configuredBase }, 'probeHosts: no host probe succeeded — falling back to configured BYBIT_REST_BASE');
     chosenBase = configuredBase;
+    saveChosenBaseToDisk(chosenBase);
+    logger.warn({ configuredBase }, 'probeHosts: no host probe succeeded — falling back to configured BYBIT_REST_BASE');
     return chosenBase;
   }
 
@@ -108,6 +154,11 @@ async function probeHosts(timeoutMs = 5000) {
   return null;
 }
 
+/**
+ * fetchKlines(symbol, interval, limit)
+ * Tries host candidates (or configured/chosen base) and multiple endpoint paths, normalizes common shapes.
+ * Returns array of { open_time, open, high, low, close, volume }
+ */
 async function fetchKlines(symbol, interval, limit = 200) {
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
@@ -136,6 +187,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           continue;
         }
 
+        // v5: { result: { list: [ ... ] } }
         if (json && json.result && Array.isArray(json.result.list)) {
           const list = json.result.list;
           return list.map(r => ({
@@ -148,6 +200,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }));
         }
 
+        // legacy shapes...
         if (json && json.result && Array.isArray(json.result)) {
           const arr = json.result;
           if (arr.length && Array.isArray(arr[0])) {
@@ -234,6 +287,12 @@ async function fetchSymbolsFromCoinGecko(perPage = 250) {
   }
 }
 
+/**
+ * fetchAllSymbols()
+ * Tries multiple hosts and v5/v2 instrument endpoints; returns array of normalized instrument objects:
+ *  { symbol, base, quote, status }
+ * Falls back to CoinGecko if Bybit responses are unusable.
+ */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
   const configured = getConfiguredBase();
@@ -301,7 +360,6 @@ async function fetchAllSymbols() {
             status: it.status || it.state || null
           })).filter(Boolean);
         } else {
-          // If json is null but HTTP OK, we couldn't parse — continue to next candidate but keep lastOkResponseText for diagnostics
           logger.debug({ host, path: c.path, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'fetchAllSymbols: parsed json null despite HTTP OK');
         }
 
@@ -317,7 +375,6 @@ async function fetchAllSymbols() {
     }
   }
 
-  // If we reach here, no hosts returned usable symbols. Log diagnostic details.
   if (lastOkHostPath) {
     logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return symbols (last OK response snippet included)');
   } else {
@@ -339,6 +396,9 @@ async function fetchAllSymbols() {
   return [];
 }
 
+/**
+ * fetchTicker24h(symbol)
+ */
 async function fetchTicker24h(symbol) {
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
@@ -398,6 +458,9 @@ async function fetchTicker24h(symbol) {
   return null;
 }
 
+/**
+ * getWalletBalance(coin) - v5 signed
+ */
 async function getWalletBalance(coin = 'USDT') {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -432,6 +495,9 @@ async function getWalletBalance(coin = 'USDT') {
   return json;
 }
 
+/**
+ * placeMarketOrderV5(order) - v5 signed POST
+ */
 async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', qty, reduceOnly = false, tp = null, sl = null } = {}) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -472,6 +538,9 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
   return json;
 }
 
+/**
+ * setPositionTradingStop - v5 signed POST
+ */
 async function setPositionTradingStop({ category = 'linear', symbol, stopLoss }) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -504,6 +573,9 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
   return json;
 }
 
+/**
+ * fetchOpenOrders / fetchOpenPositions - v5 signed GETs
+ */
 async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
