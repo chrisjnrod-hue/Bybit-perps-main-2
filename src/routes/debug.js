@@ -233,7 +233,7 @@ router.post('/seed', async (req, res) => {
  * Bybit debug endpoints
  */
 
-// GET /debug/bybit/probe-status (existing)
+// GET /debug/bybit/probe-status
 router.get('/bybit/probe-status', (req, res) => {
   try {
     const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: null };
@@ -244,7 +244,7 @@ router.get('/bybit/probe-status', (req, res) => {
   }
 });
 
-// POST /debug/bybit/probe (existing)
+// POST /debug/bybit/probe
 router.post('/bybit/probe', async (req, res) => {
   try {
     const body = req.body || {};
@@ -262,9 +262,10 @@ router.post('/bybit/probe', async (req, res) => {
 });
 
 /*
- * NEW: POST /debug/bybit/seed
+ * POST /debug/bybit/seed
  * - Fetches symbols via bybitRest.fetchAllSymbols() (which will fallback to CoinGecko)
  * - Inserts them into the symbols table (INSERT OR REPLACE)
+ * - Returns inserted count plus verification (savedCount and sample rows) to ensure persistence in same process
  */
 router.post('/bybit/seed', async (req, res) => {
   try {
@@ -273,7 +274,6 @@ router.post('/bybit/seed', async (req, res) => {
       return res.status(500).json({ ok: false, error: 'bybitRest.fetchAllSymbols not available' });
     }
 
-    // optional allow passing a source override or limiting count in body (not required)
     const body = req.body || {};
     const limit = body.limit && Number.isFinite(Number(body.limit)) ? Number(body.limit) : null;
 
@@ -295,7 +295,12 @@ router.post('/bybit/seed', async (req, res) => {
     });
     insertMany(toInsert);
     logger.info({ count: toInsert.length }, 'bybit/seed: symbols saved into DB');
-    res.json({ ok: true, inserted: toInsert.length });
+
+    // Verification: read back count and a sample of saved rows (same DB handle)
+    const savedCount = db.prepare('SELECT COUNT(*) as c FROM symbols').get().c || 0;
+    const sampleRows = db.prepare('SELECT symbol, base, quote FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT 10').all();
+
+    res.json({ ok: true, inserted: toInsert.length, savedCount, sample: sampleRows });
   } catch (err) {
     if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
     logger.error({ err }, 'bybit/seed handler error');
@@ -304,7 +309,7 @@ router.post('/bybit/seed', async (req, res) => {
 });
 
 /*
- * NEW: GET /debug/bybit/db-info
+ * GET /debug/bybit/db-info
  * - Returns the expected DB path and whether the file exists and its size (helps verify persistence)
  */
 router.get('/bybit/db-info', (req, res) => {
