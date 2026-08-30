@@ -1,3 +1,9 @@
+/**
+ * SQLite wrapper to persist symbols, klines, signals, trades.
+ * Adds missing columns on existing DB (migration).
+ *
+ * Added: close() to allow graceful shutdown.
+ */
 const path = require('path');
 const fs = require('fs');
 const Database = require('better-sqlite3');
@@ -49,7 +55,7 @@ module.exports = {
       );
     `);
 
-    // Migration: add columns to symbols table if missing
+    // Migration: add additional columns to symbols if not present
     const existing = db.prepare("PRAGMA table_info(symbols)").all().map(r => r.name);
     const toAdd = [
       { name: 'market_cap', type: 'REAL' },
@@ -71,5 +77,18 @@ module.exports = {
 
     logger.info({ dbPath }, 'Database initialized');
   },
-  get() { return db; }
+
+  get() { return db; },
+
+  // Close DB connection for graceful shutdown
+  close() {
+    try {
+      if (db && typeof db.close === 'function') {
+        db.close();
+        logger.info('SQLite database closed via db.close()');
+      }
+    } catch (err) {
+      logger.warn({ err }, 'Error closing SQLite database');
+    }
+  }
 };
