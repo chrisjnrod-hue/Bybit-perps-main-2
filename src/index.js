@@ -5,6 +5,7 @@
  * - global uncaughtException / unhandledRejection handlers
  * - heartbeat logging
  * - graceful shutdown that attempts to close DB and WS connections
+ * - non-blocking bybit host probe (runs in background so startup is fast)
  */
 
 require('dotenv').config();
@@ -44,12 +45,19 @@ async function start() {
     // init DB
     db.init();
 
-    // Probe Bybit hosts to pick a working base (helps in environments with multiple mirrors)
+    // Start Bybit probe in background (do not await) so startup is not blocked by network probes.
     try {
       const bybitRest = require('./services/bybitRest');
-      await bybitRest.probeHosts(3000);
+      bybitRest.probeHosts(3000)
+        .then((base) => {
+          if (base) logger.info({ base }, 'probeHosts completed in background');
+          else logger.warn('probeHosts completed in background with no selected base');
+        })
+        .catch((e) => {
+          logger.debug({ e }, 'probeHosts background failure');
+        });
     } catch (e) {
-      logger.debug({ e }, 'probeHosts call failed (continuing)');
+      logger.debug({ e }, 'probeHosts startup call failed');
     }
 
     // start REST poller (symbol discovery + root seeding)
