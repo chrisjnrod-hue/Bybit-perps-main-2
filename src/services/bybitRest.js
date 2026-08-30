@@ -1,13 +1,11 @@
 /**
  * src/services/bybitRest.js
  *
- * Complete Bybit REST helper:
- *  - probeHosts with resilient acceptance (accept HTTP OK even if JSON parse fails)
- *  - fetchKlines / fetchAllSymbols with robust shape normalization
- *  - fetchTicker24h helper
- *  - v5-signed helpers for wallet, order create, trading-stop, open orders/positions
- *
- * Set LOG_LEVEL=debug for more verbose logs.
+ * Bybit REST helper with:
+ * - probeHosts (resilient)
+ * - fetchKlines / fetchAllSymbols with robust shape normalization
+ * - fallback to CoinGecko markets when Bybit returns no symbols
+ * - v5-signed helpers (wallet, orders, trading-stop, open orders/positions)
  */
 
 const fetch = require('node-fetch');
@@ -16,7 +14,6 @@ const { URL } = require('url');
 const logger = require('pino')();
 const config = require('../config');
 
-// Candidate mainnet hostnames (ordered)
 const HOST_CANDIDATES = [
   'https://api.bybit.com',
   'https://bybit.com',
@@ -34,7 +31,6 @@ function getConfiguredBase() {
   return String(envBase).replace(/\/$/, '');
 }
 
-/** Fetch wrapper with timeout using AbortController */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -49,7 +45,6 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   }
 }
 
-/** Sign v5 request: timestamp + method + requestPath + body (body is '' for GET) */
 function signV5Request(method, requestPath, body = '', apiSecret) {
   const timestamp = Date.now().toString();
   const payload = timestamp + method.toUpperCase() + requestPath + (body ? body : '');
@@ -57,9 +52,6 @@ function signV5Request(method, requestPath, body = '', apiSecret) {
   return { signature, timestamp };
 }
 
-/** Decide best base for calls:
- *  - priority: chosenBase (from probe), configured base env, then host candidate list first entry
- */
 function getBase() {
   const configured = getConfiguredBase();
   if (chosenBase) return chosenBase;
@@ -67,11 +59,6 @@ function getBase() {
   return HOST_CANDIDATES[0];
 }
 
-/**
- * probeHosts(timeoutMs)
- * Try each host candidate with a lightweight v5 kline request for BTCUSDT.
- * Accept a host when it returns HTTP OK; prefer a host with valid JSON, but accept OK responses even if JSON parse fails.
- */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
   const list = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
@@ -82,26 +69,21 @@ async function probeHosts(timeoutMs = 5000) {
     const testUrl = `${host.replace(/\/$/, '')}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=1`;
     try {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
-      // Log HTTP status so it's visible in logs
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
-      // prefer to parse JSON and validate, but accept OK responses even if JSON parse fails
       let json = null;
       try {
         json = await res.json();
       } catch (parseErr) {
-        // parse failed — log it but accept host if HTTP was OK
         logger.debug({ host, err: parseErr && parseErr.message ? parseErr.message : String(parseErr) }, 'probeHosts: json parse failed for host');
       }
 
       if (res.ok) {
-        // if we got usable JSON that's best — accept host
         if (json) {
           chosenBase = host.replace(/\/$/, '');
           logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
           return chosenBase;
         }
-        // if no json but status OK, accept host (makes probe resilient to proxies/truncation)
         chosenBase = host.replace(/\/$/, '');
         logger.info({ chosenBase, note: 'accepted despite json parse failure (HTTP OK)' }, 'probeHosts: selected host');
         return chosenBase;
@@ -115,7 +97,6 @@ async function probeHosts(timeoutMs = 5000) {
     }
   }
 
-  // if no hosts responded successfully, log and optionally fall back to configured base
   const configuredBase = getConfiguredBase();
   if (configuredBase) {
     logger.warn({ configuredBase }, 'probeHosts: no host probe succeeded — falling back to configured BYBIT_REST_BASE');
@@ -127,15 +108,9 @@ async function probeHosts(timeoutMs = 5000) {
   return null;
 }
 
-/**
- * fetchKlines(symbol, interval, limit)
- * Tries host candidates (or configured/chosen base) and multiple endpoint paths, normalizes common shapes.
- * Returns array of { open_time, open, high, low, close, volume }
- */
 async function fetchKlines(symbol, interval, limit = 200) {
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
-  // If probe chose a base, prioritize it.
   if (chosenBase && !hostList.includes(chosenBase)) hostList.unshift(chosenBase);
 
   const candidates = [
@@ -161,7 +136,6 @@ async function fetchKlines(symbol, interval, limit = 200) {
           continue;
         }
 
-        // v5: { result: { list: [ ... ] } }
         if (json && json.result && Array.isArray(json.result.list)) {
           const list = json.result.list;
           return list.map(r => ({
@@ -174,7 +148,6 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }));
         }
 
-        // legacy: json.result is array-of-arrays or array-of-objects
         if (json && json.result && Array.isArray(json.result)) {
           const arr = json.result;
           if (arr.length && Array.isArray(arr[0])) {
@@ -198,7 +171,6 @@ async function fetchKlines(symbol, interval, limit = 200) {
           }
         }
 
-        // top-level array
         if (Array.isArray(json)) {
           if (json.length && Array.isArray(json[0])) {
             return json.map(r => ({
@@ -232,11 +204,36 @@ async function fetchKlines(symbol, interval, limit = 200) {
   return [];
 }
 
-/**
- * fetchAllSymbols()
- * Tries multiple hosts and v5/v2 instrument endpoints; returns array of normalized instrument objects:
- *  { symbol, base, quote, status }
- */
+/** Helper: fetch symbols from CoinGecko markets as a fallback */
+async function fetchSymbolsFromCoinGecko(perPage = 250) {
+  try {
+    const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
+    const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 7000);
+    if (!res.ok) {
+      logger.warn({ status: res.status }, 'CoinGecko fallback: non-ok response');
+      return [];
+    }
+    const arr = await res.json().catch(() => null);
+    if (!Array.isArray(arr)) return [];
+    const mapped = [];
+    const seen = new Set();
+    for (const it of arr) {
+      if (!it || !it.symbol) continue;
+      const base = String(it.symbol).toUpperCase();
+      const candidate = `${base}USDT`;
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
+      }
+    }
+    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
+    return mapped;
+  } catch (err) {
+    logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
+    return [];
+  }
+}
+
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
   const configured = getConfiguredBase();
@@ -250,6 +247,9 @@ async function fetchAllSymbols() {
     { path: '/v2/public/tickers', params: {} }
   ];
 
+  let lastOkResponseText = null;
+  let lastOkHostPath = null;
+
   for (const host of hostList) {
     for (const c of candidates) {
       try {
@@ -259,14 +259,25 @@ async function fetchAllSymbols() {
         });
 
         const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 6000);
-        const json = await res.json().catch(() => null);
+        // try to parse JSON but keep raw fallback for diagnostics
+        let json = null;
+        let bodyText = null;
+        try {
+          const text = await res.text();
+          bodyText = text;
+          try { json = JSON.parse(text); } catch (e) { json = null; }
+        } catch (e) {
+          bodyText = null;
+        }
 
         if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchAllSymbols: HTTP error');
+          logger.debug({ host, path: c.path, status: res.status, bodyText: bodyText ? bodyText.slice(0, 400) : null }, 'fetchAllSymbols: HTTP error');
           continue;
         }
 
-        // v5 shape: { result: { list: [ {symbol, baseCoin, quoteCoin, status}, ... ] } }
+        lastOkHostPath = { host, path: c.path };
+        lastOkResponseText = bodyText;
+
         let symbols = null;
         if (json && json.result && Array.isArray(json.result.list)) {
           symbols = json.result.list.map(it => ({
@@ -289,6 +300,9 @@ async function fetchAllSymbols() {
             quote: it.quote || it.quoteCoin || null,
             status: it.status || it.state || null
           })).filter(Boolean);
+        } else {
+          // If json is null but HTTP OK, we couldn't parse — continue to next candidate but keep lastOkResponseText for diagnostics
+          logger.debug({ host, path: c.path, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'fetchAllSymbols: parsed json null despite HTTP OK');
         }
 
         if (symbols && symbols.length) {
@@ -296,22 +310,35 @@ async function fetchAllSymbols() {
           return symbols;
         }
 
-        // nothing useful from this candidate — log and continue
-        logger.debug({ host, path: c.path, body: json }, 'fetchAllSymbols: unexpected/empty shape; trying next');
+        logger.debug({ host, path: c.path, bodySnippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'fetchAllSymbols: unexpected/empty shape; trying next');
       } catch (err) {
         logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchAllSymbols: candidate threw, trying next');
       }
     }
   }
 
-  logger.error('fetchAllSymbols: all hosts/candidates failed to return symbols');
+  // If we reach here, no hosts returned usable symbols. Log diagnostic details.
+  if (lastOkHostPath) {
+    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return symbols (last OK response snippet included)');
+  } else {
+    logger.warn('fetchAllSymbols: no host returned HTTP OK during attempts');
+  }
+
+  // Fallback: try CoinGecko to create a best-effort symbol list (BASEUSDT)
+  try {
+    const cgSymbols = await fetchSymbolsFromCoinGecko(250);
+    if (cgSymbols && cgSymbols.length) {
+      logger.info({ count: cgSymbols.length }, 'fetchAllSymbols: fallback to CoinGecko succeeded');
+      return cgSymbols;
+    }
+    logger.warn('fetchAllSymbols: CoinGecko fallback returned no symbols');
+  } catch (e) {
+    logger.debug({ e }, 'fetchAllSymbols: CoinGecko fallback threw');
+  }
+
   return [];
 }
 
-/**
- * fetchTicker24h(symbol)
- * Normalizes ticker shapes from various endpoints.
- */
 async function fetchTicker24h(symbol) {
   const configured = getConfiguredBase();
   const hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES;
@@ -336,7 +363,6 @@ async function fetchTicker24h(symbol) {
           continue;
         }
 
-        // v5: { result: { list: [ {...} ] } }
         if (json && json.result && Array.isArray(json.result.list) && json.result.list.length) {
           const t = json.result.list[0];
           return {
@@ -348,7 +374,6 @@ async function fetchTicker24h(symbol) {
           };
         }
 
-        // legacy / v2: top-level array or result array
         if (json && (Array.isArray(json) || (json.result && Array.isArray(json.result)))) {
           const arr = Array.isArray(json) ? json : json.result;
           if (arr.length && arr[0]) {
@@ -373,10 +398,6 @@ async function fetchTicker24h(symbol) {
   return null;
 }
 
-/**
- * getWalletBalance(coin)
- * Signed v5 call to account wallet-balance.
- */
 async function getWalletBalance(coin = 'USDT') {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -403,7 +424,6 @@ async function getWalletBalance(coin = 'USDT') {
     throw new Error(`getWalletBalance HTTP ${res.status}`);
   }
 
-  // Normalise: result.list[0] or result[coin] or top-level result
   if (json && json.result) {
     if (Array.isArray(json.result.list) && json.result.list.length) return json.result.list[0];
     if (json.result[coin]) return json.result[coin];
@@ -412,12 +432,6 @@ async function getWalletBalance(coin = 'USDT') {
   return json;
 }
 
-/**
- * placeMarketOrderV5(order)
- * Signed v5 POST to create an order. Returns the parsed JSON from Bybit.
- *
- * Note: Field names for takeProfit/stopLoss may differ depending on Bybit version — adjust if you see errors.
- */
 async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', qty, reduceOnly = false, tp = null, sl = null } = {}) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -458,10 +472,6 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
   return json;
 }
 
-/**
- * setPositionTradingStop({ category, symbol, stopLoss })
- * Signed v5 POST to set position trading stop (stop loss/take profit).
- */
 async function setPositionTradingStop({ category = 'linear', symbol, stopLoss }) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -494,10 +504,6 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
   return json;
 }
 
-/**
- * fetchOpenOrders / fetchOpenPositions
- * Signed GET calls to Bybit v5 private endpoints.
- */
 async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
