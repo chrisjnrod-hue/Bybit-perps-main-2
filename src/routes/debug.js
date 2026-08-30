@@ -16,6 +16,7 @@ const dbModule = require('../db'); // do NOT call dbModule.get() here
 const wsManager = require('../services/bybitWs');
 const poller = require('../services/poller');
 const config = require('../config');
+const bybitRest = require('../services/bybitRest');
 
 let manualIntervalId = null;
 
@@ -143,7 +144,6 @@ router.get('/scan/next', (req, res) => {
 // Trigger a manual full scan once (paginated)
 router.post('/scan', async (req, res) => {
   try {
-    // Ensure DB ready before heavy operations
     getDbOrThrow();
     await poller.scanOnce();
     res.json({ ok: true, message: 'scanOnce executed; check logs for details' });
@@ -161,7 +161,6 @@ router.post('/scan/symbol', async (req, res) => {
     const body = req.body || {};
     const symbol = body.symbol;
     if (!symbol) return res.status(400).json({ ok: false, error: 'symbol required in JSON body' });
-    // poller.scanSymbolRoots should exist in poller module
     if (typeof poller.scanSymbolRoots !== 'function') {
       return res.status(500).json({ ok: false, error: 'poller.scanSymbolRoots not available' });
     }
@@ -221,6 +220,40 @@ router.post('/seed', async (req, res) => {
   } catch (err) {
     if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
     logger.error({ err }, 'seed handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+/*
+ * New debug endpoints for Bybit probing diagnostics and reprobe:
+ *  - GET /debug/bybit/probe-status  -> returns chosenBase, last probe host/path and response snippet
+ *  - POST /debug/bybit/probe        -> triggers a fresh probeHosts(timeoutMs) and returns chosen base
+ */
+
+// GET probe status
+router.get('/bybit/probe-status', (req, res) => {
+  try {
+    const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: null };
+    res.json({ ok: true, probe: info });
+  } catch (err) {
+    logger.error({ err }, 'bybit/probe-status handler error');
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+// Trigger reprobe (synchronous - waits for probe to finish)
+router.post('/bybit/probe', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const timeoutMs = Number(body.timeoutMs) || 5000;
+    if (typeof bybitRest.reprobe !== 'function') {
+      return res.status(500).json({ ok: false, error: 'bybitRest.reprobe not available' });
+    }
+    const base = await bybitRest.reprobe(timeoutMs);
+    const info = bybitRest.getLastProbeInfo ? bybitRest.getLastProbeInfo() : { chosenBase: base };
+    res.json({ ok: true, chosenBase: base, probeInfo: info });
+  } catch (err) {
+    logger.error({ err }, 'bybit/probe handler error');
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
