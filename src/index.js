@@ -6,6 +6,7 @@
  * - heartbeat logging
  * - graceful shutdown that attempts to close DB and WS connections
  * - non-blocking bybit host probe (runs in background so startup is fast)
+ * - sends startup telegram summary after services init (best-effort)
  */
 
 require('dotenv').config();
@@ -83,6 +84,16 @@ async function start() {
     }, 60_000);
 
     logger.info('Startup complete');
+
+    // Best-effort: send startup telegram summary after short delay so other services can seed initial state.
+    setTimeout(async () => {
+      try {
+        await signalManager.sendStartupSummary();
+      } catch (e) {
+        logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
+      }
+    }, 8_000);
+
   } catch (err) {
     logger.error({ err }, 'Failed to start application');
     // exit non-zero so Render restarts
