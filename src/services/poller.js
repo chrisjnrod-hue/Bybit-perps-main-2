@@ -84,7 +84,7 @@ module.exports = {
 
   /**
    * initialScan:
-   * - If config.U SE_WS true, attempts wsManager.performInitialScan() (if function exists) with timeout
+   * - If config.USE_WS true, attempts wsManager.performInitialScan() (if function exists) with timeout
    * - Falls back to bybit.fetchAllSymbols()
    * - persists discovered symbols to DB
    * - Kicks off background seeding for seedSymbols if SYMBOL_SEED_ALL true
@@ -94,7 +94,7 @@ module.exports = {
 
     let allSymbols = [];
 
-    const useWs = !!config.U SE_WS; // config flag
+    const useWs = !!config.USE_WS; // config flag
 
     if (useWs) {
       try {
