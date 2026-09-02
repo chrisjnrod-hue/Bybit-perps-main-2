@@ -6,7 +6,8 @@
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: request v5 instrument endpoints with category=linear and treat API retCode/ret_code != 0 as failures.
+ * - fetchAllSymbols: request v5 instrument endpoints with category=linear, treat API retCode/ret_code != 0 as failures,
+ *   and use more robust symbol filtering (by symbol suffix OR quote field).
  */
 
 const fetch = require('node-fetch');
@@ -146,10 +147,10 @@ function getOrderBase() {
  * probeHosts(timeoutMs)
  * - If BYBIT_REST_BASE is set, only probe that host and DO NOT persist a different host.
  * - Accept a host only if response looks like JSON or API-shaped JSON.
+ * - Require retCode===0 when retCode present.
  */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
-  // If configured explicitly, only probe that single host (do not try other candidates)
   const list = configured ? [configured] : HOST_CANDIDATES.slice();
 
   logger.info({ candidates: list }, 'bybitRest: starting host probe');
@@ -352,12 +353,31 @@ async function fetchAllSymbols() {
         }
 
         if (symbols && symbols.length) {
-          const filtered = symbols.filter(s => s && s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
+          // More robust filtering: accept if symbol matches regex OR quote === 'USDT' OR symbol endsWith 'USDT'
+          const filtered = symbols.filter(s => {
+            if (!s || !s.symbol) return false;
+            try {
+              const sym = String(s.symbol);
+              const quote = String(s.quote || '').toUpperCase();
+              // regex match
+              if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
+              // explicit quote field equals USDT
+              if (quote === 'USDT') return true;
+              // symbol string ends with USDT
+              if (sym.toUpperCase().endsWith('USDT')) return true;
+            } catch (e) {
+              return false;
+            }
+            return false;
+          });
+
           if (filtered.length) {
             logger.info({ host, path: c.path, count: filtered.length }, 'attemptHostForSymbols: fetched and filtered symbols from host');
             return { symbols: filtered };
           } else {
-            logger.info({ host, path: c.path, count: symbols.length, note: 'no symbols matched filter' });
+            // Log a sample of returned symbols to help debug why filtering failed
+            const sample = symbols.slice(0, 10).map(s => ({ symbol: s.symbol, base: s.base, quote: s.quote }));
+            logger.warn({ host, path: c.path, rawCount: symbols.length, sample }, 'attemptHostForSymbols: no symbols matched filter (sample shown)');
             return { symbols: [], rawCount: symbols.length };
           }
         }
