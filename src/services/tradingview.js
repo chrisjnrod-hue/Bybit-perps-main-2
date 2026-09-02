@@ -19,7 +19,11 @@ async function fetchTvRatingForSymbol(symbol) {
         const row = json.data[0];
         const recommend = row.d[0];
         let score = 0;
-        if (typeof recommend === 'number') score = Math.max(0, Math.min(1, (5 - recommend) / 4));
+        if (typeof recommend === 'number') {
+          // TradingView Recommend.All: 1 strong sell ... 5 strong buy
+          // map 5 -> 1, 1 -> 0 and normalize to 0..1 where 1 is best (buy)
+          score = Math.max(0, Math.min(1, (recommend - 1) / 4));
+        }
         logger.info({ symbol, ticker, score }, 'TV rating fetched');
         return { source: 'tradingview', score, raw: row.d };
       }
