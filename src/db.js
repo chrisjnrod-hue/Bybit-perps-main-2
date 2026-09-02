@@ -3,6 +3,7 @@
  * Adds missing columns on existing DB (migration).
  *
  * Added: close() to allow graceful shutdown.
+ * Added: notification_state table and helpers, upsert/get latest signals snapshot helper.
  */
 const path = require('path');
 const fs = require('fs');
@@ -41,6 +42,7 @@ module.exports = {
         state TEXT,
         meta TEXT
       );
+      CREATE INDEX IF NOT EXISTS idx_signals_sym_tf_dt ON signals(symbol, root_tf, detected_at);
       CREATE TABLE IF NOT EXISTS trades (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT,
@@ -52,6 +54,10 @@ module.exports = {
         sl REAL,
         status TEXT,
         meta TEXT
+      );
+      CREATE TABLE IF NOT EXISTS notification_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
       );
     `);
 
@@ -79,6 +85,72 @@ module.exports = {
   },
 
   get() { return db; },
+
+  // notification state helpers (key/value JSON)
+  setState(key, value) {
+    try {
+      const v = JSON.stringify(value);
+      const stmt = db.prepare('INSERT OR REPLACE INTO notification_state (key, value) VALUES (?, ?)');
+      stmt.run(key, v);
+      return true;
+    } catch (err) {
+      logger.warn({ err, key }, 'db.setState failed');
+      return false;
+    }
+  },
+
+  getState(key) {
+    try {
+      const row = db.prepare('SELECT value FROM notification_state WHERE key = ?').get(key);
+      if (!row || !row.value) return null;
+      return JSON.parse(row.value);
+    } catch (err) {
+      logger.warn({ err, key }, 'db.getState failed');
+      return null;
+    }
+  },
+
+  // insert signal row (we keep history; latest per symbol/root_tf is used by helpers)
+  insertSignal({ symbol, root_tf, detected_at = Date.now(), state = 'detected', meta = {} } = {}) {
+    try {
+      const stmt = db.prepare('INSERT INTO signals (symbol, root_tf, detected_at, state, meta) VALUES (?, ?, ?, ?, ?)');
+      stmt.run(symbol, root_tf, detected_at, state, JSON.stringify(meta || {}));
+    } catch (err) {
+      logger.warn({ err, symbol, root_tf }, 'db.insertSignal failed');
+    }
+  },
+
+  // Return latest signals snapshot: one row per symbol/root_tf with the most recent detected_at
+  getLatestSignalsSnapshot() {
+    try {
+      const rows = db.prepare(`
+        SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
+        FROM signals s1
+        INNER JOIN (
+          SELECT symbol, root_tf, MAX(detected_at) as max_dt
+          FROM signals
+          GROUP BY symbol, root_tf
+        ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
+        ORDER BY UPPER(s1.symbol) ASC
+      `).all();
+
+      return rows.map(r => {
+        let meta = {};
+        try { meta = r.meta ? JSON.parse(r.meta) : {}; } catch (e) { meta = {}; }
+        return {
+          key: `${r.symbol}:${r.root_tf}`,
+          symbol: r.symbol,
+          root_tf: r.root_tf,
+          detected_at: r.detected_at,
+          state: r.state,
+          meta
+        };
+      });
+    } catch (err) {
+      logger.warn({ err }, 'db.getLatestSignalsSnapshot failed');
+      return [];
+    }
+  },
 
   // Close DB connection for graceful shutdown
   close() {
