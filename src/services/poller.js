@@ -1,8 +1,11 @@
 /**
  * src/services/poller.js
  *
- * - Fast initialScan: persist symbols quickly
- * - Background concurrent kline seeding for top N symbols
+ * UPDATED:
+ * - Implements WS → REST fallback chain for initial symbol scan
+ * - Cursor-based pagination fetches ALL symbols (no topN limiting)
+ * - SYMBOL_SEED_ALL flag controls whether to seed all or none
+ * - Fast initialScan followed by concurrent kline seeding
  * - Non-blocking probe on startup, open-trade gating until first aligned boundary
  */
 
@@ -12,15 +15,12 @@ const config = require('../config');
 const logger = require('pino')();
 const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
-const marketData = require('./marketData');
 const signalManager = require('./signalManager');
 
 const limiter = new Bottleneck({ minTime: 50 });
 
-// Configurable environment values (defaults provided)
-const SEED_TOP_SYMBOLS = Number(process.env.SEED_TOP_SYMBOLS || 100);
+// Configurable concurrency for kline seeding
 const SEED_CONCURRENCY = Number(process.env.SEED_CONCURRENCY || 6);
-const SEED_KLINES_LIMIT = Number(process.env.SEED_KLINES_LIMIT || 200);
 
 let isRunning = false;
 
@@ -47,7 +47,7 @@ module.exports = {
     // Run initialScan immediately (fast)
     (async () => {
       try {
-        logger.info('poller: starting initialScan (deploy-time)');
+        logger.info('poller: starting initialScan (deploy-time, WS → REST fallback)');
         await this.initialScan();
         logger.info('poller: initialScan completed (fast symbol seed)');
       } catch (err) {
@@ -81,78 +81,158 @@ module.exports = {
   },
 
   /**
-   * initialScan:
-   * - fetchAllSymbols (Bybit primary, filtered) and persist quickly
-   * - schedule backgroundSeedKlines() to fetch klines concurrently for top N symbols
+   * initialScan():
+   * - Attempts WS initial scan with timeout (if USE_WS enabled)
+   * - Falls back to REST API with cursor pagination for ALL symbols
+   * - Persists symbols quickly to DB
+   * - Schedules backgroundSeedKlines() for concurrent kline fetching
    */
   async initialScan() {
-    logger.info('Starting initial symbol discovery (fast)');
+    logger.info('Starting initial symbol discovery (WS → REST fallback chain)');
 
-    const all = await bybit.fetchAllSymbols();
-    if (!Array.isArray(all) || all.length === 0) {
-      logger.warn('poller.initialScan: fetchAllSymbols returned no symbols');
+    let allSymbols = [];
+
+    // STEP 1: Try WS initial scan first (if enabled)
+    const useWs = process.env.USE_WS === 'true';
+    if (useWs) {
+      try {
+        const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
+        logger.info({ timeoutMs: wsTimeoutMs }, 'Attempting WS initial scan with timeout');
+
+        allSymbols = await Promise.race([
+          this.performWsInitialScan(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('WS scan timeout')), wsTimeoutMs)
+          )
+        ]);
+
+        if (allSymbols && allSymbols.length > 0) {
+          logger.info({ wsSymbols: allSymbols.length }, 'WS initial scan succeeded, using WS symbols');
+        } else {
+          logger.warn('WS scan returned empty; falling back to REST API');
+          allSymbols = [];
+        }
+      } catch (e) {
+        logger.warn({ err: e && e.message ? e.message : String(e) }, 'WS scan failed, falling back to REST API cursor pagination');
+        allSymbols = [];
+      }
     }
 
-    const filtered = (all || []).filter(s => s && s.symbol);
+    // STEP 2: Fall back to REST API if WS didn't work
+    if (!allSymbols || allSymbols.length === 0) {
+      logger.info('Using REST API cursor pagination to fetch all symbols');
+      allSymbols = await bybit.fetchAllSymbols();
+    }
+
+    if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
+      logger.warn('initialScan: no symbols obtained from WS or REST API');
+      return;
+    }
+
+    // STEP 3: Apply seed strategy (SYMBOL_SEED_ALL controls whether to seed)
+    const seedSymbols = bybit.getSeedSymbols(allSymbols);
+    logger.info({ totalSymbols: allSymbols.length, seedSymbols: seedSymbols.length }, 'Symbol seeding strategy applied');
+
+    // STEP 4: Persist ALL discovered symbols to DB (not just seed symbols)
+    const filtered = (allSymbols || []).filter(s => s && s.symbol);
     const db = dbModule.get();
     const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
     const now = Date.now();
     const insertMany = db.transaction((rows) => {
       for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT$/i, ''), s.quote || 'USDT', now);
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT(\.P)?$/i, ''), s.quote || 'USDT', now);
       }
     });
     insertMany(filtered);
-    logger.info({ count: filtered.length }, 'Symbols saved (initialScan)');
+    logger.info({ count: filtered.length }, 'All discovered symbols saved to DB');
 
-    // start background seeding (non-blocking)
-    setImmediate(() => this.backgroundSeedKlines(filtered));
+    // STEP 5: Start background seeding for SEED symbols only (non-blocking)
+    if (seedSymbols && seedSymbols.length > 0) {
+      setImmediate(() => this.backgroundSeedKlines(seedSymbols));
+    } else {
+      logger.info('No symbols to seed (SYMBOL_SEED_ALL disabled or empty seed list)');
+    }
   },
 
   /**
-   * backgroundSeedKlines:
-   * - seed klines concurrently for the top SEED_TOP_SYMBOLS symbols
-   * - chunked batching with limiter to avoid bursts
+   * performWsInitialScan():
+   * Placeholder for WS-based initial scan (if wsManager has this capability)
+   * Falls back to empty array if method doesn't exist or throws
    */
-  async backgroundSeedKlines(allSymbols) {
+  async performWsInitialScan() {
     try {
-      if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
+      const wsManager = require('./bybitWs');
+      if (typeof wsManager.performInitialScan === 'function') {
+        logger.info('Calling wsManager.performInitialScan()');
+        const result = await wsManager.performInitialScan();
+        return Array.isArray(result) ? result : [];
+      } else {
+        logger.debug('wsManager.performInitialScan not implemented; skipping WS scan');
+        return [];
+      }
+    } catch (e) {
+      logger.debug({ err: e && e.message ? e.message : String(e) }, 'performWsInitialScan threw exception');
+      return [];
+    }
+  },
+
+  /**
+   * backgroundSeedKlines():
+   * - Concurrently seeds klines for all provided symbols (respects SYMBOL_SEED_ALL decision)
+   * - Uses limiter and batching to avoid overwhelming API
+   * - Non-blocking (runs in background)
+   */
+  async backgroundSeedKlines(symbols) {
+    try {
+      if (!Array.isArray(symbols) || symbols.length === 0) {
         logger.info('backgroundSeedKlines: no symbols to seed');
         return;
       }
 
-      const toSeed = allSymbols.slice(0, SEED_TOP_SYMBOLS);
-      logger.info({ count: toSeed.length, topN: SEED_TOP_SYMBOLS }, 'backgroundSeedKlines: starting seeding for top symbols');
+      logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting seeding for symbols');
 
-      for (let i = 0; i < toSeed.length; i += SEED_CONCURRENCY) {
-        const batch = toSeed.slice(i, i + SEED_CONCURRENCY);
-        const jobs = batch.map(sym => limiter.schedule(() => this.seedKlinesForSymbol(sym.symbol)));
+      // Process symbols in batches
+      for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
+        const batch = symbols.slice(i, i + SEED_CONCURRENCY);
+        const jobs = batch.map(sym =>
+          limiter.schedule(() => this.seedKlinesForSymbol(sym.symbol))
+        );
         await Promise.all(jobs);
       }
 
-      logger.info('backgroundSeedKlines: completed top-N seeding');
+      logger.info({ totalSeeded: symbols.length }, 'backgroundSeedKlines: completed seeding');
     } catch (err) {
       logger.error({ err }, 'backgroundSeedKlines: error during seeding');
     }
   },
 
   /**
-   * seedKlinesForSymbol(symbol, timeframe)
-   * - attempts to fetch klines and store them; computes MACD but continues on failure
+   * seedKlinesForSymbol(symbol, timeframe):
+   * - Fetches klines for symbol across ROOT_TFS
+   * - Stores to DB
+   * - Computes MACD but continues on failure
    */
   async seedKlinesForSymbol(symbol, timeframe) {
     const tfs = timeframe ? [timeframe] : (config.ROOT_TFS || []);
     for (const tf of tfs) {
       const interval = tf === 'D' ? 'D' : String(tf);
       try {
-        const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, SEED_KLINES_LIMIT));
+        const klines = await limiter.schedule(() =>
+          bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT)
+        );
         if (!klines || klines.length === 0) continue;
+
         const db = dbModule.get();
-        const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+        const insert = db.prepare(
+          'INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        );
         const insertMany = db.transaction((rows) => {
-          for (const k of rows) insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
+          for (const k of rows) {
+            insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
+          }
         });
         insertMany(klines);
+
         try {
           await macdUtil.computeAndStoreMacd(symbol, tf);
         } catch (e) {
@@ -165,7 +245,7 @@ module.exports = {
   },
 
   /**
-   * scanOnce: iterate symbols and check for root signals
+   * scanOnce(): iterate symbols and check for root signals
    */
   async scanOnce() {
     const db = dbModule.get();
@@ -180,7 +260,9 @@ module.exports = {
     const tfList = config.ROOT_TFS || [];
     for (const tf of tfList) {
       const db = dbModule.get();
-      const rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
+      const rows = db.prepare(
+        'SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2'
+      ).all(symbol, tf);
       if (rows.length < 2) {
         // try to seed quickly for missing tf
         await this.seedKlinesForSymbol(symbol, tf);
