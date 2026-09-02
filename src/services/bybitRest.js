@@ -5,7 +5,8 @@
  * - getOrderBase() chooses BYBIT_ORDER_BASE -> MAINNET -> fallback
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
- *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages like bybits.com).
+ *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
+ * - fetchAllSymbols: request v5 instrument endpoints with category=linear and treat API retCode/ret_code != 0 as failures.
  */
 
 const fetch = require('node-fetch');
@@ -144,10 +145,11 @@ function getOrderBase() {
 /**
  * probeHosts(timeoutMs)
  * - If BYBIT_REST_BASE is set, only probe that host and DO NOT persist a different host.
- * - Accept a host only if response looks like JSON or API-shaped JSON (prevents HTML pages being accepted).
+ * - Accept a host only if response looks like JSON or API-shaped JSON.
  */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
+  // If configured explicitly, only probe that single host (do not try other candidates)
   const list = configured ? [configured] : HOST_CANDIDATES.slice();
 
   logger.info({ candidates: list }, 'bybitRest: starting host probe');
@@ -158,6 +160,7 @@ async function probeHosts(timeoutMs = 5000) {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
+      // capture text for diagnostics
       let text = null;
       let parsed = null;
       try {
@@ -168,8 +171,11 @@ async function probeHosts(timeoutMs = 5000) {
       }
 
       if (res.ok) {
+        // Basic content-type guard:
         const ct = (res.headers && typeof res.headers.get === 'function') ? (res.headers.get('content-type') || '') : '';
         const looksLikeJson = /application\/json/i.test(ct) || (text && text.trim().startsWith('{'));
+
+        // Try to detect API-shaped JSON: has `result` or `ret_code`/`retCode` fields commonly in Bybit responses
         const parsedOkApi = parsed && (parsed.result || typeof parsed.ret_code !== 'undefined' || typeof parsed.retCode !== 'undefined');
 
         if (!looksLikeJson && !parsedOkApi) {
@@ -177,14 +183,25 @@ async function probeHosts(timeoutMs = 5000) {
           continue;
         }
 
+        // If API returned retCode/ret_code, ensure it's zero before accepting
+        if (parsed && (typeof parsed.retCode !== 'undefined' || typeof parsed.ret_code !== 'undefined')) {
+          const rc = typeof parsed.retCode !== 'undefined' ? parsed.retCode : parsed.ret_code;
+          if (rc !== 0) {
+            logger.debug({ host, path: testUrl, retCode: rc, snippet: text ? text.slice(0, 200) : null }, 'probeHosts: host returned API error retCode; skipping');
+            continue;
+          }
+        }
+
         lastProbeHostPath = { host, path: testUrl };
         lastProbeResponseText = text;
 
+        // If user explicitly configured BYBIT_REST_BASE, respect that and DO NOT overwrite it.
         if (configured) {
           logger.info({ configured }, 'probeHosts: configured BYBIT_REST_BASE responded OK; not persisting probe selection');
           return configured;
         }
 
+        // Otherwise accept and persist the host we probed
         chosenBase = host.replace(/\/$/, '');
         saveChosenBaseToDisk(chosenBase);
         if (parsed) {
@@ -247,7 +264,8 @@ async function fetchSymbolsFromCoinGecko(perPage = 250) {
 
 /**
  * fetchAllSymbols()
- * Use only the single base from getBase() for public symbol discovery.
+ * Behavior: use only the single base from getBase() for attempts.
+ * Last-resort fallback to CoinGecko.
  */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
@@ -259,9 +277,10 @@ async function fetchAllSymbols() {
     return [];
   }
 
+  // Ensure v5 instrument calls include category=linear so API returns linear instruments
   const candidates = [
-    { path: '/v5/market/instruments', params: {} },
-    { path: '/v5/market/instruments-info', params: {} },
+    { path: '/v5/market/instruments', params: { category: 'linear' } },
+    { path: '/v5/market/instruments-info', params: { category: 'linear' } },
     { path: '/v2/public/symbols', params: {} },
     { path: '/v2/public/tickers', params: {} }
   ];
@@ -291,6 +310,16 @@ async function fetchAllSymbols() {
         if (!res.ok) {
           logger.debug({ host, path: c.path, status: res.status }, 'attemptHostForSymbols: HTTP error');
           continue;
+        }
+
+        // If API uses retCode/ret_code semantics, treat non-zero as failure and skip this endpoint.
+        if (json && (typeof json.retCode !== 'undefined' || typeof json.ret_code !== 'undefined')) {
+          const rc = (typeof json.retCode !== 'undefined') ? json.retCode : json.ret_code;
+          const rm = json.retMsg || json.ret_msg || null;
+          if (rc !== 0) {
+            logger.debug({ host, path: c.path, retCode: rc, retMsg: rm, snippet: bodyText ? bodyText.slice(0,200) : null }, 'attemptHostForSymbols: API returned non-zero retCode; skipping endpoint');
+            continue;
+          }
         }
 
         lastOkHostPath = { host, path: c.path };
