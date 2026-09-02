@@ -7,8 +7,6 @@
  * - SYMBOL_SEED_ALL flag controls whether to seed all or none
  * - Fast initialScan followed by concurrent kline seeding
  * - Non-blocking probe on startup, open-trade gating until first aligned boundary
- * - On scan boundaries collects newly-detected signals and triggers telegram notifications (one per new signal)
- * - Detects new root-candle open for configured ROOT_TFS and triggers signalManager.newRootCandle
  */
 
 const dbModule = require('../db');
@@ -21,8 +19,8 @@ const signalManager = require('./signalManager');
 
 const limiter = new Bottleneck({ minTime: 50 });
 
-// Configurable concurrency for kline seeding
-const SEED_CONCURRENCY = Number(process.env.SEED_CONCURRENCY || 6);
+// Configurable concurrency for kline seeding (now from config)
+const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
 
@@ -95,7 +93,7 @@ module.exports = {
     let allSymbols = [];
 
     // STEP 1: Try WS initial scan first (if enabled)
-    const useWs = process.env.USE_WS === 'true';
+    const useWs = !!config.USE_WS;
     if (useWs) {
       try {
         const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
@@ -248,57 +246,18 @@ module.exports = {
 
   /**
    * scanOnce(): iterate symbols and check for root signals
-   * - collects newly detected signals during this scan and triggers notifications (one-per-signal)
    */
   async scanOnce() {
-    const db = dbModule;
-    const previousSnapshot = db.getLatestSignalsSnapshot();
-    const previousKeys = new Set(previousSnapshot.map(r => r.key));
-    const scanStart = Date.now();
-
-    const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-    const tasks = [];
+    const db = dbModule.get();
+    const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
     for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
       const page = rows.slice(i, i + config.PAGE_SIZE);
-      for (const r of page) {
-        // call scanSymbolRoots with notifyImmediately=false so notifications are sent once per-scan afterwards
-        tasks.push(this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
-      }
-      // throttle between pages
-      try { await Promise.all(tasks.splice(0, tasks.length)); } catch (e) { logger.debug({ e }, 'Error in scanning page tasks'); }
-    }
-
-    // After scanning, compute new snapshot and notify only new keys
-    const afterSnapshot = db.getLatestSignalsSnapshot();
-    const newSignals = afterSnapshot.filter(r => !previousKeys.has(r.key) && r.detected_at >= scanStart);
-
-    if (newSignals.length > 0) {
-      logger.info({ newSignals: newSignals.length }, 'scanOnce: new signals found this boundary; notifying one message per signal');
-      for (const s of newSignals) {
-        try {
-          // one telegram block per new signal
-          const telegram = require('./telegram');
-          await telegram.sendNewSignalSingleBlock(s);
-        } catch (e) {
-          logger.debug({ e, s }, 'Failed to send new-signal telegram block');
-        }
-      }
-    } else {
-      logger.info('scanOnce: no new signals found this boundary');
-    }
-
-    // persist last scan keys
-    try {
-      db.setState('lastScanAt', scanStart);
-      db.setState('lastScanSignals', afterSnapshot.map(r => r.key));
-    } catch (e) {
-      logger.debug({ e }, 'Failed to persist last scan state');
+      await Promise.all(page.map(r => this.scanSymbolRoots(r.symbol)));
     }
   },
 
-  async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
+  async scanSymbolRoots(symbol) {
     const tfList = config.ROOT_TFS || [];
-    const results = [];
     for (const tf of tfList) {
       const db = dbModule.get();
       const rows = db.prepare(
@@ -313,15 +272,12 @@ module.exports = {
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
           const signalManagerModule = require('./signalManager');
-          // pass notifyImmediately through
-          const sig = await signalManagerModule.handleRootSignal({ symbol, root_tf: tf, detected_at: detected_ts || Date.now(), notifyImmediately });
-          results.push(sig);
+          signalManagerModule.handleRootSignal({ symbol, root_tf: tf, detected_at: Date.now() });
         }
       } catch (err) {
         logger.debug({ err, symbol, tf }, 'Error checking flip');
       }
     }
-    return results;
   },
 
   scheduleAlignedTo5m() {
@@ -343,33 +299,7 @@ module.exports = {
       logger.info({ wait }, 'Next aligned scan in ms');
       setTimeout(async () => {
         try {
-          // Determine which root TFs open a new root-candle at this boundary
-          const now = new Date();
-          const newRootTfs = [];
-          const minute = now.getUTCMinutes();
-          const hour = now.getUTCHours();
-
-          for (const tf of config.ROOT_TFS) {
-            if (tf === 'D') {
-              if (hour === 0 && minute === 0) newRootTfs.push('D');
-            } else {
-              const tfNum = Number(tf);
-              if (!isNaN(tfNum) && ( (now.getTime() / 60000) % tfNum === 0 )) {
-                newRootTfs.push(String(tf));
-              }
-            }
-          }
-
           await this.scanOnce();
-
-          if (newRootTfs.length && config.NEW_ROOT_CANDLE_NOTIFY) {
-            try {
-              await signalManager.handleNewRootCandle(newRootTfs);
-            } catch (e) {
-              logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
-            }
-          }
-
           if (!firstBoundaryPassed) {
             firstBoundaryPassed = true;
             try {
