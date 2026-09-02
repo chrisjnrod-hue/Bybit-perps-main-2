@@ -52,6 +52,12 @@ module.exports = {
 
   COINGECKO_ENABLED: (process.env.COINGECKO_ENABLED === 'true'),
 
+  // NEW: notification/scan flags
+  // Seconds between root mid-scan if ROOT_MIDSCAN_INTERVAL not 0; used by poller
+  ROOT_SCAN_INTERVAL_SECS: Number(process.env.ROOT_SCAN_INTERVAL_SECS || 0),
+  // Whether to send root-candle open notifications
+  NEW_ROOT_CANDLE_NOTIFY: envBool('NEW_ROOT_CANDLE_NOTIFY', true),
+
   // Legacy compatibility flags
   BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
   BREAK_EVEN_TRAILING: (process.env.BREAK_EVEN_TRAILING === 'true'),
