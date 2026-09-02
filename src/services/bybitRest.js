@@ -1,14 +1,14 @@
 /**
  * src/services/bybitRest.js
  *
+ * FULLY UPDATED for cursor-based pagination and WS fallback:
  * - MAINNET / OPENTRADES aware order routing
  * - getOrderBase() chooses BYBIT_ORDER_BASE -> MAINNET -> fallback
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: request v5 instrument endpoints with category=linear, treat API retCode/ret_code != 0 as failures,
- *   and use more robust symbol filtering (by symbol suffix OR quote field). Now accepts USDT and USDT.P suffixes,
- *   merges unique symbols across endpoints, sorts A->Z, and provides a seeding helper to choose top-N or all.
+ * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (no topN limit)
+ * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
  */
 
 const fetch = require('node-fetch');
@@ -85,6 +85,7 @@ function saveChosenBaseToDisk(base) {
     logger.debug({ e }, 'bybitRest: failed to persist chosen base');
   }
 }
+
 loadChosenBaseFromDisk();
 
 /** Fetch wrapper with timeout using AbortController */
@@ -265,247 +266,257 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 }
 
 /**
- * fetchAllSymbols()
- * Behavior: use only the single base from getBase() for attempts.
- * Last-resort fallback to CoinGecko.
+ * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION
+ * 
+ * Fetches ALL USDT/USDT.P perpetual pairs using cursor-based pagination.
+ * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
+ * 
+ * Algorithm:
+ * 1. Use getBase() for single authoritative host
+ * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
+ * 3. Filter by USDT/USDT.P suffix
+ * 4. Accumulate ALL matching symbols
+ * 5. Remove duplicates and sort A->Z
+ * 6. Fall back to CoinGecko if REST fails
  */
 async function fetchAllSymbols() {
-  logger.info('bybitRest.fetchAllSymbols: start');
+  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for all symbols');
 
-  // Accept USDT or USDT.P suffix (case-insensitive). Also allow override via SYMBOL_FILTER_REGEX env.
-  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p)?$/i;
+  // Symbol filter: accept USDT or USDT.P suffix (case-insensitive)
+  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
+    ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
+    : /usdt(\.p)?$/i;
 
-  // TARGET_SYMBOLS: if initial harvest < target, attempt extended harvest
-  const TARGET_SYMBOLS = process.env.SYMBOL_TARGET ? Number(process.env.SYMBOL_TARGET) : 700;
   const base = getBase();
   if (!base) {
     logger.warn('fetchAllSymbols: no base available (getBase returned null)');
     return [];
   }
 
-  // Conservative candidate endpoints (first pass)
-  const candidates = [
-    { path: '/v5/market/instruments', params: { category: 'linear' } },
-    { path: '/v5/market/instruments-info', params: { category: 'linear' } },
-    { path: '/v2/public/symbols', params: {} },
-    { path: '/v2/public/tickers', params: {} }
-  ];
+  const allSymbols = [];
+  let cursor = null;
+  const limit = config.BYBIT_PAGINATION_LIMIT || 1000;
+  let pageNum = 0;
+  let totalRawInstruments = 0;
+  let totalFiltered = 0;
 
-  // Extended candidate endpoints (used when initial harvest is below TARGET_SYMBOLS)
-  const extendedCandidates = [
-    { path: '/v5/market/instruments', params: {} },            // broader - no category filter
-    { path: '/v5/market/instruments-info', params: {} },       // broader
-    { path: '/v5/market/tickers', params: {} },
-    { path: '/v2/public/symbols', params: {} },
-    { path: '/v2/public/tickers', params: {} }
-  ];
+  try {
+    // ===== CURSOR PAGINATION LOOP =====
+    while (true) {
+      pageNum++;
+      
+      // Build request params
+      const params = {
+        category: 'linear',
+        instrumentType: 'PERPETUAL',
+        limit: String(limit)
+      };
 
-  let lastOkResponseText = null;
-  let lastOkHostPath = null;
+      if (cursor) {
+        params.cursor = cursor;
+      }
 
-  async function attemptHostForSymbols(host, candidateList, timeoutMs = 8000) {
-    for (const c of candidateList) {
+      // Build URL
+      const url = new URL(`${base.replace(/\/$/, '')}/v5/market/instruments-info`);
+      Object.entries(params).forEach(([k, v]) => {
+        url.searchParams.append(k, String(v));
+      });
+
+      logger.info(
+        { page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() },
+        'fetchAllSymbols: fetching page'
+      );
+
+      // Fetch with timeout
+      const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 10000);
+      let json = null;
+      let bodyText = null;
+
       try {
-        const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
-        Object.entries(c.params || {}).forEach(([k, v]) => {
-          if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
-        });
-
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, timeoutMs);
-
-        let json = null;
-        let bodyText = null;
+        bodyText = await res.text();
         try {
-          bodyText = await res.text();
-          try { json = JSON.parse(bodyText); } catch (e) { json = null; }
+          json = JSON.parse(bodyText);
         } catch (e) {
-          bodyText = null;
+          json = null;
         }
+      } catch (e) {
+        bodyText = null;
+      }
 
-        if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status }, 'attemptHostForSymbols: HTTP error');
-          continue;
+      // Handle HTTP errors
+      if (!res.ok) {
+        logger.warn(
+          { status: res.status, page: pageNum, url: url.toString() },
+          'fetchAllSymbols: HTTP error, stopping pagination'
+        );
+        break;
+      }
+
+      // Handle invalid JSON
+      if (!json) {
+        logger.warn(
+          { page: pageNum, snippet: bodyText ? bodyText.slice(0, 200) : null },
+          'fetchAllSymbols: invalid JSON response, stopping pagination'
+        );
+        break;
+      }
+
+      // Check for API error codes (ret_code or retCode)
+      if (typeof json.ret_code !== 'undefined' || typeof json.retCode !== 'undefined') {
+        const rc = typeof json.ret_code !== 'undefined' ? json.ret_code : json.retCode;
+        const rm = json.ret_msg || json.retMsg || null;
+        if (rc !== 0) {
+          logger.warn(
+            { retCode: rc, retMsg: rm, page: pageNum },
+            'fetchAllSymbols: API returned non-zero retCode, stopping pagination'
+          );
+          break;
         }
+      }
 
-        // If API uses retCode/ret_code semantics, treat non-zero as failure and skip this endpoint.
-        if (json && (typeof json.retCode !== 'undefined' || typeof json.ret_code !== 'undefined')) {
-          const rc = (typeof json.retCode !== 'undefined') ? json.retCode : json.ret_code;
-          const rm = json.retMsg || json.ret_msg || null;
-          if (rc !== 0) {
-            logger.debug({ host, path: c.path, retCode: rc, retMsg: rm, snippet: bodyText ? bodyText.slice(0,200) : null }, 'attemptHostForSymbols: API returned non-zero retCode; skipping endpoint');
-            continue;
-          }
-        }
+      const result = json.result || {};
+      const instruments = result.list || [];
 
-        lastOkHostPath = { host, path: c.path };
-        lastOkResponseText = bodyText;
+      // Process page
+      if (instruments.length > 0) {
+        totalRawInstruments += instruments.length;
+        logger.info(
+          { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
+          'fetchAllSymbols: page fetched, applying USDT filter'
+        );
 
-        let symbols = null;
-        if (json && json.result && Array.isArray(json.result.list)) {
-          symbols = json.result.list.map(it => ({
-            symbol: it.symbol || it.name || null,
-            base: it.baseCoin || it.base || null,
-            quote: it.quoteCoin || it.quote || null,
-            status: it.status || it.state || null
-          })).filter(Boolean);
-        } else if (json && json.result && Array.isArray(json.result)) {
-          symbols = json.result.map(it => ({
-            symbol: it.symbol || it.name || null,
-            base: it.baseCoin || it.base || null,
-            quote: it.quoteCoin || it.quote || null,
-            status: it.status || it.state || null
-          })).filter(Boolean);
-        } else if (Array.isArray(json)) {
-          symbols = json.map(it => ({
-            symbol: it.symbol || it.name || null,
-            base: it.base || it.baseCoin || null,
-            quote: it.quote || it.quoteCoin || null,
-            status: it.status || it.state || null
-          })).filter(Boolean);
-        } else {
-          logger.debug({ host, path: c.path, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 400) : null }, 'attemptHostForSymbols: parsed json null despite HTTP OK');
-        }
-
-        if (symbols && symbols.length) {
-          // More robust filtering: accept if symbol matches regex OR quote === 'USDT' OR symbol endsWith 'USDT' / 'USDT.P'
-          const filtered = symbols.filter(s => {
-            if (!s || !s.symbol) return false;
+        // Filter for USDT/USDT.P pairs
+        const filtered = instruments
+          .filter(it => {
+            if (!it || !it.symbol) return false;
             try {
-              const sym = String(s.symbol);
-              const quote = String(s.quote || '').toUpperCase();
-              // regex match (handles USDT and USDT.P)
+              const sym = String(it.symbol);
+              const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
+
+              // Match by regex (handles USDT and USDT.P)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
-              // explicit quote field equals USDT
+
+              // Match by explicit quote field
               if (quote === 'USDT') return true;
-              // symbol string ends with USDT or USDT.P
+
+              // Match by symbol suffix
               const su = sym.toUpperCase();
               if (su.endsWith('USDT') || su.endsWith('USDT.P')) return true;
             } catch (e) {
               return false;
             }
             return false;
-          });
+          })
+          .map(it => ({
+            symbol: it.symbol,
+            base: it.baseCoin || it.base || null,
+            quote: it.quoteCoin || it.quote || 'USDT',
+            status: it.status || null
+          }));
 
-          logger.info({ host, path: c.path, fetched: symbols.length, filtered: filtered.length }, 'attemptHostForSymbols: fetched symbols from host endpoint');
+        allSymbols.push(...filtered);
+        totalFiltered += filtered.length;
 
-          // Return both filtered list and raw count so caller can decide whether to expand
-          return { symbols: filtered, rawCount: symbols.length };
-        }
-      } catch (err) {
-        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'attemptHostForSymbols: candidate threw');
+        logger.info(
+          {
+            page: pageNum,
+            pageSize: instruments.length,
+            filtered: filtered.length,
+            totalAccumulated: allSymbols.length
+          },
+          'fetchAllSymbols: page filtered and accumulated'
+        );
+      } else {
+        logger.info({ page: pageNum }, 'fetchAllSymbols: empty page received');
+      }
+
+      // Check for next page cursor
+      cursor = result.nextPageCursor;
+      if (!cursor) {
+        logger.info(
+          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments },
+          'fetchAllSymbols: no nextPageCursor found, pagination complete'
+        );
+        break;
+      }
+
+      // Small delay between pages to avoid hammering API
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    if (allSymbols.length === 0) {
+      logger.warn(
+        { totalRawInstruments, totalFiltered },
+        'fetchAllSymbols: no symbols matched USDT filter after full pagination'
+      );
+      return [];
+    }
+
+    // ===== DEDUP & SORT =====
+    const uniqueMap = new Map();
+    for (const s of allSymbols) {
+      const key = String(s.symbol).toUpperCase();
+      if (!uniqueMap.has(key)) {
+        uniqueMap.set(key, {
+          symbol: String(s.symbol),
+          base: s.base || null,
+          quote: s.quote || 'USDT',
+          status: s.status || null
+        });
       }
     }
-    return { symbols: null };
-  }
 
-  function mergeUniqueSymbols(arrays) {
-    const map = new Map();
-    for (const arr of arrays) {
-      if (!Array.isArray(arr)) continue;
-      for (const s of arr) {
-        if (!s || !s.symbol) continue;
-        const key = String(s.symbol).toUpperCase();
-        if (!map.has(key)) {
-          map.set(key, {
-            symbol: String(s.symbol),
-            base: s.base || null,
-            quote: s.quote || null,
-            status: s.status || null
-          });
-        }
-      }
-    }
-    // Return alphabetically sorted A->Z (case-insensitive)
-    const out = Array.from(map.values()).sort((a, b) => {
+    const unique = Array.from(uniqueMap.values());
+    unique.sort((a, b) => {
       const A = String(a.symbol || '').toUpperCase();
       const B = String(b.symbol || '').toUpperCase();
       if (A < B) return -1;
       if (A > B) return 1;
       return 0;
     });
-    return out;
-  }
 
-  try {
-    // First, try the standard candidate list
-    const firstAttempt = await attemptHostForSymbols(base, candidates, 8000);
-    if (Array.isArray(firstAttempt.symbols) && firstAttempt.symbols.length) {
-      lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
-      lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
+    logger.info(
+      {
+        totalUnique: unique.length,
+        sampleFirst: unique.slice(0, 5).map(s => s.symbol),
+        sampleLast: unique.slice(-5).map(s => s.symbol)
+      },
+      'fetchAllSymbols: returning all unique symbols (sorted A-Z)'
+    );
 
-      // If we already have enough symbols, return them sorted
-      if (firstAttempt.symbols.length >= TARGET_SYMBOLS) {
-        const merged = mergeUniqueSymbols([firstAttempt.symbols]);
-        logger.info({ base, count: merged.length }, 'fetchAllSymbols: base returned sufficient symbols (initial pass)');
-        return merged;
-      }
+    return unique;
 
-      // Otherwise, attempt extended harvest on the same base to gather more unique symbols
-      logger.info({ base, initialCount: firstAttempt.symbols.length, target: TARGET_SYMBOLS }, 'fetchAllSymbols: initial harvest below target, attempting extended harvest on same base');
-      const secondAttempt = await attemptHostForSymbols(base, extendedCandidates, 10000);
-
-      const combined = mergeUniqueSymbols([firstAttempt.symbols, secondAttempt.symbols || []]);
-      logger.info({ base, combinedCount: combined.length, initial: firstAttempt.symbols.length, second: (secondAttempt.symbols ? secondAttempt.symbols.length : 0) }, 'fetchAllSymbols: extended harvest complete, merged unique symbols');
-
-      if (combined.length) {
-        logger.info({ sampleFirst: combined.slice(0, 5).map(s => s.symbol), sampleLast: combined.slice(-5).map(s => s.symbol) }, 'fetchAllSymbols: returning combined symbol list (sorted A->Z)');
-        return combined;
-      } else {
-        // If merge failed but initial had something, return initial (sorted & unique)
-        const onlyInitial = mergeUniqueSymbols([firstAttempt.symbols]);
-        logger.warn({ base, initialCount: firstAttempt.symbols.length }, 'fetchAllSymbols: extended harvest yielded no new symbols; returning initial filtered set');
-        return onlyInitial;
-      }
-    } else if (Array.isArray(firstAttempt.symbols) && firstAttempt.symbols.length === 0) {
-      logger.warn({ base, rawCount: firstAttempt.rawCount }, 'fetchAllSymbols: base returned symbols but none matched filter; returning empty (no fallback hosts used)');
-    } else {
-      logger.warn({ base }, 'fetchAllSymbols: base attempt failed to produce symbols; returning empty (no fallback hosts used)');
-    }
   } catch (e) {
-    logger.debug({ e }, 'fetchAllSymbols: base exclusive attempt threw, returning empty (no fallback hosts used)');
+    logger.error({ e }, 'fetchAllSymbols: exception during pagination');
+    return [];
   }
-
-  if (lastOkHostPath) {
-    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: base failed but there was an OK response snippet (included)');
-  } else {
-    logger.warn('fetchAllSymbols: base returned no HTTP OK during attempts');
-  }
-
-  // Last-resort CoinGecko fallback (filtered)
-  try {
-    const cgSymbols = await fetchSymbolsFromCoinGecko(500);
-    if (cgSymbols && cgSymbols.length) {
-      const filtered = cgSymbols.filter(s => s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
-      const uniqueSorted = mergeUniqueSymbols([filtered]);
-      logger.info({ count: uniqueSorted.length }, 'fetchAllSymbols: fallback to CoinGecko (filtered) succeeded');
-      return uniqueSorted;
-    }
-    logger.warn('fetchAllSymbols: CoinGecko fallback returned no symbols');
-  } catch (e) {
-    logger.debug({ e }, 'fetchAllSymbols: CoinGecko fallback threw');
-  }
-
-  return [];
 }
 
 /**
- * Helper to derive seed list (top N vs all) for initial kline seeding / subscriptions.
- * - If SYMBOL_SEED_ALL=true, return the full symbol list (sorted A->Z).
- * - Otherwise return the first SYMBOL_SEED_TOPN symbols (default 100).
- *
- * Other modules should call getSeedSymbols(fetchAllSymbolsResult) when deciding
- * which symbols to seed initially.
+ * getSeedSymbols(symbols) - UPDATED
+ * 
+ * Respects only SYMBOL_SEED_ALL flag (no topN cutting).
+ * - If SYMBOL_SEED_ALL=true: return ALL symbols for seeding
+ * - If SYMBOL_SEED_ALL=false: return empty array (no seeding)
  */
 function getSeedSymbols(symbols) {
   if (!Array.isArray(symbols)) return [];
+
   const seedAll = envBool('SYMBOL_SEED_ALL', false);
-  const topN = process.env.SYMBOL_SEED_TOPN ? Number(process.env.SYMBOL_SEED_TOPN) : 100;
+
   if (seedAll) {
-    logger.info({ totalSymbols: symbols.length }, 'getSeedSymbols: SYMBOL_SEED_ALL enabled — seeding all symbols');
-    return symbols.slice(); // copy
+    logger.info(
+      { totalSymbols: symbols.length },
+      'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL symbols'
+    );
+    return symbols.slice(); // return copy of all
   }
-  logger.info({ totalSymbols: symbols.length, seedTopN: topN }, 'getSeedSymbols: returning top N symbols for seeding');
-  return symbols.slice(0, topN);
+
+  logger.warn(
+    { totalSymbols: symbols.length },
+    'getSeedSymbols: SYMBOL_SEED_ALL=false, no symbols seeded (set SYMBOL_SEED_ALL=true to enable seeding)'
+  );
+  return [];
 }
 
 /**
@@ -887,6 +898,7 @@ async function reprobe(timeoutMs = 5000) {
   return base;
 }
 
+// ===== EXPORTS =====
 module.exports = {
   probeHosts,
   getBase,
@@ -899,9 +911,8 @@ module.exports = {
   setPositionTradingStop,
   fetchOpenOrders,
   fetchOpenPositions,
-  // new helper for seeding
   getSeedSymbols,
-  // diagnostics
   getLastProbeInfo,
-  reprobe
+  reprobe,
+  envBool
 };
