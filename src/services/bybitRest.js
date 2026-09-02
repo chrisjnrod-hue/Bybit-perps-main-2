@@ -234,7 +234,7 @@ async function probeHosts(timeoutMs = 5000) {
 }
 
 /** Helper: fetch symbols from CoinGecko markets as a fallback */
-async function fetchSymbolsFromCoinGecko(perPage = 250) {
+async function fetchSymbolsFromCoinGecko(perPage = 500) {
   try {
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
     const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
@@ -272,6 +272,7 @@ async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
 
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p|\.P|P)?$/i;
+  const TARGET_SYMBOLS = process.env.SYMBOL_TARGET ? Number(process.env.SYMBOL_TARGET) : 700;
   const base = getBase();
   if (!base) {
     logger.warn('fetchAllSymbols: no base available (getBase returned null)');
@@ -286,11 +287,20 @@ async function fetchAllSymbols() {
     { path: '/v2/public/tickers', params: {} }
   ];
 
+  // Additional, broader candidates to try when initial harvest returns fewer than TARGET_SYMBOLS
+  const extendedCandidates = [
+    { path: '/v5/market/instruments', params: {} },            // no category filter - broader
+    { path: '/v5/market/instruments-info', params: {} },       // no category filter
+    { path: '/v5/market/tickers', params: {} },                // many tickers
+    { path: '/v2/public/symbols', params: {} },                // may be duplicate but harmless
+    { path: '/v2/public/tickers', params: {} }
+  ];
+
   let lastOkResponseText = null;
   let lastOkHostPath = null;
 
-  async function attemptHostForSymbols(host, timeoutMs = 8000) {
-    for (const c of candidates) {
+  async function attemptHostForSymbols(host, candidateList, timeoutMs = 8000) {
+    for (const c of candidateList) {
       try {
         const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
         Object.entries(c.params || {}).forEach(([k, v]) => {
@@ -371,15 +381,10 @@ async function fetchAllSymbols() {
             return false;
           });
 
-          if (filtered.length) {
-            logger.info({ host, path: c.path, count: filtered.length }, 'attemptHostForSymbols: fetched and filtered symbols from host');
-            return { symbols: filtered };
-          } else {
-            // Log a sample of returned symbols to help debug why filtering failed
-            const sample = symbols.slice(0, 10).map(s => ({ symbol: s.symbol, base: s.base, quote: s.quote }));
-            logger.warn({ host, path: c.path, rawCount: symbols.length, sample }, 'attemptHostForSymbols: no symbols matched filter (sample shown)');
-            return { symbols: [], rawCount: symbols.length };
-          }
+          logger.info({ host, path: c.path, fetched: symbols.length, filtered: filtered.length }, 'attemptHostForSymbols: fetched symbols from host endpoint');
+
+          // Return both filtered list and raw count so caller can decide whether to expand
+          return { symbols: filtered, rawCount: symbols.length };
         }
       } catch (err) {
         logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'attemptHostForSymbols: candidate threw');
@@ -388,14 +393,55 @@ async function fetchAllSymbols() {
     return { symbols: null };
   }
 
+  function mergeUniqueSymbols(arrays) {
+    const map = new Map();
+    for (const arr of arrays) {
+      if (!Array.isArray(arr)) continue;
+      for (const s of arr) {
+        if (!s || !s.symbol) continue;
+        const key = String(s.symbol).toUpperCase();
+        if (!map.has(key)) {
+          map.set(key, {
+            symbol: String(s.symbol),
+            base: s.base || null,
+            quote: s.quote || null,
+            status: s.status || null
+          });
+        }
+      }
+    }
+    return Array.from(map.values());
+  }
+
   try {
-    const result = await attemptHostForSymbols(base, 8000);
-    if (Array.isArray(result.symbols) && result.symbols.length) {
+    // First, try the standard candidate list
+    const firstAttempt = await attemptHostForSymbols(base, candidates, 8000);
+    if (Array.isArray(firstAttempt.symbols) && firstAttempt.symbols.length) {
       lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
       lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
-      return result.symbols;
-    } else if (Array.isArray(result.symbols) && result.symbols.length === 0) {
-      logger.warn({ base, rawCount: result.rawCount }, 'fetchAllSymbols: base returned symbols but none matched filter; returning empty (no fallback hosts used)');
+
+      // If we already have enough symbols, return them
+      if (firstAttempt.symbols.length >= TARGET_SYMBOLS) {
+        logger.info({ base, count: firstAttempt.symbols.length }, 'fetchAllSymbols: base returned sufficient symbols (initial pass)');
+        return firstAttempt.symbols;
+      }
+
+      // Otherwise, attempt extended harvest on the same base to gather more unique symbols
+      logger.info({ base, initialCount: firstAttempt.symbols.length, target: TARGET_SYMBOLS }, 'fetchAllSymbols: initial harvest below target, attempting extended harvest on same base');
+      const secondAttempt = await attemptHostForSymbols(base, extendedCandidates, 10000);
+
+      const combined = mergeUniqueSymbols([firstAttempt.symbols, secondAttempt.symbols || []]);
+      logger.info({ base, combinedCount: combined.length, initial: firstAttempt.symbols.length, second: (secondAttempt.symbols ? secondAttempt.symbols.length : 0) }, 'fetchAllSymbols: extended harvest complete, merged unique symbols');
+
+      if (combined.length) {
+        return combined;
+      } else {
+        // If merge failed but initial had something, return initial
+        logger.warn({ base, initialCount: firstAttempt.symbols.length }, 'fetchAllSymbols: extended harvest yielded no new symbols; returning initial filtered set');
+        return firstAttempt.symbols;
+      }
+    } else if (Array.isArray(firstAttempt.symbols) && firstAttempt.symbols.length === 0) {
+      logger.warn({ base, rawCount: firstAttempt.rawCount }, 'fetchAllSymbols: base returned symbols but none matched filter; returning empty (no fallback hosts used)');
     } else {
       logger.warn({ base }, 'fetchAllSymbols: base attempt failed to produce symbols; returning empty (no fallback hosts used)');
     }
@@ -411,7 +457,7 @@ async function fetchAllSymbols() {
 
   // Last-resort CoinGecko fallback (filtered)
   try {
-    const cgSymbols = await fetchSymbolsFromCoinGecko(250);
+    const cgSymbols = await fetchSymbolsFromCoinGecko(500);
     if (cgSymbols && cgSymbols.length) {
       const filtered = cgSymbols.filter(s => s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
       logger.info({ count: filtered.length }, 'fetchAllSymbols: fallback to CoinGecko (filtered) succeeded');
