@@ -7,7 +7,8 @@
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
  * - fetchAllSymbols: request v5 instrument endpoints with category=linear, treat API retCode/ret_code != 0 as failures,
- *   and use more robust symbol filtering (by symbol suffix OR quote field).
+ *   and use more robust symbol filtering (by symbol suffix OR quote field). Now accepts USDT and USDT.P suffixes,
+ *   merges unique symbols across endpoints, sorts A->Z, and provides a seeding helper to choose top-N or all.
  */
 
 const fetch = require('node-fetch');
@@ -271,7 +272,10 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
 
-  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p|\.P|P)?$/i;
+  // Accept USDT or USDT.P suffix (case-insensitive). Also allow override via SYMBOL_FILTER_REGEX env.
+  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p)?$/i;
+
+  // TARGET_SYMBOLS: if initial harvest < target, attempt extended harvest
   const TARGET_SYMBOLS = process.env.SYMBOL_TARGET ? Number(process.env.SYMBOL_TARGET) : 700;
   const base = getBase();
   if (!base) {
@@ -279,7 +283,7 @@ async function fetchAllSymbols() {
     return [];
   }
 
-  // Ensure v5 instrument calls include category=linear so API returns linear instruments
+  // Conservative candidate endpoints (first pass)
   const candidates = [
     { path: '/v5/market/instruments', params: { category: 'linear' } },
     { path: '/v5/market/instruments-info', params: { category: 'linear' } },
@@ -287,12 +291,12 @@ async function fetchAllSymbols() {
     { path: '/v2/public/tickers', params: {} }
   ];
 
-  // Additional, broader candidates to try when initial harvest returns fewer than TARGET_SYMBOLS
+  // Extended candidate endpoints (used when initial harvest is below TARGET_SYMBOLS)
   const extendedCandidates = [
-    { path: '/v5/market/instruments', params: {} },            // no category filter - broader
-    { path: '/v5/market/instruments-info', params: {} },       // no category filter
-    { path: '/v5/market/tickers', params: {} },                // many tickers
-    { path: '/v2/public/symbols', params: {} },                // may be duplicate but harmless
+    { path: '/v5/market/instruments', params: {} },            // broader - no category filter
+    { path: '/v5/market/instruments-info', params: {} },       // broader
+    { path: '/v5/market/tickers', params: {} },
+    { path: '/v2/public/symbols', params: {} },
     { path: '/v2/public/tickers', params: {} }
   ];
 
@@ -363,18 +367,19 @@ async function fetchAllSymbols() {
         }
 
         if (symbols && symbols.length) {
-          // More robust filtering: accept if symbol matches regex OR quote === 'USDT' OR symbol endsWith 'USDT'
+          // More robust filtering: accept if symbol matches regex OR quote === 'USDT' OR symbol endsWith 'USDT' / 'USDT.P'
           const filtered = symbols.filter(s => {
             if (!s || !s.symbol) return false;
             try {
               const sym = String(s.symbol);
               const quote = String(s.quote || '').toUpperCase();
-              // regex match
+              // regex match (handles USDT and USDT.P)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
               // explicit quote field equals USDT
               if (quote === 'USDT') return true;
-              // symbol string ends with USDT
-              if (sym.toUpperCase().endsWith('USDT')) return true;
+              // symbol string ends with USDT or USDT.P
+              const su = sym.toUpperCase();
+              if (su.endsWith('USDT') || su.endsWith('USDT.P')) return true;
             } catch (e) {
               return false;
             }
@@ -410,7 +415,15 @@ async function fetchAllSymbols() {
         }
       }
     }
-    return Array.from(map.values());
+    // Return alphabetically sorted A->Z (case-insensitive)
+    const out = Array.from(map.values()).sort((a, b) => {
+      const A = String(a.symbol || '').toUpperCase();
+      const B = String(b.symbol || '').toUpperCase();
+      if (A < B) return -1;
+      if (A > B) return 1;
+      return 0;
+    });
+    return out;
   }
 
   try {
@@ -420,10 +433,11 @@ async function fetchAllSymbols() {
       lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
       lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
 
-      // If we already have enough symbols, return them
+      // If we already have enough symbols, return them sorted
       if (firstAttempt.symbols.length >= TARGET_SYMBOLS) {
-        logger.info({ base, count: firstAttempt.symbols.length }, 'fetchAllSymbols: base returned sufficient symbols (initial pass)');
-        return firstAttempt.symbols;
+        const merged = mergeUniqueSymbols([firstAttempt.symbols]);
+        logger.info({ base, count: merged.length }, 'fetchAllSymbols: base returned sufficient symbols (initial pass)');
+        return merged;
       }
 
       // Otherwise, attempt extended harvest on the same base to gather more unique symbols
@@ -434,11 +448,13 @@ async function fetchAllSymbols() {
       logger.info({ base, combinedCount: combined.length, initial: firstAttempt.symbols.length, second: (secondAttempt.symbols ? secondAttempt.symbols.length : 0) }, 'fetchAllSymbols: extended harvest complete, merged unique symbols');
 
       if (combined.length) {
+        logger.info({ sampleFirst: combined.slice(0, 5).map(s => s.symbol), sampleLast: combined.slice(-5).map(s => s.symbol) }, 'fetchAllSymbols: returning combined symbol list (sorted A->Z)');
         return combined;
       } else {
-        // If merge failed but initial had something, return initial
+        // If merge failed but initial had something, return initial (sorted & unique)
+        const onlyInitial = mergeUniqueSymbols([firstAttempt.symbols]);
         logger.warn({ base, initialCount: firstAttempt.symbols.length }, 'fetchAllSymbols: extended harvest yielded no new symbols; returning initial filtered set');
-        return firstAttempt.symbols;
+        return onlyInitial;
       }
     } else if (Array.isArray(firstAttempt.symbols) && firstAttempt.symbols.length === 0) {
       logger.warn({ base, rawCount: firstAttempt.rawCount }, 'fetchAllSymbols: base returned symbols but none matched filter; returning empty (no fallback hosts used)');
@@ -460,8 +476,9 @@ async function fetchAllSymbols() {
     const cgSymbols = await fetchSymbolsFromCoinGecko(500);
     if (cgSymbols && cgSymbols.length) {
       const filtered = cgSymbols.filter(s => s.symbol && DEFAULT_SYMBOL_FILTER.test(String(s.symbol)));
-      logger.info({ count: filtered.length }, 'fetchAllSymbols: fallback to CoinGecko (filtered) succeeded');
-      return filtered;
+      const uniqueSorted = mergeUniqueSymbols([filtered]);
+      logger.info({ count: uniqueSorted.length }, 'fetchAllSymbols: fallback to CoinGecko (filtered) succeeded');
+      return uniqueSorted;
     }
     logger.warn('fetchAllSymbols: CoinGecko fallback returned no symbols');
   } catch (e) {
@@ -469,6 +486,26 @@ async function fetchAllSymbols() {
   }
 
   return [];
+}
+
+/**
+ * Helper to derive seed list (top N vs all) for initial kline seeding / subscriptions.
+ * - If SYMBOL_SEED_ALL=true, return the full symbol list (sorted A->Z).
+ * - Otherwise return the first SYMBOL_SEED_TOPN symbols (default 100).
+ *
+ * Other modules should call getSeedSymbols(fetchAllSymbolsResult) when deciding
+ * which symbols to seed initially.
+ */
+function getSeedSymbols(symbols) {
+  if (!Array.isArray(symbols)) return [];
+  const seedAll = envBool('SYMBOL_SEED_ALL', false);
+  const topN = process.env.SYMBOL_SEED_TOPN ? Number(process.env.SYMBOL_SEED_TOPN) : 100;
+  if (seedAll) {
+    logger.info({ totalSymbols: symbols.length }, 'getSeedSymbols: SYMBOL_SEED_ALL enabled — seeding all symbols');
+    return symbols.slice(); // copy
+  }
+  logger.info({ totalSymbols: symbols.length, seedTopN: topN }, 'getSeedSymbols: returning top N symbols for seeding');
+  return symbols.slice(0, topN);
 }
 
 /**
@@ -862,6 +899,8 @@ module.exports = {
   setPositionTradingStop,
   fetchOpenOrders,
   fetchOpenPositions,
+  // new helper for seeding
+  getSeedSymbols,
   // diagnostics
   getLastProbeInfo,
   reprobe
