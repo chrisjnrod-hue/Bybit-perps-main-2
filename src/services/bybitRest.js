@@ -1,11 +1,11 @@
 /**
  * src/services/bybitRest.js
  *
- * - Ensures chosenBase (from probeHosts or config) is tried first exclusively.
- * - Falls back to candidate hosts only if chosenBase fails.
- * - Persists chosenBase to disk and records probe diagnostics.
- * - Filters returned symbols to USDT/perp-like by default (configurable via SYMBOL_FILTER_REGEX).
- * - Full helper implementations (klines, ticker, signed v5 account/order calls).
+ * - MAINNET / OPENTRADES aware order routing
+ * - getOrderBase() chooses BYBIT_ORDER_BASE -> MAINNET -> fallback
+ * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
+ * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
+ *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages like bybits.com).
  */
 
 const fetch = require('node-fetch');
@@ -34,19 +34,39 @@ const CHOSEN_BASE_FILE = path.join(__dirname, '..', 'data', 'chosen_bybit_base.t
 let lastProbeHostPath = null;
 let lastProbeResponseText = null;
 
+/* Env boolean helper */
+function envBool(name, defaultVal = false) {
+  if (typeof process.env[name] === 'undefined') return defaultVal;
+  const v = String(process.env[name]).toLowerCase().trim();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+const OPENTRADES = envBool('OPENTRADES', false);
+const MAINNET = envBool('MAINNET', true);
+
+/* Configured base helper */
 function getConfiguredBase() {
   const envBase = process.env.BYBIT_REST_BASE || (config && config.BYBIT_REST_BASE);
   if (!envBase) return null;
   return String(envBase).replace(/\/$/, '');
 }
 
+/**
+ * Load chosen base from disk but do not let it override an explicit BYBIT_REST_BASE or MAINNET env var.
+ */
 function loadChosenBaseFromDisk() {
   try {
     if (fs.existsSync(CHOSEN_BASE_FILE)) {
       const b = String(fs.readFileSync(CHOSEN_BASE_FILE, 'utf8') || '').trim();
       if (b) {
-        chosenBase = b.replace(/\/$/, '');
-        logger.info({ chosenBase }, 'bybitRest: loaded chosenBase from disk');
+        const configured = getConfiguredBase();
+        const hasMainnetEnv = typeof process.env.MAINNET !== 'undefined';
+        if (!configured && !hasMainnetEnv) {
+          chosenBase = b.replace(/\/$/, '');
+          logger.info({ chosenBase }, 'bybitRest: loaded chosenBase from disk');
+        } else {
+          logger.info({ diskChosen: b, configured, MAINNET: process.env.MAINNET }, 'bybitRest: ignoring chosen_bybit_base.txt because environment/config is present');
+        }
       }
     }
   } catch (e) {
@@ -96,13 +116,39 @@ function getBase() {
 }
 
 /**
+ * getOrderBase()
+ * Prefer BYBIT_ORDER_BASE; if MAINNET env is present, obey it (MAINNET=true -> mainnet, false -> testnet).
+ * Otherwise fallback to getBase().
+ */
+function getOrderBase() {
+  const explicit = process.env.BYBIT_ORDER_BASE;
+  if (explicit) return String(explicit).replace(/\/$/, '');
+
+  // If MAINNET env is explicitly set, obey it
+  if (typeof process.env.MAINNET !== 'undefined') {
+    return MAINNET ? 'https://api.bybit.com' : 'https://api-testnet.bybit.com';
+  }
+
+  // Backwards compatibility with BYBIT_USE_TESTNET
+  const useTestnetRaw = typeof process.env.BYBIT_USE_TESTNET !== 'undefined' ? String(process.env.BYBIT_USE_TESTNET) : null;
+  if (useTestnetRaw !== null) {
+    const val = useTestnetRaw.toLowerCase();
+    if (val === '1' || val === 'true' || val === 'yes') return 'https://api-testnet.bybit.com';
+    if (val === '0' || val === 'false' || val === 'no') return 'https://api.bybit.com';
+    return 'https://api-testnet.bybit.com';
+  }
+
+  return getBase();
+}
+
+/**
  * probeHosts(timeoutMs)
- * Try candidate hosts with a quick v5 kline request for BTCUSDT.
- * Accept a host on HTTP OK; persist chosen base and record diagnostics.
+ * - If BYBIT_REST_BASE is set, only probe that host and DO NOT persist a different host.
+ * - Accept a host only if response looks like JSON or API-shaped JSON (prevents HTML pages being accepted).
  */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
-  const list = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
+  const list = configured ? [configured] : HOST_CANDIDATES.slice();
 
   logger.info({ candidates: list }, 'bybitRest: starting host probe');
 
@@ -112,7 +158,6 @@ async function probeHosts(timeoutMs = 5000) {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
-      // capture text for diagnostics
       let text = null;
       let parsed = null;
       try {
@@ -123,14 +168,29 @@ async function probeHosts(timeoutMs = 5000) {
       }
 
       if (res.ok) {
+        const ct = (res.headers && typeof res.headers.get === 'function') ? (res.headers.get('content-type') || '') : '';
+        const looksLikeJson = /application\/json/i.test(ct) || (text && text.trim().startsWith('{'));
+        const parsedOkApi = parsed && (parsed.result || typeof parsed.ret_code !== 'undefined' || typeof parsed.retCode !== 'undefined');
+
+        if (!looksLikeJson && !parsedOkApi) {
+          logger.debug({ host, path: testUrl, contentType: ct, snippet: text ? text.slice(0, 200) : null }, 'probeHosts: host returned OK but not JSON/API-shaped; skipping');
+          continue;
+        }
+
         lastProbeHostPath = { host, path: testUrl };
         lastProbeResponseText = text;
+
+        if (configured) {
+          logger.info({ configured }, 'probeHosts: configured BYBIT_REST_BASE responded OK; not persisting probe selection');
+          return configured;
+        }
+
         chosenBase = host.replace(/\/$/, '');
         saveChosenBaseToDisk(chosenBase);
         if (parsed) {
           logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
         } else {
-          logger.info({ chosenBase, note: 'accepted despite json parse failure (HTTP OK)' }, 'probeHosts: selected host');
+          logger.info({ chosenBase, note: 'accepted despite json parse detection (HTTP OK)' }, 'probeHosts: selected host');
         }
         return chosenBase;
       } else {
@@ -187,19 +247,16 @@ async function fetchSymbolsFromCoinGecko(perPage = 250) {
 
 /**
  * fetchAllSymbols()
- * Behavior: if chosenBase exists, try it exclusively first. If that fails or returns no usable symbols,
- * fall back to trying the full host list. Last-resort fallback to CoinGecko.
+ * Use only the single base from getBase() for public symbol discovery.
  */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: start');
 
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX ? new RegExp(process.env.SYMBOL_FILTER_REGEX) : /usdt(\.p|\.P|P)?$/i;
-  const configured = getConfiguredBase();
-  let hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
-
-  if (chosenBase) {
-    if (!hostList.includes(chosenBase)) hostList.unshift(chosenBase);
-    else hostList = [chosenBase, ...hostList.filter(h => h !== chosenBase)];
+  const base = getBase();
+  if (!base) {
+    logger.warn('fetchAllSymbols: no base available (getBase returned null)');
+    return [];
   }
 
   const candidates = [
@@ -282,52 +339,25 @@ async function fetchAllSymbols() {
     return { symbols: null };
   }
 
-  // 1) If chosenBase exists, try exclusively first
-  if (chosenBase) {
-    logger.info({ chosenBase }, 'fetchAllSymbols: attempting chosenBase exclusively first');
-    try {
-      const result = await attemptHostForSymbols(chosenBase, 8000);
-      if (Array.isArray(result.symbols) && result.symbols.length) {
-        lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
-        lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
-        return result.symbols;
-      } else if (Array.isArray(result.symbols) && result.symbols.length === 0) {
-        logger.warn({ chosenBase, rawCount: result.rawCount }, 'fetchAllSymbols: chosenBase returned symbols but none matched filter; falling back');
-      } else {
-        logger.warn({ chosenBase }, 'fetchAllSymbols: chosenBase attempt failed to produce symbols; falling back');
-      }
-    } catch (e) {
-      logger.debug({ e }, 'fetchAllSymbols: chosenBase exclusive attempt threw, falling back');
+  try {
+    const result = await attemptHostForSymbols(base, 8000);
+    if (Array.isArray(result.symbols) && result.symbols.length) {
+      lastProbeHostPath = lastProbeHostPath || lastOkHostPath;
+      lastProbeResponseText = lastProbeResponseText || lastOkResponseText;
+      return result.symbols;
+    } else if (Array.isArray(result.symbols) && result.symbols.length === 0) {
+      logger.warn({ base, rawCount: result.rawCount }, 'fetchAllSymbols: base returned symbols but none matched filter; returning empty (no fallback hosts used)');
+    } else {
+      logger.warn({ base }, 'fetchAllSymbols: base attempt failed to produce symbols; returning empty (no fallback hosts used)');
     }
-  }
-
-  // 2) Fallback to full list (skip chosenBase if already tried)
-  for (const host of hostList) {
-    if (chosenBase && host.replace(/\/$/, '') === chosenBase) continue;
-    try {
-      const result = await attemptHostForSymbols(host, 8000);
-      if (Array.isArray(result.symbols) && result.symbols.length) {
-        logger.info({ host }, 'fetchAllSymbols: succeeded using fallback host');
-        if (!chosenBase) {
-          chosenBase = host.replace(/\/$/, '');
-          saveChosenBaseToDisk(chosenBase);
-          logger.info({ chosenBase }, 'fetchAllSymbols: setting chosenBase from fallback host');
-        }
-        return result.symbols;
-      } else {
-        logger.debug({ host }, 'fetchAllSymbols: this host returned no usable filtered symbols, trying next host');
-        continue;
-      }
-    } catch (err) {
-      logger.debug({ host, err: err && err.message ? err.message : String(err) }, 'fetchAllSymbols: host attempt threw');
-      continue;
-    }
+  } catch (e) {
+    logger.debug({ e }, 'fetchAllSymbols: base exclusive attempt threw, returning empty (no fallback hosts used)');
   }
 
   if (lastOkHostPath) {
-    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: all hosts/candidates failed to return usable symbols (last OK snippet included)');
+    logger.warn({ lastOkHostPath, snippet: lastOkResponseText ? lastOkResponseText.slice(0, 800) : null }, 'fetchAllSymbols: base failed but there was an OK response snippet (included)');
   } else {
-    logger.warn('fetchAllSymbols: no host returned HTTP OK during attempts');
+    logger.warn('fetchAllSymbols: base returned no HTTP OK during attempts');
   }
 
   // Last-resort CoinGecko fallback (filtered)
@@ -348,14 +378,13 @@ async function fetchAllSymbols() {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * Tries chosenBase first then fallback hosts.
+ * Uses single base (getBase()) only.
  */
 async function fetchKlines(symbol, interval, limit = 200) {
-  const configured = getConfiguredBase();
-  let hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
-  if (chosenBase) {
-    if (!hostList.includes(chosenBase)) hostList.unshift(chosenBase);
-    else hostList = [chosenBase, ...hostList.filter(h => h !== chosenBase)];
+  const base = getBase();
+  if (!base) {
+    logger.error({ symbol, interval }, 'fetchKlines: no base available (getBase returned null)');
+    return [];
   }
 
   const candidates = [
@@ -364,27 +393,48 @@ async function fetchKlines(symbol, interval, limit = 200) {
     { path: '/v2/public/kline/list', params: { symbol, interval, limit: String(limit) } }
   ];
 
-  for (const host of hostList) {
-    for (const c of candidates) {
-      try {
-        const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
-        Object.entries(c.params || {}).forEach(([k, v]) => {
-          if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
-        });
+  for (const c of candidates) {
+    try {
+      const url = new URL(`${base.replace(/\/$/, '')}${c.path}`);
+      Object.entries(c.params || {}).forEach(([k, v]) => {
+        if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+      });
 
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
-        let json = null;
-        try { json = await res.json(); } catch (e) { json = null; }
+      const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
+      let json = null;
+      try { json = await res.json(); } catch (e) { json = null; }
 
-        if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error');
-          continue;
-        }
+      if (!res.ok) {
+        logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error on base');
+        continue;
+      }
 
-        if (json && json.result && Array.isArray(json.result.list)) {
-          const list = json.result.list;
-          return list.map(r => ({
-            open_time: r.start || r.t || r.open_time || r[0],
+      if (json && json.result && Array.isArray(json.result.list)) {
+        const list = json.result.list;
+        return list.map(r => ({
+          open_time: r.start || r.t || r.open_time || r[0],
+          open: Number(r.open || r.o || r[1] || 0),
+          high: Number(r.high || r.h || r[2] || 0),
+          low: Number(r.low || r.l || r[3] || 0),
+          close: Number(r.close || r.c || r[4] || 0),
+          volume: Number(r.volume || r.v || r[5] || 0)
+        }));
+      }
+
+      if (json && json.result && Array.isArray(json.result)) {
+        const arr = json.result;
+        if (arr.length && Array.isArray(arr[0])) {
+          return arr.map(r => ({
+            open_time: r[0],
+            open: Number(r[1]),
+            high: Number(r[2]),
+            low: Number(r[3]),
+            close: Number(r[4]),
+            volume: Number(r[5])
+          }));
+        } else if (arr.length && typeof arr[0] === 'object') {
+          return arr.map(r => ({
+            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
             open: Number(r.open || r.o || r[1] || 0),
             high: Number(r.high || r.h || r[2] || 0),
             low: Number(r.low || r.l || r[3] || 0),
@@ -392,72 +442,49 @@ async function fetchKlines(symbol, interval, limit = 200) {
             volume: Number(r.volume || r.v || r[5] || 0)
           }));
         }
-
-        if (json && json.result && Array.isArray(json.result)) {
-          const arr = json.result;
-          if (arr.length && Array.isArray(arr[0])) {
-            return arr.map(r => ({
-              open_time: r[0],
-              open: Number(r[1]),
-              high: Number(r[2]),
-              low: Number(r[3]),
-              close: Number(r[4]),
-              volume: Number(r[5])
-            }));
-          } else if (arr.length && typeof arr[0] === 'object') {
-            return arr.map(r => ({
-              open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-              open: Number(r.open || r.o || r[1] || 0),
-              high: Number(r.high || r.h || r[2] || 0),
-              low: Number(r.low || r.l || r[3] || 0),
-              close: Number(r.close || r.c || r[4] || 0),
-              volume: Number(r.volume || r.v || r[5] || 0)
-            }));
-          }
-        }
-
-        if (Array.isArray(json)) {
-          if (json.length && Array.isArray(json[0])) {
-            return json.map(r => ({
-              open_time: r[0],
-              open: Number(r[1]),
-              high: Number(r[2]),
-              low: Number(r[3]),
-              close: Number(r[4]),
-              volume: Number(r[5])
-            }));
-          } else if (json.length && typeof json[0] === 'object') {
-            return json.map(r => ({
-              open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-              open: Number(r.open || r.o || r[1] || 0),
-              high: Number(r.high || r.h || r[2] || 0),
-              low: Number(r.low || r.l || r[3] || 0),
-              close: Number(r.close || r.c || r[4] || 0),
-              volume: Number(r.volume || r.v || r[5] || 0)
-            }));
-          }
-        }
-
-        logger.debug({ host, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next');
-      } catch (err) {
-        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
       }
+
+      if (Array.isArray(json)) {
+        if (json.length && Array.isArray(json[0])) {
+          return json.map(r => ({
+            open_time: r[0],
+            open: Number(r[1]),
+            high: Number(r[2]),
+            low: Number(r[3]),
+            close: Number(r[4]),
+            volume: Number(r[5])
+          }));
+        } else if (json.length && typeof json[0] === 'object') {
+          return json.map(r => ({
+            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
+            open: Number(r.open || r.o || r[1] || 0),
+            high: Number(r.high || r.h || r[2] || 0),
+            low: Number(r.low || r.l || r[3] || 0),
+            close: Number(r.close || r.c || r[4] || 0),
+            volume: Number(r.volume || r.v || r[5] || 0)
+          }));
+        }
+      }
+
+      logger.debug({ base, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate endpoint');
+    } catch (err) {
+      logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
     }
   }
 
-  logger.error({ symbol, interval }, 'fetchKlines: all candidates/hosts failed');
+  logger.error({ symbol, interval }, 'fetchKlines: all candidates on base failed');
   return [];
 }
 
 /**
  * fetchTicker24h(symbol)
+ * Uses single base (getBase()) only.
  */
 async function fetchTicker24h(symbol) {
-  const configured = getConfiguredBase();
-  let hostList = configured ? [configured, ...HOST_CANDIDATES.filter(h => h !== configured)] : HOST_CANDIDATES.slice();
-  if (chosenBase) {
-    if (!hostList.includes(chosenBase)) hostList.unshift(chosenBase);
-    else hostList = [chosenBase, ...hostList.filter(h => h !== chosenBase)];
+  const base = getBase();
+  if (!base) {
+    logger.warn('fetchTicker24h: no base available (getBase returned null)');
+    return null;
   }
 
   const candidates = [
@@ -465,57 +492,56 @@ async function fetchTicker24h(symbol) {
     { path: '/v2/public/tickers', params: { symbol } }
   ];
 
-  for (const host of hostList) {
-    for (const c of candidates) {
-      try {
-        const url = new URL(`${host.replace(/\/$/, '')}${c.path}`);
-        Object.entries(c.params || {}).forEach(([k, v]) => {
-          if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
-        });
-        const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
-        const json = await res.json().catch(() => null);
-        if (!res.ok) {
-          logger.debug({ host, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error');
-          continue;
-        }
+  for (const c of candidates) {
+    try {
+      const url = new URL(`${base.replace(/\/$/, '')}${c.path}`);
+      Object.entries(c.params || {}).forEach(([k, v]) => {
+        if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+      });
+      const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
+      const json = await res.json().catch(() => null);
+      if (!res.ok) {
+        logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error on base');
+        continue;
+      }
 
-        if (json && json.result && Array.isArray(json.result.list) && json.result.list.length) {
-          const t = json.result.list[0];
+      if (json && json.result && Array.isArray(json.result.list) && json.result.list.length) {
+        const t = json.result.list[0];
+        return {
+          last_price: t.lastPrice || t.last || t.close || t.price || null,
+          last: t.lastPrice || t.last || t.close || t.price || null,
+          close: t.close || t.last || t.price || null,
+          volume: t.turnover24h || t.volume || t.volume_24_h || null,
+          volume_24h: t.turnover24h || t.volume || null
+        };
+      }
+
+      if (json && (Array.isArray(json) || (json.result && Array.isArray(json.result)))) {
+        const arr = Array.isArray(json) ? json : json.result;
+        if (arr.length && arr[0]) {
+          const t = arr[0];
           return {
-            last_price: t.lastPrice || t.last || t.close || t.price || null,
-            last: t.lastPrice || t.last || t.close || t.price || null,
+            last_price: t.last_price || t.last || t.close || t.price || null,
+            last: t.last_price || t.last || t.close || t.price || null,
             close: t.close || t.last || t.price || null,
-            volume: t.turnover24h || t.volume || t.volume_24h || null,
-            volume_24h: t.turnover24h || t.volume || null
+            volume: t.volume || t.volume_24h || null,
+            volume_24h: t.volume || null
           };
         }
-
-        if (json && (Array.isArray(json) || (json.result && Array.isArray(json.result)))) {
-          const arr = Array.isArray(json) ? json : json.result;
-          if (arr.length && arr[0]) {
-            const t = arr[0];
-            return {
-              last_price: t.last_price || t.last || t.close || t.price || null,
-              last: t.last_price || t.last || t.close || t.price || null,
-              close: t.close || t.last || t.price || null,
-              volume: t.volume || t.volume_24h || null,
-              volume_24h: t.volume || null
-            };
-          }
-        }
-
-        logger.debug({ host, path: c.path, body: json }, 'fetchTicker24h: unexpected shape, trying next');
-      } catch (err) {
-        logger.debug({ host, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchTicker24h: candidate threw');
       }
+
+      logger.debug({ base, path: c.path, body: json }, 'fetchTicker24h: unexpected shape, trying next candidate endpoint');
+    } catch (err) {
+      logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchTicker24h: candidate threw');
     }
   }
   return null;
 }
 
 /**
- * Signed/private endpoints: getWalletBalance, placeMarketOrderV5, setPositionTradingStop, fetchOpenOrders, fetchOpenPositions
- * Uses v5 signing (timestamp + method + requestPath + body) HMAC-SHA256
+ * Signed/private endpoints:
+ * - getWalletBalance, fetchOpenOrders, fetchOpenPositions: read-only but use getOrderBase()
+ * - placeMarketOrderV5, setPositionTradingStop: order-mutating endpoints; if OPENTRADES=false they simulate/dry-run
  */
 
 async function getWalletBalance(coin = 'USDT') {
@@ -526,7 +552,8 @@ async function getWalletBalance(coin = 'USDT') {
   }
 
   const requestPath = `/v5/account/wallet-balance?coin=${encodeURIComponent(coin)}`;
-  const base = getBase();
+  const base = getOrderBase();
+  logger.debug({ base, coin }, 'getWalletBalance: using order base for wallet balance');
   const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
   const url = `${base}${requestPath}`;
   const headers = {
@@ -570,9 +597,20 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
   if (tp) bodyObj.takeProfit = String(tp);
   if (sl) bodyObj.stopLoss = String(sl);
 
+  // Dry-run when OPENTRADES is disabled
+  if (!OPENTRADES) {
+    logger.info({ op: 'DRY_RUN_ORDER', body: bodyObj }, 'placeMarketOrderV5: OPENTRADES disabled — not sending real order');
+    return {
+      ret_code: 0,
+      ret_msg: 'DRY_RUN: order not placed (OPENTRADES=false)',
+      result: { order: bodyObj, simulated: true }
+    };
+  }
+
   const bodyStr = JSON.stringify(bodyObj);
   const requestPath = `/v5/order/create`;
-  const base = getBase();
+  const base = getOrderBase();
+  logger.info({ base, symbol, qty, side }, 'placeMarketOrderV5: placing order (real)');
   const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
   const url = `${base}${requestPath}`;
   const headers = {
@@ -602,9 +640,20 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
   const bodyObj = { category, symbol };
   if (typeof stopLoss !== 'undefined' && stopLoss !== null) bodyObj.stopLoss = String(stopLoss);
 
+  // Dry-run when OPENTRADES is disabled
+  if (!OPENTRADES) {
+    logger.info({ op: 'DRY_RUN_TRADING_STOP', body: bodyObj }, 'setPositionTradingStop: OPENTRADES disabled — not sending real request');
+    return {
+      ret_code: 0,
+      ret_msg: 'DRY_RUN: trading stop not applied (OPENTRADES=false)',
+      result: { params: bodyObj, simulated: true }
+    };
+  }
+
   const bodyStr = JSON.stringify(bodyObj);
   const requestPath = `/v5/position/trading-stop`;
-  const base = getBase();
+  const base = getOrderBase();
+  logger.info({ base, symbol }, 'setPositionTradingStop: sending real trading stop');
   const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
   const url = `${base}${requestPath}`;
   const headers = {
@@ -634,7 +683,8 @@ async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
   if (symbol) params.append('symbol', symbol);
   const requestPath = `/v5/order/realtime${params.toString() ? `?${params.toString()}` : ''}`;
 
-  const base = getBase();
+  const base = getOrderBase();
+  logger.debug({ base }, 'fetchOpenOrders: using order base');
   const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
 
   const url = `${base}${requestPath}`;
@@ -665,7 +715,8 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
   if (symbol) params.append('symbol', symbol);
   const requestPath = `/v5/position/list${params.toString() ? `?${params.toString()}` : ''}`;
 
-  const base = getBase();
+  const base = getOrderBase();
+  logger.debug({ base }, 'fetchOpenPositions: using order base');
   const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
 
   const url = `${base}${requestPath}`;
@@ -691,7 +742,9 @@ function getLastProbeInfo() {
   return {
     chosenBase,
     lastProbeHostPath,
-    lastProbeResponseText: lastProbeResponseText ? String(lastProbeResponseText).slice(0, 2000) : null
+    lastProbeResponseText: lastProbeResponseText ? String(lastProbeResponseText).slice(0, 2000) : null,
+    OPENTRADES,
+    MAINNET
   };
 }
 
@@ -705,6 +758,7 @@ async function reprobe(timeoutMs = 5000) {
 module.exports = {
   probeHosts,
   getBase,
+  getOrderBase,
   fetchKlines,
   fetchAllSymbols,
   fetchTicker24h,
