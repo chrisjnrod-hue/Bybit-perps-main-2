@@ -7,12 +7,42 @@
  * - Subscribes to both klineV2.<interval>.<symbol> and fallback kline.<interval>.<symbol>.
  * - Emits 'kline' events: payload { symbol, timeframe, data, raw } where data has { open_time, open, high, low, close, volume }.
  * - Provides closeAll() for graceful shutdown.
+ *
+ * WS host selection:
+ * - BYBIT_WS_PUBLIC (env or config) wins if present.
+ * - Otherwise MAINNET env controls default WS host:
+ *     MAINNET=true  -> mainnet WS
+ *     MAINNET=false -> testnet WS
+ *
+ * Adjust BYBIT_WS_PUBLIC in Render if you want an explicit override.
  */
 
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const config = require('../config');
 const logger = require('pino')();
+
+/* Helper to interpret env boolean */
+function envBool(name, defaultVal = false) {
+  if (typeof process.env[name] === 'undefined') return defaultVal;
+  const v = String(process.env[name]).toLowerCase().trim();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+const MAINNET = envBool('MAINNET', true);
+
+/* Choose websocket URL:
+   - env BYBIT_WS_PUBLIC or config.BYBIT_WS_PUBLIC takes precedence
+   - otherwise default to mainnet/testnet standard endpoints
+*/
+function getWsUrl() {
+  const explicit = process.env.BYBIT_WS_PUBLIC || config && config.BYBIT_WS_PUBLIC;
+  if (explicit) return String(explicit);
+
+  // Default safe WS endpoints (v5 public streaming endpoints)
+  // NOTE: adjust if you use a different path in your environment or Bybit changes URLs.
+  return MAINNET ? 'wss://stream.bybit.com/realtime' : 'wss://stream-testnet.bybit.com/realtime';
+}
 
 class WSManager extends EventEmitter {
   constructor() {
@@ -25,7 +55,7 @@ class WSManager extends EventEmitter {
   }
 
   start() {
-    logger.info('WS Manager ready (batched)');
+    logger.info({ wsUrl: getWsUrl() }, 'WS Manager ready (batched)');
   }
 
   intervalToTopicPart(tf) {
@@ -38,7 +68,7 @@ class WSManager extends EventEmitter {
       return null;
     }
 
-    const wsUrl = config.BYBIT_WS_PUBLIC;
+    const wsUrl = getWsUrl();
     const ws = new WebSocket(wsUrl);
     const conn = {
       ws,
@@ -50,7 +80,7 @@ class WSManager extends EventEmitter {
 
     ws.on('open', () => {
       conn.ready = true;
-      logger.info({ connId: conn.id }, 'WS connection opened');
+      logger.info({ connId: conn.id, wsUrl }, 'WS connection opened');
       const pending = Array.from(conn._topics || []);
       if (pending.length) {
         try {
