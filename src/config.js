@@ -28,6 +28,10 @@ module.exports = {
   WS_INITIAL_SCAN_TIMEOUT: Number(process.env.WS_INITIAL_SCAN_TIMEOUT || 10000),
   BYBIT_PAGINATION_LIMIT: Number(process.env.BYBIT_PAGINATION_LIMIT || 1000),
 
+  // Seeding / WS controls
+  SEED_CONCURRENCY: Number(process.env.SEED_CONCURRENCY || 6),
+  USE_WS: envBool('USE_WS', false),
+  
   // Trade controls
   MAX_OPEN_TRADES: Number(process.env.MAX_OPEN_TRADES || 3),
   MIN_24H_VOLUME: Number(process.env.MIN_24H_VOLUME || 100000),
