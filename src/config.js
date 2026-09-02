@@ -28,10 +28,6 @@ module.exports = {
   WS_INITIAL_SCAN_TIMEOUT: Number(process.env.WS_INITIAL_SCAN_TIMEOUT || 10000),
   BYBIT_PAGINATION_LIMIT: Number(process.env.BYBIT_PAGINATION_LIMIT || 1000),
 
-  // Seeding / WS controls (centralized)
-  SEED_CONCURRENCY: Number(process.env.SEED_CONCURRENCY || 6),
-  USE_WS: envBool('USE_WS', false),
-
   // Trade controls
   MAX_OPEN_TRADES: Number(process.env.MAX_OPEN_TRADES || 3),
   MIN_24H_VOLUME: Number(process.env.MIN_24H_VOLUME || 100000),
@@ -55,6 +51,12 @@ module.exports = {
   MIN_24H_VOLUME_CHANGE_PCT: Number(process.env.MIN_24H_VOLUME_CHANGE_PCT || -9999),
 
   COINGECKO_ENABLED: (process.env.COINGECKO_ENABLED === 'true'),
+
+  // NEW: notification/scan flags
+  // Seconds between root mid-scan if ROOT_MIDSCAN_INTERVAL not 0; used by poller
+  ROOT_SCAN_INTERVAL_SECS: Number(process.env.ROOT_SCAN_INTERVAL_SECS || 0),
+  // Whether to send root-candle open notifications
+  NEW_ROOT_CANDLE_NOTIFY: envBool('NEW_ROOT_CANDLE_NOTIFY', true),
 
   // Legacy compatibility flags
   BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
