@@ -1,4 +1,12 @@
 const parseList = (v) => (v ? v.split(',').map(x => x.trim()) : []);
+
+/* Env boolean helper */
+function envBool(name, defaultVal = false) {
+  if (typeof process.env[name] === 'undefined') return defaultVal;
+  const v = String(process.env[name]).toLowerCase().trim();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
 module.exports = {
   BYBIT_REST_BASE: process.env.BYBIT_REST_BASE || 'https://api.bybit.com',
   BYBIT_WS_PUBLIC: process.env.BYBIT_WS_PUBLIC || 'wss://stream.bybit.com/realtime_public',
@@ -14,6 +22,11 @@ module.exports = {
   MAX_CONCURRENT_WS: Number(process.env.MAX_CONCURRENT_WS || 20),
   BATCH_WS_SIZE: Number(process.env.BATCH_WS_SIZE || 20),
   SEED_KLINES_LIMIT: Number(process.env.SEED_KLINES_LIMIT || 200),
+
+  // Symbol seeding (UPDATED: removed topN, now only SYMBOL_SEED_ALL flag)
+  SYMBOL_SEED_ALL: envBool('SYMBOL_SEED_ALL', false),
+  WS_INITIAL_SCAN_TIMEOUT: Number(process.env.WS_INITIAL_SCAN_TIMEOUT || 10000),
+  BYBIT_PAGINATION_LIMIT: Number(process.env.BYBIT_PAGINATION_LIMIT || 1000),
 
   // Trade controls
   MAX_OPEN_TRADES: Number(process.env.MAX_OPEN_TRADES || 3),
