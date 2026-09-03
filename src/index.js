@@ -1,12 +1,9 @@
 /**
  * Entrypoint - starts Express server and the poller/scanner
  *
- * Added:
- * - global uncaughtException / unhandledRejection handlers
- * - heartbeat logging
- * - graceful shutdown that attempts to close DB and WS connections
- * - non-blocking bybit host probe (runs in background so startup is fast)
- * - sends startup telegram summary after services init (best-effort)
+ * UPDATED:
+ * - Increased delay for startup summary (give poller time to seed and detect signals)
+ * - Better logging for startup phases
  */
 
 require('dotenv').config();
@@ -46,7 +43,7 @@ async function start() {
     // init DB
     db.init();
 
-    // Start Bybit probe in background (do not await) so startup is not blocked by network probes.
+    // Start Bybit probe in background
     try {
       const bybitRest = require('./services/bybitRest');
       bybitRest.probeHosts(3000)
@@ -85,18 +82,22 @@ async function start() {
 
     logger.info('Startup complete');
 
-    // Best-effort: send startup telegram summary after short delay so other services can seed initial state.
+    // UPDATED: DELAY startup telegram summary to allow seeding/compilation
+    // Give poller 15-20 seconds to discover and seed symbols, then another 8s for MACD computation
+    const delayMs = parseInt(process.env.STARTUP_SUMMARY_DELAY_MS || '23000');
+    logger.info({ delayMs }, 'Scheduling startup telegram summary');
+    
     setTimeout(async () => {
       try {
+        logger.info('Sending startup telegram summary after seeding delay...');
         await signalManager.sendStartupSummary();
       } catch (e) {
         logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
       }
-    }, 8_000);
+    }, delayMs);
 
   } catch (err) {
     logger.error({ err }, 'Failed to start application');
-    // exit non-zero so Render restarts
     process.exit(1);
   }
 }
@@ -104,22 +105,18 @@ async function start() {
 async function gracefulShutdown(signal) {
   logger.info({ signal }, 'Starting graceful shutdown');
   try {
-    // stop heartbeat
     if (heartbeatInterval) clearInterval(heartbeatInterval);
 
-    // stop accepting new connections
     if (server && server.close) {
       logger.info('Closing HTTP server');
       await new Promise((resolve) => server.close(resolve));
     }
 
-    // try to close WS connections
     try {
       if (wsManager && typeof wsManager.closeAll === 'function') {
         await wsManager.closeAll();
         logger.info('WS Manager closed all connections');
       } else {
-        // best-effort: if connections array exists close sockets
         if (wsManager && Array.isArray(wsManager.connections)) {
           wsManager.connections.forEach((c) => {
             try { c.ws && c.ws.close(); } catch (e) { /* noop */ }
@@ -130,7 +127,6 @@ async function gracefulShutdown(signal) {
       logger.warn({ e }, 'Failed to close WS manager cleanly');
     }
 
-    // close DB
     try {
       const dbInstance = db.get();
       if (db && typeof db.close === 'function') {
@@ -144,7 +140,6 @@ async function gracefulShutdown(signal) {
       logger.warn({ e }, 'Error closing DB');
     }
 
-    // small delay to let things flush
     await new Promise((resolve) => setTimeout(resolve, 500));
   } catch (err) {
     logger.error({ err }, 'Error during graceful shutdown');
@@ -154,9 +149,7 @@ async function gracefulShutdown(signal) {
   }
 }
 
-// Capture termination signals from Render
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Start the app
 start();
