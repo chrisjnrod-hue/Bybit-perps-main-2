@@ -1,18 +1,13 @@
 // src/services/bybitWs.js
 /**
  * Batched Bybit WebSocket manager (v5-aware).
- *
- * - Groups symbols into connections up to config.BATCH_WS_SIZE per connection.
- * - Caps total connections at config.MAX_CONCURRENT_WS.
- * - Subscribes to both klineV2.<interval>.<symbol> and fallback kline.<interval>.<symbol>.
- * - Emits 'kline' events: payload { symbol, timeframe, data, raw } where data has { open_time, open, high, low, close, volume }.
- * - Provides closeAll() for graceful shutdown.
- * - Provides performInitialScan() for WS-based symbol discovery.
- *
- * FIXES:
- * - Added heartbeat/keepalive (ping every 30s)
- * - Exponential backoff reconnection on failure
- * - Better error recovery and socket state management
+ * 
+ * CRITICAL FIXES:
+ * - Proper connection establishment with auto-reconnect
+ * - Heartbeat/keepalive (ping/pong every 30s)
+ * - Better error recovery and exponential backoff
+ * - Socket state validation before sending
+ * - Connection pooling with proper cleanup
  */
 
 const WebSocket = require('ws');
@@ -20,7 +15,6 @@ const EventEmitter = require('events');
 const config = require('../config');
 const logger = require('pino')();
 
-/* Helper to interpret env boolean */
 function envBool(name, defaultVal = false) {
   if (typeof process.env[name] === 'undefined') return defaultVal;
   const v = String(process.env[name]).toLowerCase().trim();
@@ -29,16 +23,15 @@ function envBool(name, defaultVal = false) {
 
 const MAINNET = envBool('MAINNET', true);
 
-/* Choose websocket URL */
 function getWsUrl() {
   const explicit = process.env.BYBIT_WS_PUBLIC || (config && config.BYBIT_WS_PUBLIC);
   if (explicit) return String(explicit);
   return MAINNET ? 'wss://stream.bybit.com/v5/public/linear' : 'wss://stream-testnet.bybit.com/v5/public/linear';
 }
 
-const WS_SUBSCRIBE_CHUNK = config.WS_SUBSCRIBE_CHUNK || (process.env.WS_SUBSCRIBE_CHUNK ? Number(process.env.WS_SUBSCRIBE_CHUNK) : 50);
-const WS_SUBSCRIBE_RETRY_BASE_MS = config.WS_SUBSCRIBE_RETRY_BASE_MS || (process.env.WS_SUBSCRIBE_RETRY_BASE_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_BASE_MS) : 1000);
-const WS_SUBSCRIBE_RETRY_MAX_MS = config.WS_SUBSCRIBE_RETRY_MAX_MS || (process.env.WS_SUBSCRIBE_RETRY_MAX_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_MAX_MS) : 60000);
+const WS_SUBSCRIBE_CHUNK = config.WS_SUBSCRIBE_CHUNK || 50;
+const WS_SUBSCRIBE_RETRY_BASE_MS = config.WS_SUBSCRIBE_RETRY_BASE_MS || 1000;
+const WS_SUBSCRIBE_RETRY_MAX_MS = config.WS_SUBSCRIBE_RETRY_MAX_MS || 60000;
 
 class WSManager extends EventEmitter {
   constructor() {
@@ -49,26 +42,38 @@ class WSManager extends EventEmitter {
     this.maxSockets = config.MAX_CONCURRENT_WS || 20;
     this.batchSize = config.BATCH_WS_SIZE || 20;
     this.klineBuffer = new Map();
-    this.heartbeatInterval = null; // NEW: heartbeat interval
-    this.reconnectAttempts = new Map(); // NEW: track reconnect attempts per connection
+    this.heartbeatInterval = null;
+    this.connectionAttempts = new Map();
   }
 
   start() {
-    logger.info({ wsUrl: getWsUrl(), maxSockets: this.maxSockets, batchSize: this.batchSize }, 'WS Manager ready (batched)');
+    logger.info({ wsUrl: getWsUrl(), maxSockets: this.maxSockets, batchSize: this.batchSize }, 'WS Manager starting');
     
-    // NEW: Start heartbeat to keep connections alive
+    // Create initial connections proactively
+    this._ensureMinConnections();
+    
+    // Start heartbeat
     this.heartbeatInterval = setInterval(() => {
       for (const conn of this.connections) {
         if (conn && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
           try {
             conn.ws.ping();
-            logger.debug({ connId: conn.id }, 'Heartbeat ping sent');
           } catch (e) {
-            logger.debug({ connId: conn.id, err: e }, 'Heartbeat ping failed');
+            logger.debug({ connId: conn.id }, 'Heartbeat ping failed');
           }
         }
       }
-    }, 30000); // ping every 30 seconds
+    }, 30000);
+
+    logger.info('WS Manager started and ready');
+  }
+
+  // NEW: Ensure minimum number of connections exist
+  _ensureMinConnections() {
+    const minConnections = Math.ceil(this.maxSockets / 2) || 1;
+    while (this.openSockets < minConnections && this.openSockets < this.maxSockets) {
+      this._createConnection();
+    }
   }
 
   intervalToTopicPart(tf) {
@@ -77,12 +82,23 @@ class WSManager extends EventEmitter {
 
   _createConnection() {
     if (this.openSockets >= this.maxSockets) {
-      logger.warn({ maxSockets: this.maxSockets }, 'Max WS connections reached; cannot create new connection');
+      logger.warn({ maxSockets: this.maxSockets }, 'Max WS connections reached');
       return null;
     }
 
     const wsUrl = getWsUrl();
-    const ws = new WebSocket(wsUrl);
+    let ws;
+    
+    try {
+      ws = new WebSocket(wsUrl, {
+        handshakeTimeout: 10000, // 10 second timeout
+        perMessageDeflate: false
+      });
+    } catch (err) {
+      logger.error({ err, wsUrl }, 'Failed to create WebSocket');
+      return null;
+    }
+
     const conn = {
       ws,
       symbols: new Set(),
@@ -92,17 +108,17 @@ class WSManager extends EventEmitter {
       ready: false,
       retryDelayMs: WS_SUBSCRIBE_RETRY_BASE_MS,
       _retryTimer: null,
-      reconnectAttempts: 0, // NEW: track reconnect attempts
-      lastConnectAttempt: null // NEW: timestamp of last attempt
+      reconnectAttempts: 0,
+      createdAt: Date.now()
     };
 
     ws.on('open', () => {
       conn.ready = true;
-      conn.reconnectAttempts = 0; // RESET on successful open
-      logger.info({ connId: conn.id, wsUrl }, 'WS connection opened successfully');
+      conn.reconnectAttempts = 0;
+      logger.info({ connId: conn.id, wsUrl }, '✅ WS connection opened successfully');
       
-      if (conn.pendingTopics && conn.pendingTopics.size) {
-        logger.info({ connId: conn.id, pending: conn.pendingTopics.size }, 'Flushing pending subscribe topics on open');
+      if (conn.pendingTopics && conn.pendingTopics.size > 0) {
+        logger.info({ connId: conn.id, pending: conn.pendingTopics.size }, 'Flushing pending topics on open');
         this._flushPendingForConn(conn);
       }
     });
@@ -111,13 +127,11 @@ class WSManager extends EventEmitter {
       try {
         const data = JSON.parse(msg);
         
-        // Handle ping/pong
         if (data && data.op === 'ping') {
           try { ws.send(JSON.stringify({ op: 'pong' })); } catch (e) { /* ignore */ }
           return;
         }
 
-        // Handle kline data
         if (data && data.topic && Array.isArray(data.data) && data.data.length > 0) {
           const topic = String(data.topic);
           const topicParts = topic.split('.');
@@ -139,11 +153,10 @@ class WSManager extends EventEmitter {
               logger.debug({ symbol: sym, timeframe: tf, close: k.close }, 'Kline received');
             }
           }
-        } else if (data && data.ret_code !== undefined) {
-          if (data.ret_code !== 0) {
-            logger.warn({ connId: conn.id, retCode: data.ret_code, retMsg: data.ret_msg }, 'WS subscription error');
-          } else {
-            logger.debug({ connId: conn.id, op: data.op }, 'WS operation successful');
+        } else if (data && (data.ret_code !== undefined || data.retCode !== undefined)) {
+          const rc = data.ret_code !== undefined ? data.ret_code : data.retCode;
+          if (rc !== 0) {
+            logger.warn({ connId: conn.id, retCode: rc, retMsg: data.ret_msg }, 'WS subscription error');
           }
         }
       } catch (err) {
@@ -152,13 +165,12 @@ class WSManager extends EventEmitter {
     });
 
     ws.on('error', (err) => {
-      logger.warn({ err: err && err.message ? err.message : err, connId: conn.id }, 'WS error');
+      logger.warn({ err: err && err.message ? err.message : err, connId: conn.id }, 'WS error event');
     });
 
     ws.on('close', (code, reason) => {
-      logger.info({ connId: conn.id, code, reason: reason ? reason.toString() : '', reconnectAttempts: conn.reconnectAttempts }, 'WS connection closed');
+      logger.warn({ connId: conn.id, code, reason: reason ? reason.toString() : 'unknown' }, 'WS connection closed');
 
-      // NEW: Clear retry timer on close
       if (conn._retryTimer) {
         clearTimeout(conn._retryTimer);
         conn._retryTimer = null;
@@ -170,10 +182,10 @@ class WSManager extends EventEmitter {
       this.connections = this.connections.filter(c => c !== conn);
       this.openSockets = Math.max(0, this.openSockets - 1);
 
-      // NEW: Implement exponential backoff reconnection
-      if (symbolsToRecover && symbolsToRecover.length) {
+      // Exponential backoff reconnection
+      if (symbolsToRecover && symbolsToRecover.length > 0) {
         conn.reconnectAttempts = (conn.reconnectAttempts || 0) + 1;
-        const retryDelay = Math.min(1000 * Math.pow(2, Math.min(conn.reconnectAttempts - 1, 5)), 30000); // max 30s
+        const retryDelay = Math.min(1000 * Math.pow(2, Math.min(conn.reconnectAttempts - 1, 5)), 30000);
         
         logger.info({ 
           connId: conn.id, 
@@ -187,30 +199,32 @@ class WSManager extends EventEmitter {
             try {
               this.subscribeSymbolMTF(sym);
             } catch (e) {
-              logger.debug({ err: e, symbol: sym }, 'Error re-subscribing symbol after close');
+              logger.debug({ err: e, symbol: sym }, 'Error re-subscribing');
             }
           }
         }, retryDelay);
       }
+
+      // Ensure minimum connections
+      this._ensureMinConnections();
     });
 
     this.connections.push(conn);
     this.openSockets++;
-    logger.info({ connId: conn.id, openSockets: this.openSockets, totalConnections: this.connections.length }, 'WS connection created');
+    logger.info({ connId: conn.id, openSockets: this.openSockets }, 'WS connection created');
     return conn;
   }
 
-  /**
-   * Send subscribe/unsubscribe messages in chunks, with retry on failure.
-   */
   _sendTopicsBatch(conn, topicsArray, op = 'subscribe') {
     if (!conn || !conn.ws) return Promise.reject(new Error('Invalid connection'));
     if (!Array.isArray(topicsArray) || topicsArray.length === 0) return Promise.resolve();
 
     return new Promise((resolve, reject) => {
+      // CRITICAL: Check socket is OPEN before sending
       if (conn.ws.readyState !== WebSocket.OPEN) {
         for (const t of topicsArray) conn.pendingTopics.add(t);
-        return reject(new Error('WS not open, queued for retry'));
+        logger.debug({ connId: conn.id, readyState: conn.ws.readyState }, 'Socket not OPEN, queuing topics');
+        return reject(new Error(`WS not open (state=${conn.ws.readyState}), queued for retry`));
       }
 
       try {
@@ -218,7 +232,7 @@ class WSManager extends EventEmitter {
         conn.ws.send(JSON.stringify(payload), (err) => {
           if (err) {
             for (const t of topicsArray) conn.pendingTopics.add(t);
-            logger.warn({ err: err && err.message ? err.message : err, connId: conn.id, op, batchSize: topicsArray.length }, 'Failed to send batch; queued for retry');
+            logger.warn({ err: err && err.message ? err.message : err, connId: conn.id, op, batchSize: topicsArray.length }, 'Send failed; queued for retry');
             return reject(err);
           }
           for (const t of topicsArray) conn.pendingTopics.delete(t);
@@ -228,20 +242,17 @@ class WSManager extends EventEmitter {
         });
       } catch (err) {
         for (const t of topicsArray) conn.pendingTopics.add(t);
-        logger.warn({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception while sending batch; queued for retry');
+        logger.warn({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception during send; queued for retry');
         return reject(err);
       }
     });
   }
 
-  /**
-   * Flush pending topics for a given connection in chunked batches.
-   */
   _flushPendingForConn(conn) {
     if (!conn || !conn.pendingTopics || conn.pendingTopics.size === 0) return;
 
     if (!conn.ready || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
-      logger.debug({ connId: conn.id, pending: conn.pendingTopics.size, readyState: conn.ws ? conn.ws.readyState : 'no-ws' }, 'Not flushing pending because socket not OPEN');
+      logger.debug({ connId: conn.id, pending: conn.pendingTopics.size, readyState: conn.ws ? conn.ws.readyState : 'no-ws' }, 'Socket not OPEN, scheduling retry');
       this._scheduleFlushRetry(conn);
       return;
     }
@@ -261,13 +272,13 @@ class WSManager extends EventEmitter {
       this._sendTopicsBatch(conn, batch, 'subscribe').then(() => {
         sendNextChunk(index + 1);
       }).catch((err) => {
-        logger.warn({ connId: conn.id, err: err && err.message ? err.message : err, retryIn: conn.retryDelayMs }, 'Failed to flush pending batch; scheduling retry');
+        logger.warn({ connId: conn.id, err: err && err.message ? err.message : err }, 'Flush batch failed; scheduling retry');
         this._scheduleFlushRetry(conn);
       });
     };
 
     if (chunks.length) {
-      logger.info({ connId: conn.id, batches: chunks.length, totalTopics: topics.length }, 'Flushing pending subscribe topics in batches');
+      logger.info({ connId: conn.id, batches: chunks.length, totalTopics: topics.length }, 'Flushing pending topics in batches');
       sendNextChunk(0);
     }
   }
@@ -281,41 +292,34 @@ class WSManager extends EventEmitter {
       conn._retryTimer = null;
       conn.retryDelayMs = Math.min((conn.retryDelayMs || WS_SUBSCRIBE_RETRY_BASE_MS) * 2, WS_SUBSCRIBE_RETRY_MAX_MS);
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
-        logger.debug({ connId: conn.id, retryDelayMs: conn.retryDelayMs }, 'Retrying flush for connection');
+        logger.debug({ connId: conn.id, retryDelayMs: conn.retryDelayMs }, 'Retrying flush');
         this._flushPendingForConn(conn);
       } else {
         this._scheduleFlushRetry(conn);
       }
     }, delay);
-    logger.debug({ connId: conn.id, delayMs: delay }, 'Scheduled flush retry for connection');
+    logger.debug({ connId: conn.id, delayMs: delay }, 'Scheduled flush retry');
   }
 
-  /**
-   * Returns a connection that has capacity (< batchSize).
-   * If none, creates a new connection.
-   */
   _getOrCreateTargetConnection() {
-    let target = this.connections.find(c => c.symbols.size < this.batchSize);
+    let target = this.connections.find(c => c.symbols.size < this.batchSize && c.ready);
     if (!target) {
       target = this._createConnection();
     }
     return target;
   }
 
-  /**
-   * Subscribe symbol to the WS with multi-timeframe topics.
-   */
   subscribeSymbolMTF(symbol, tfs = null) {
     if (!symbol) return null;
     if (this.symbolToConn.has(symbol)) {
-      logger.debug({ symbol }, 'Symbol already subscribed, skipping');
+      logger.debug({ symbol }, 'Symbol already subscribed');
       return this.symbolToConn.get(symbol);
     }
 
     const timeframes = tfs || config.MTF_TFS || ['5', '15', '60', 'D'];
     const target = this._getOrCreateTargetConnection();
     if (!target) {
-      logger.warn({ symbol }, 'No available WS connection could be created for subscription');
+      logger.warn({ symbol }, 'No available WS connection could be created');
       return null;
     }
 
@@ -333,7 +337,7 @@ class WSManager extends EventEmitter {
     target.symbols.add(symbol);
     this.symbolToConn.set(symbol, target);
 
-    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size }, 'Queued symbol for subscription (pending until socket OPEN)');
+    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size }, 'Queued symbol for subscription');
     
     if (target.ws && target.ws.readyState === WebSocket.OPEN) {
       this._flushPendingForConn(target);
@@ -364,20 +368,18 @@ class WSManager extends EventEmitter {
         const batch = topicsToUnsub.slice(i, i + WS_SUBSCRIBE_CHUNK);
         try {
           this._sendTopicsBatch(conn, batch, 'unsubscribe').catch(err => {
-            logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Unsubscribe batch failed but continuing');
+            logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Unsubscribe batch failed');
           });
         } catch (err) {
           logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception sending unsubscribe');
         }
       }
-    } else {
-      logger.debug({ connId: conn.id, reason: conn.ws ? `readyState=${conn.ws.readyState}` : 'no-ws', queuedUnsubs: topicsToUnsub.length }, 'Socket not OPEN, unsubscriptions queued or removed from topics');
     }
 
     conn.symbols.delete(symbol);
     this.symbolToConn.delete(symbol);
     this.klineBuffer.delete(symbol);
-    logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');
+    logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol');
 
     if (conn.symbols.size === 0) {
       try {
@@ -412,14 +414,10 @@ class WSManager extends EventEmitter {
     return { open_time, open, high, low, close, volume, timeframe: tf, symbol };
   }
 
-  /**
-   * performInitialScan()
-   * Returns an array of symbols discovered via WS subscriptions
-   */
   async performInitialScan() {
     try {
       if (this.connections.length === 0) {
-        logger.warn('performInitialScan: no active connections yet');
+        logger.warn('performInitialScan: no active connections');
         return [];
       }
 
@@ -439,14 +437,13 @@ class WSManager extends EventEmitter {
       logger.info({ count: result.length }, 'performInitialScan: returning subscribed symbols');
       return result;
     } catch (err) {
-      logger.error({ err: err && err.message ? err.message : err }, 'performInitialScan: error');
+      logger.error({ err: err && err.message ? err.message : err }, 'performInitialScan error');
       return [];
     }
   }
 
   async closeAll() {
     try {
-      // NEW: Clear heartbeat interval
       if (this.heartbeatInterval) {
         clearInterval(this.heartbeatInterval);
         this.heartbeatInterval = null;
@@ -477,7 +474,7 @@ class WSManager extends EventEmitter {
       this.symbolToConn = new Map();
       this.klineBuffer = new Map();
       this.openSockets = 0;
-      logger.info('WSManager: closed all connections');
+      logger.info('WSManager: all connections closed');
     } catch (err) {
       logger.warn({ err: err && err.message ? err.message : err }, 'WSManager.closeAll error');
     }
