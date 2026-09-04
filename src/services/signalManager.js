@@ -144,16 +144,27 @@ module.exports = {
 
       if (notifyImmediately) {
         // send telegram block immediately with COMPLETE MTF data
-        await telegram.sendRootSignalBlock({
-          symbol,
-          root_tf,
-          alignment,
-          detected_at,
-          accept,
-          marketData: mdata,
-          tvScore: tv.score || 0,
-          mtfScore
-        });
+        try {
+          if (telegram.sendRootSignalBlock) {
+            await telegram.sendRootSignalBlock({
+              symbol,
+              root_tf,
+              alignment,
+              detected_at,
+              accept,
+              marketData: mdata,
+              tvScore: tv.score || 0,
+              mtfScore
+            });
+          } else if (telegram.sendNewSignalSingleBlock) {
+            await telegram.sendNewSignalSingleBlock(signalObj);
+          } else {
+            // fallback: generic startup summary call
+            await telegram.sendStartupSummary ? telegram.sendStartupSummary({ snapshot: [signalObj] }) : null;
+          }
+        } catch (e) {
+          logger.debug({ e, symbol }, 'Failed to send immediate root signal block (continuing)');
+        }
       } else {
         return signalObj;
       }
@@ -265,8 +276,54 @@ module.exports = {
         }
       }
 
+      // compute counts per root_tf
+      const counts = {};
+      for (const s of snapshot) {
+        counts[s.root_tf] = (counts[s.root_tf] || 0) + 1;
+      }
+
       const telegramSvc = require('./telegram');
-      await telegramSvc.sendStartupSummary({ snapshot });
+
+      // Prefer a dedicated header sender if available
+      if (telegramSvc.sendStartupSummaryHeader) {
+        try {
+          await telegramSvc.sendStartupSummaryHeader({ counts, total: snapshot.length });
+        } catch (e) {
+          logger.debug({ e }, 'sendStartupSummary: header send failed (continuing)');
+        }
+      } else {
+        // fallback: call existing summary (single message) if present
+        try {
+          if (telegramSvc.sendStartupSummary) {
+            await telegramSvc.sendStartupSummary({ snapshot, counts });
+          }
+        } catch (e) {
+          logger.debug({ e }, 'sendStartupSummary: fallback header send failed');
+        }
+      }
+
+      // Send one signal block per signal (sequentially to avoid hitting rate limits)
+      for (const s of snapshot) {
+        try {
+          if (telegramSvc.sendRootSignalBlock) {
+            await telegramSvc.sendRootSignalBlock({
+              symbol: s.symbol,
+              root_tf: s.root_tf,
+              detected_at: s.detected_at,
+              alignment: s.meta?.alignment || null,
+              tvScore: s.meta?.tvScore || 0,
+              marketData: s.meta?.marketData || {}
+            });
+          } else if (telegramSvc.sendNewSignalSingleBlock) {
+            await telegramSvc.sendNewSignalSingleBlock(s);
+          } else {
+            // Last fallback: send summary with single-signal payload
+            await telegramSvc.sendStartupSummary ? telegramSvc.sendStartupSummary({ snapshot: [s] }) : null;
+          }
+        } catch (e) {
+          logger.debug({ e, s }, 'sendStartupSummary: failed to send per-signal block (continuing)');
+        }
+      }
     } catch (e) {
       logger.debug({ e }, 'sendStartupSummary failed');
     }
@@ -289,7 +346,7 @@ module.exports = {
       }
 
       const telegramSvc = require('./telegram');
-      await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
+      await telegramSvc.sendRootCandleUpdate ? telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs }) : null;
     } catch (e) {
       logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
     }
