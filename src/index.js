@@ -70,8 +70,13 @@ async function start() {
 
     // start websockets manager (batched)
     logger.info('🌐 Starting WS manager...');
-    wsManager.start();
-    logger.info('✅ WS Manager started');
+    try {
+      const maybe = wsManager.start();
+      if (maybe && typeof maybe.then === 'function') await maybe;
+      logger.info('✅ WS Manager started');
+    } catch (e) {
+      logger.error({ e }, 'WS Manager failed to start (caught and continuing)');
+    }
 
     // start signal manager (consumes cache & WS events)
     logger.info('📊 Starting signal manager...');
@@ -80,8 +85,12 @@ async function start() {
 
     // start telegram
     logger.info('💬 Initializing telegram...');
-    telegram.init();
-    logger.info('✅ Telegram initialized');
+    try {
+      telegram.init && telegram.init();
+      logger.info('✅ Telegram initialized');
+    } catch (e) {
+      logger.warn({ e }, 'Telegram init failed (continuing)');
+    }
 
     // register trade manager to listen to WS kline events for breakeven logic
     logger.info('📈 Registering trade manager...');
@@ -120,19 +129,29 @@ async function start() {
         const allSignals = signalManager.getAllSignals();
         const signalCount = allSignals.length;
 
+        // Also require that a scan has run at least once
+        let lastScanAt = null;
+        try {
+          lastScanAt = db.getState ? db.getState('lastScanAt') : null;
+        } catch (e) {
+          lastScanAt = null;
+        }
+        const hasFirstScan = !!lastScanAt;
+
         // Log every 5 seconds to avoid spam
         if (elapsedTime - lastLogTime >= 5000 || elapsedTime < 1000) {
           logger.info({ 
             seedingDone: isSeedingDone, 
             signalCount,
+            hasFirstScan,
             elapsedSeconds: Math.round(elapsedTime / 1000),
             maxSeconds: Math.round(maxWaitTime / 1000)
           }, '⏳ Readiness check...');
           lastLogTime = elapsedTime;
         }
 
-        // Check conditions: seeding done AND at least 1 signal detected
-        if (isSeedingDone && signalCount > 0) {
+        // Check conditions: seeding done AND at least 1 signal detected AND at least one scan has run
+        if (isSeedingDone && hasFirstScan && signalCount > 0) {
           logger.info('═══════════════════════════════════════════════');
           logger.info({ 
             seedingDone: isSeedingDone,
