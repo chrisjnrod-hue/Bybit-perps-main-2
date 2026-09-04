@@ -11,8 +11,8 @@ const logger = require('pino')();
 
 let openTradesAllowed = true;
 
-// NEW: Signal cache for synchronization across blocks
-const signalCache = new Map(); // symbol:root_tf -> signal object
+// Signal cache for synchronization
+const signalCache = new Map();
 
 function setOpenTradesAllowed(v) {
   openTradesAllowed = !!v;
@@ -24,13 +24,12 @@ const inProgress = new Map();
 module.exports = {
   start() {
     logger.info('SignalManager started');
-    // NEW: Sync signals from DB on startup
     this.syncSignalsFromDb();
   },
 
   setOpenTradesAllowed,
 
-  // NEW: Sync in-memory signal cache with DB snapshot
+  // Sync in-memory signal cache with DB snapshot
   syncSignalsFromDb() {
     try {
       const db = dbModule;
@@ -47,12 +46,12 @@ module.exports = {
   },
 
   /**
-   * handleRootSignal - UPDATED FOR SYNC
+   * handleRootSignal - UPDATED TO FETCH 5m/15m MTF DATA
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
     
-    // NEW: Check if already cached (avoid duplicate processing)
+    // Check if already cached
     if (signalCache.has(key)) {
       const cached = signalCache.get(key);
       logger.debug({ key, cachedAt: cached.detected_at }, 'handleRootSignal: signal already in cache, returning cached version');
@@ -71,9 +70,23 @@ module.exports = {
       // Fetch market data
       const mdata = await marketData.updateSymbolMarketData(symbol);
 
+      // CRITICAL: Seed 5m/15m klines IMMEDIATELY so MTF can be computed
+      logger.info({ symbol }, 'Seeding 5m/15m klines for MTF computation');
+      try {
+        const poller = require('./poller');
+        await Promise.all([
+          poller.seedKlinesForSymbol(symbol, '5'),
+          poller.seedKlinesForSymbol(symbol, '15')
+        ]);
+        logger.info({ symbol }, '5m/15m klines seeded successfully');
+      } catch (e) {
+        logger.debug({ e, symbol }, 'Error seeding 5m/15m klines (continuing anyway)');
+      }
+
       // Subscribe to MTF websockets
       try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
+      // CRITICAL: Evaluate alignment AFTER 5m/15m is seeded
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
@@ -90,12 +103,12 @@ module.exports = {
         logger.debug({ e, symbol }, 'TV rating fetch failed');
       }
 
-      // UPDATED: Comprehensive meta object with all signal data
+      // Compose meta with POPULATED alignment
       const meta = {
         tvScore: tv.score || 0,
         tvSource: tv.source || 'unknown',
         mtfScore,
-        alignment,
+        alignment,           // NOW HAS 5m/15m WITH ACTUAL VALUES
         acceptReason: accept && accept.reason ? accept.reason : null,
         decision: accept && accept.decision ? accept.decision : 'monitor',
         marketData: mdata ? {
@@ -105,14 +118,11 @@ module.exports = {
           prev_volume_24h_usdt: mdata.prev_volume_24h,
           volume_change_pct: mdata.volume_change_pct,
           market_cap: mdata.market_cap
-        } : {},
-        // NEW: MTF status snapshot for consistency
-        mtfStatus: alignment || {}
+        } : {}
       };
 
       dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
 
-      // UPDATED: Create signal object with ALL fields for consistency
       const signalObj = {
         key,
         symbol,
@@ -123,18 +133,17 @@ module.exports = {
         tvScore: tv.score || 0,
         mtfScore,
         alignment,
-        // ADDED: These ensure per-signal blocks match startup snapshot
         marketData: mdata,
         decision: accept?.decision || 'monitor',
         acceptReason: accept?.reason || null
       };
 
-      // NEW: Cache this signal for consistency
+      // Cache this signal
       signalCache.set(key, signalObj);
-      logger.info({ key, cached: true }, 'Signal cached for synchronization');
+      logger.info({ key, cached: true, mtfStatus: alignment }, 'Signal cached with MTF data');
 
       if (notifyImmediately) {
-        // send telegram block immediately with all data
+        // send telegram block immediately with COMPLETE MTF data
         await telegram.sendRootSignalBlock({
           symbol,
           root_tf,
@@ -146,29 +155,28 @@ module.exports = {
           mtfScore
         });
       } else {
-        // do not notify now - return signal object so caller (poller) can notify at boundary
         return signalObj;
       }
 
-      // Only when decision is 'accept' do we attempt to open a trade.
+      // Only attempt to open trade if decision is 'accept'
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
-          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled');
         } else if (!openTradesAllowed) {
-          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
+          logger.info({ symbol }, 'Accept but open trades not yet enabled');
         } else {
           // Apply market-level filters
           let passFilters = true;
           if (config.MIN_MARKET_CAP > 0) {
             if (!mdata?.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
-              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered by MIN_MARKET_CAP');
             }
           }
           if (config.MIN_24H_USDT_VOLUME > 0) {
             if (!mdata?.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
-              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
+              logger.info({ symbol }, 'Filtered by MIN_24H_USDT_VOLUME');
             }
           }
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
@@ -176,20 +184,18 @@ module.exports = {
             if (change === null) {
               if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
                 passFilters = false;
-                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+                logger.info({ symbol }, 'Filtered by volume change (no data)');
               }
-            } else {
-              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
-                passFilters = false;
-                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
-              }
+            } else if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+              passFilters = false;
+              logger.info({ symbol, change }, 'Filtered by MIN_24H_VOLUME_CHANGE_PCT');
             }
           }
 
           if (passFilters) {
             await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
           } else {
-            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
+            logger.info({ symbol }, 'Accepted but market filters prevented trade');
           }
         }
       }
@@ -251,7 +257,7 @@ module.exports = {
       const db = dbModule;
       const snapshot = db.getLatestSignalsSnapshot();
       
-      // NEW: Merge with cache to ensure consistency
+      // Merge with cache to ensure consistency
       for (const s of snapshot) {
         const key = `${s.symbol}:${s.root_tf}`;
         if (!signalCache.has(key)) {
@@ -274,7 +280,7 @@ module.exports = {
       const db = dbModule;
       const snapshot = db.getLatestSignalsSnapshot();
       
-      // NEW: Ensure cache is fresh
+      // Ensure cache is fresh
       for (const s of snapshot) {
         const key = `${s.symbol}:${s.root_tf}`;
         if (!signalCache.has(key)) {
@@ -289,13 +295,13 @@ module.exports = {
     }
   },
 
-  // NEW: Public method to get cached signal
+  // Public method to get cached signal
   getSignal(symbol, root_tf) {
     const key = `${symbol}:${root_tf}`;
     return signalCache.get(key) || null;
   },
 
-  // NEW: Public method to get all cached signals
+  // Public method to get all cached signals
   getAllSignals() {
     return Array.from(signalCache.values());
   }
