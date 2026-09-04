@@ -11,8 +11,8 @@ const logger = require('pino')();
 
 let openTradesAllowed = true;
 
-// Signal cache for synchronization
-const signalCache = new Map();
+// NEW: Signal cache for synchronization across blocks
+const signalCache = new Map(); // symbol:root_tf -> signal object
 
 function setOpenTradesAllowed(v) {
   openTradesAllowed = !!v;
@@ -24,12 +24,13 @@ const inProgress = new Map();
 module.exports = {
   start() {
     logger.info('SignalManager started');
+    // NEW: Sync signals from DB on startup
     this.syncSignalsFromDb();
   },
 
   setOpenTradesAllowed,
 
-  // Sync in-memory signal cache with DB snapshot
+  // NEW: Sync in-memory signal cache with DB snapshot
   syncSignalsFromDb() {
     try {
       const db = dbModule;
@@ -46,12 +47,12 @@ module.exports = {
   },
 
   /**
-   * handleRootSignal - UPDATED TO FETCH 5m/15m MTF DATA
+   * handleRootSignal - UPDATED FOR SYNC
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
     
-    // Check if already cached
+    // NEW: Check if already cached (avoid duplicate processing)
     if (signalCache.has(key)) {
       const cached = signalCache.get(key);
       logger.debug({ key, cachedAt: cached.detected_at }, 'handleRootSignal: signal already in cache, returning cached version');
@@ -70,23 +71,9 @@ module.exports = {
       // Fetch market data
       const mdata = await marketData.updateSymbolMarketData(symbol);
 
-      // CRITICAL: Seed 5m/15m klines IMMEDIATELY so MTF can be computed
-      logger.info({ symbol }, 'Seeding 5m/15m klines for MTF computation');
-      try {
-        const poller = require('./poller');
-        await Promise.all([
-          poller.seedKlinesForSymbol(symbol, '5'),
-          poller.seedKlinesForSymbol(symbol, '15')
-        ]);
-        logger.info({ symbol }, '5m/15m klines seeded successfully');
-      } catch (e) {
-        logger.debug({ e, symbol }, 'Error seeding 5m/15m klines (continuing anyway)');
-      }
-
       // Subscribe to MTF websockets
       try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
-      // CRITICAL: Evaluate alignment AFTER 5m/15m is seeded
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
@@ -103,12 +90,12 @@ module.exports = {
         logger.debug({ e, symbol }, 'TV rating fetch failed');
       }
 
-      // Compose meta with POPULATED alignment
+      // UPDATED: Comprehensive meta object with all signal data
       const meta = {
         tvScore: tv.score || 0,
         tvSource: tv.source || 'unknown',
         mtfScore,
-        alignment,           // NOW HAS 5m/15m WITH ACTUAL VALUES
+        alignment,
         acceptReason: accept && accept.reason ? accept.reason : null,
         decision: accept && accept.decision ? accept.decision : 'monitor',
         marketData: mdata ? {
@@ -118,11 +105,14 @@ module.exports = {
           prev_volume_24h_usdt: mdata.prev_volume_24h,
           volume_change_pct: mdata.volume_change_pct,
           market_cap: mdata.market_cap
-        } : {}
+        } : {},
+        // NEW: MTF status snapshot for consistency
+        mtfStatus: alignment || {}
       };
 
       dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
 
+      // UPDATED: Create signal object with ALL fields for consistency
       const signalObj = {
         key,
         symbol,
@@ -133,61 +123,52 @@ module.exports = {
         tvScore: tv.score || 0,
         mtfScore,
         alignment,
+        // ADDED: These ensure per-signal blocks match startup snapshot
         marketData: mdata,
         decision: accept?.decision || 'monitor',
         acceptReason: accept?.reason || null
       };
 
-      // Cache this signal
+      // NEW: Cache this signal for consistency
       signalCache.set(key, signalObj);
-      logger.info({ key, cached: true, mtfStatus: alignment }, 'Signal cached with MTF data');
+      logger.info({ key, cached: true }, 'Signal cached for synchronization');
 
       if (notifyImmediately) {
-        // send telegram block immediately with COMPLETE MTF data
-        try {
-          if (telegram.sendRootSignalBlock) {
-            await telegram.sendRootSignalBlock({
-              symbol,
-              root_tf,
-              alignment,
-              detected_at,
-              accept,
-              marketData: mdata,
-              tvScore: tv.score || 0,
-              mtfScore
-            });
-          } else if (telegram.sendNewSignalSingleBlock) {
-            await telegram.sendNewSignalSingleBlock(signalObj);
-          } else {
-            // fallback: generic startup summary call
-            await telegram.sendStartupSummary ? telegram.sendStartupSummary({ snapshot: [signalObj] }) : null;
-          }
-        } catch (e) {
-          logger.debug({ e, symbol }, 'Failed to send immediate root signal block (continuing)');
-        }
+        // send telegram block immediately with all data
+        await telegram.sendRootSignalBlock({
+          symbol,
+          root_tf,
+          alignment,
+          detected_at,
+          accept,
+          marketData: mdata,
+          tvScore: tv.score || 0,
+          mtfScore
+        });
       } else {
+        // do not notify now - return signal object so caller (poller) can notify at boundary
         return signalObj;
       }
 
-      // Only attempt to open trade if decision is 'accept'
+      // Only when decision is 'accept' do we attempt to open a trade.
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
-          logger.info({ symbol }, 'Accept but OPENTRADE disabled');
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
         } else if (!openTradesAllowed) {
-          logger.info({ symbol }, 'Accept but open trades not yet enabled');
+          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
         } else {
           // Apply market-level filters
           let passFilters = true;
           if (config.MIN_MARKET_CAP > 0) {
             if (!mdata?.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
-              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered by MIN_MARKET_CAP');
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
           if (config.MIN_24H_USDT_VOLUME > 0) {
             if (!mdata?.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
-              logger.info({ symbol }, 'Filtered by MIN_24H_USDT_VOLUME');
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
@@ -195,18 +176,20 @@ module.exports = {
             if (change === null) {
               if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
                 passFilters = false;
-                logger.info({ symbol }, 'Filtered by volume change (no data)');
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
               }
-            } else if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
-              passFilters = false;
-              logger.info({ symbol, change }, 'Filtered by MIN_24H_VOLUME_CHANGE_PCT');
+            } else {
+              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+                passFilters = false;
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
             }
           }
 
           if (passFilters) {
             await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
           } else {
-            logger.info({ symbol }, 'Accepted but market filters prevented trade');
+            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
           }
         }
       }
@@ -268,7 +251,7 @@ module.exports = {
       const db = dbModule;
       const snapshot = db.getLatestSignalsSnapshot();
       
-      // Merge with cache to ensure consistency
+      // NEW: Merge with cache to ensure consistency
       for (const s of snapshot) {
         const key = `${s.symbol}:${s.root_tf}`;
         if (!signalCache.has(key)) {
@@ -276,54 +259,8 @@ module.exports = {
         }
       }
 
-      // compute counts per root_tf
-      const counts = {};
-      for (const s of snapshot) {
-        counts[s.root_tf] = (counts[s.root_tf] || 0) + 1;
-      }
-
       const telegramSvc = require('./telegram');
-
-      // Prefer a dedicated header sender if available
-      if (telegramSvc.sendStartupSummaryHeader) {
-        try {
-          await telegramSvc.sendStartupSummaryHeader({ counts, total: snapshot.length });
-        } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: header send failed (continuing)');
-        }
-      } else {
-        // fallback: call existing summary (single message) if present
-        try {
-          if (telegramSvc.sendStartupSummary) {
-            await telegramSvc.sendStartupSummary({ snapshot, counts });
-          }
-        } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: fallback header send failed');
-        }
-      }
-
-      // Send one signal block per signal (sequentially to avoid hitting rate limits)
-      for (const s of snapshot) {
-        try {
-          if (telegramSvc.sendRootSignalBlock) {
-            await telegramSvc.sendRootSignalBlock({
-              symbol: s.symbol,
-              root_tf: s.root_tf,
-              detected_at: s.detected_at,
-              alignment: s.meta?.alignment || null,
-              tvScore: s.meta?.tvScore || 0,
-              marketData: s.meta?.marketData || {}
-            });
-          } else if (telegramSvc.sendNewSignalSingleBlock) {
-            await telegramSvc.sendNewSignalSingleBlock(s);
-          } else {
-            // Last fallback: send summary with single-signal payload
-            await telegramSvc.sendStartupSummary ? telegramSvc.sendStartupSummary({ snapshot: [s] }) : null;
-          }
-        } catch (e) {
-          logger.debug({ e, s }, 'sendStartupSummary: failed to send per-signal block (continuing)');
-        }
-      }
+      await telegramSvc.sendStartupSummary({ snapshot });
     } catch (e) {
       logger.debug({ e }, 'sendStartupSummary failed');
     }
@@ -337,7 +274,7 @@ module.exports = {
       const db = dbModule;
       const snapshot = db.getLatestSignalsSnapshot();
       
-      // Ensure cache is fresh
+      // NEW: Ensure cache is fresh
       for (const s of snapshot) {
         const key = `${s.symbol}:${s.root_tf}`;
         if (!signalCache.has(key)) {
@@ -346,19 +283,19 @@ module.exports = {
       }
 
       const telegramSvc = require('./telegram');
-      await telegramSvc.sendRootCandleUpdate ? telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs }) : null;
+      await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
     } catch (e) {
       logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
     }
   },
 
-  // Public method to get cached signal
+  // NEW: Public method to get cached signal
   getSignal(symbol, root_tf) {
     const key = `${symbol}:${root_tf}`;
     return signalCache.get(key) || null;
   },
 
-  // Public method to get all cached signals
+  // NEW: Public method to get all cached signals
   getAllSignals() {
     return Array.from(signalCache.values());
   }
