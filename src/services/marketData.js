@@ -8,7 +8,7 @@ const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
 
 /**
  * fetchCoinGeckoMarketCapBySymbol(baseSymbol)
- * Fetches market cap from CoinGecko API
+ * Fetches market cap from CoinGecko API (internal helper)
  */
 async function fetchCoinGeckoMarketCapBySymbol(baseSymbol) {
   try {
@@ -63,6 +63,10 @@ module.exports = {
   /**
    * updateSymbolMarketData(symbol)
    * Fetches ticker and market cap, persists to DB, returns market data object
+   *
+   * Note: CoinGecko market cap fetch is performed in background (non-blocking)
+   * to reduce startup latency. If market_cap exists in DB we return it; otherwise
+   * we schedule a background fetch and DB update.
    */
   async updateSymbolMarketData(symbol) {
     try {
@@ -84,26 +88,39 @@ module.exports = {
       const row = db.prepare('SELECT volume_24h FROM symbols WHERE symbol = ?').get(symbol);
       const last_stored = row ? (row.volume_24h || 0) : 0;
 
-      // Update symbol record
+      // Update symbol record (price + volumes)
       const update = db.prepare('UPDATE symbols SET price = ?, prev_volume_24h = ?, volume_24h = ?, volume_24h_updated_at = ? WHERE symbol = ?');
       const now = Date.now();
       update.run(lastPrice, last_stored, volume_24h_usdt, now, symbol);
 
-      // Fetch market cap if enabled
+      // Fetch existing market_cap from DB (fast)
       let market_cap = null;
-      if (config.COINGECKO_ENABLED) {
-        const base = symbol.replace(/USDT(\.P)?$/i, '');
-        market_cap = await fetchCoinGeckoMarketCapBySymbol(base);
-        if (market_cap !== null) {
-          try {
-            db.prepare('UPDATE symbols SET market_cap = ? WHERE symbol = ?').run(market_cap, symbol);
-          } catch (e) {
-            logger.debug({ err: e, symbol }, 'Failed to update market_cap in DB');
-          }
-        }
-      } else {
+      try {
         const existing = db.prepare('SELECT market_cap FROM symbols WHERE symbol = ?').get(symbol);
         market_cap = existing ? existing.market_cap : null;
+      } catch (e) {
+        logger.debug({ e, symbol }, 'Failed to read existing market_cap from DB');
+        market_cap = null;
+      }
+
+      // If enabled but not present in DB, fetch in background (non-blocking)
+      if (config.COINGECKO_ENABLED && (!market_cap || market_cap === null)) {
+        (async () => {
+          try {
+            const base = symbol.replace(/USDT(\.P)?$/i, '');
+            const fetched = await fetchCoinGeckoMarketCapBySymbol(base);
+            if (fetched !== null) {
+              try {
+                db.prepare('UPDATE symbols SET market_cap = ? WHERE symbol = ?').run(fetched, symbol);
+                logger.debug({ symbol, marketCap: fetched }, 'CoinGecko market cap stored in DB (background)');
+              } catch (e) {
+                logger.debug({ err: e, symbol }, 'Failed to update market_cap in DB (background)');
+              }
+            }
+          } catch (e) {
+            logger.debug({ e, symbol }, 'Background CoinGecko fetch failed');
+          }
+        })();
       }
 
       // Calculate volume change
