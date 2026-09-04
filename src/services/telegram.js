@@ -36,12 +36,12 @@ module.exports = {
       const ok = info && typeof info.histogram !== 'undefined';
       const pos = ok ? (info.positive ? '🟢 POS' : '🔴 NEG') : '❓ UNKNOWN';
       if (info && info.positive) positiveCount++;
-      const hist = ok ? `${Number(info.histogram).toFixed(8)}` : 'n/a';
+      const histogramVal = ok && Number.isFinite(Number(info.histogram)) ? Number(info.histogram).toFixed(8) : 'n/a';
       const rise = ok ? (info.rising ? '📈' : '📉') : '';
       
       // HIGHLIGHT 5m and 15m
       const tfLabel = (tf === '5' || tf === '15') ? `*${String(tf).padEnd(5)}*` : String(tf).padEnd(5);
-      lines.push(`${tfLabel} ${pos.padEnd(12)} hist=${hist} ${rise}`.trim());
+      lines.push(`${tfLabel} ${pos.padEnd(12)} hist=${histogramVal} ${rise}`.trim());
     }
     
     const mtfScore = total ? (positiveCount / total) : 0;
@@ -51,6 +51,10 @@ module.exports = {
   // UPDATED: Send new signal with full MTF data
   async sendNewSignalSingleBlock(signal) {
     if (!bot) return;
+    if (!config.TELEGRAM_CHAT_ID) {
+      logger.warn('Telegram chat id not configured; skipping sendNewSignalSingleBlock');
+      return;
+    }
     try {
       const { symbol, root_tf, detected_at, meta, alignment, marketData, tvScore, mtfScore } = signal;
       const timeStr = new Date(detected_at).toISOString();
@@ -58,8 +62,8 @@ module.exports = {
       const alignObj = alignment || meta?.alignment || {};
       const { lines, mtfScore: score } = this.buildAlignmentLines(alignObj);
 
-      const tv = tvScore || meta?.tvScore || 0;
-      const mtf = mtfScore || meta?.mtfScore || 0;
+      const tv = (typeof tvScore === 'number') ? tvScore : (meta?.tvScore || 0);
+      const mtf = (typeof mtfScore === 'number') ? mtfScore : (meta?.mtfScore || 0);
       const decision = meta?.decision || 'monitor';
       const reason = meta?.acceptReason || 'n/a';
 
@@ -76,22 +80,25 @@ module.exports = {
         `💎 Market Cap: ${marketCap ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
       ].join('\n');
 
+      const tvPct = Number.isFinite(Number(tv)) ? (tv * 100).toFixed(0) : '0';
+      const mtfPct = Number.isFinite(Number(mtf)) ? (mtf * 100).toFixed(0) : '0';
+
       const msg = [
         `🎯 New signal: ${symbol} (${root_tf})`,
         `⏰ Time: ${timeStr}`,
         `✅ Decision: ${decision} (${reason})`,
         ``,
         `📊 Scoring:`,
-        `  TV: ${(tv*100).toFixed(0)}% • MTF: ${(mtf*100).toFixed(0)}%`,
+        `  TV: ${tvPct}% • MTF: ${mtfPct}%`,
         ``,
         `📡 MTF Status: (5m/15m highlighted)`,
-        lines,
+        lines || 'n/a',
         ``,
         `💵 Market Data:`,
         marketLines
       ].join('\n');
 
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown', disable_web_page_preview: true });
       logger.info({ symbol, root_tf }, '✅ Telegram new-signal message sent with MTF status');
     } catch (err) {
       logger.warn({ err }, '❌ Failed to send telegram new-signal block');
@@ -101,10 +108,13 @@ module.exports = {
   // UPDATED: Root signal block with full MTF data
   async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, mtfScore = 0 }) {
     if (!bot) return;
+    if (!config.TELEGRAM_CHAT_ID) {
+      logger.warn('Telegram chat id not configured; skipping sendRootSignalBlock');
+      return;
+    }
     const timeStr = new Date(detected_at).toISOString();
     
-    const { lines: alignmentLines } = this.buildAlignmentLines(alignment);
-
+    const { lines: alignmentLines, mtfScore: computedMtfScore } = this.buildAlignmentLines(alignment || {});
     const decision = accept && accept.decision ? accept.decision : 'monitor';
 
     const price = marketData?.price ? Number(marketData.price) : null;
@@ -119,23 +129,26 @@ module.exports = {
       `💎 Market Cap: ${marketCap ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
     ].join('\n');
 
+    const tvPct = Number.isFinite(Number(tvScore)) ? (tvScore * 100).toFixed(0) : '0';
+    const mtfPct = Number.isFinite(Number(mtfScore)) ? (mtfScore * 100).toFixed(0) : (Number.isFinite(Number(computedMtfScore)) ? (computedMtfScore * 100).toFixed(0) : '0');
+
     const msg = [
       `🎯 Root signal: ${symbol} (${root_tf})`,
       `⏰ Time: ${timeStr}`,
       `✅ Decision: ${decision} ${accept?.reason ? `(${accept.reason})` : ''}`,
       ``,
       `📊 Scoring:`,
-      `  TV: ${(tvScore*100).toFixed(0)}% • MTF: ${(mtfScore*100).toFixed(0)}%`,
+      `  TV: ${tvPct}% • MTF: ${mtfPct}%`,
       ``,
       `📡 MTF Status: (5m/15m highlighted)`,
-      alignmentLines,
+      alignmentLines || 'n/a',
       ``,
       `💵 Market Data:`,
       marketLines
     ].join('\n');
 
     try {
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown' });
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg, { parse_mode: 'Markdown', disable_web_page_preview: true });
       logger.info({ symbol, root_tf }, '✅ Telegram root signal sent with MTF status');
     } catch (err) {
       logger.warn({ err }, '❌ Failed to send telegram signal block');
@@ -143,11 +156,55 @@ module.exports = {
   },
 
   /**
+   * sendStartupSummaryHeader - compact header with counts per root TF
+   * Used by signalManager to send a short header before per-signal blocks.
+   */
+  async sendStartupSummaryHeader({ counts = {}, total = 0 } = {}) {
+    if (!bot) return;
+    if (!config.TELEGRAM_CHAT_ID) {
+      logger.warn('Telegram chat id not configured; skipping sendStartupSummaryHeader');
+      return;
+    }
+    try {
+      const tfOrder = ['5', '15', '60', '240', 'D'];
+      const parts = [];
+      for (const tf of tfOrder) {
+        if (typeof counts[tf] !== 'undefined') {
+          parts.push(`${tf}:${counts[tf]}`);
+        }
+      }
+      // include any other TFs present
+      const others = Object.keys(counts || {}).filter(tf => !tfOrder.includes(tf)).sort();
+      for (const o of others) parts.push(`${o}:${counts[o]}`);
+
+      const header = [
+        `═══════════════════════════════════`,
+        `📊 Startup Root TF Summary`,
+        `═══════════════════════════════════`,
+        ``,
+        `Total signals: ${total}`,
+        parts.length ? `Counts: ${parts.join(' • ')}` : 'Counts: none',
+        `═══════════════════════════════════`
+      ].join('\n');
+
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, header, { parse_mode: 'Markdown', disable_web_page_preview: true });
+      logger.info('✅ Telegram startup summary header sent');
+    } catch (err) {
+      logger.warn({ err }, '❌ Failed to send startup summary header');
+    }
+  },
+
+  /**
    * sendStartupSummary - CRITICAL: SHOWS RECOMMENDED SIGNALS
+   * (Kept as a full summary fallback; signalManager now prefers header + per-signal blocks)
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) {
       logger.warn('❌ Telegram bot not initialized');
+      return;
+    }
+    if (!config.TELEGRAM_CHAT_ID) {
+      logger.warn('❌ Telegram chat id not configured; skipping sendStartupSummary');
       return;
     }
     
@@ -170,7 +227,7 @@ module.exports = {
           `═══════════════════════════════════`
         ].join('\n');
         
-        await bot.sendMessage(config.TELEGRAM_CHAT_ID, emptyMsg);
+        await bot.sendMessage(config.TELEGRAM_CHAT_ID, emptyMsg, { disable_web_page_preview: true });
         logger.info('ℹ️ Startup summary sent (initializing state)');
         return;
       }
@@ -221,12 +278,12 @@ module.exports = {
       ].join('\n');
 
       logger.info('📤 Sending first block (summary)');
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, firstBlock);
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, firstBlock, { disable_web_page_preview: true });
 
       // Second block: RECOMMENDED TRADES
       const openCountRow = db.prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
       const openCount = openCountRow ? Number(openCountRow.cnt || 0) : 0;
-      const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
+      const maxSlots = Math.max(0, (Number(config.MAX_OPEN_TRADES) || 0) - openCount);
 
       const candidates = snapshot
         .map(s => ({
@@ -260,7 +317,7 @@ module.exports = {
       ].join('\n');
 
       logger.info({ acceptCount: candidates.length }, '📤 Sending second block (recommended)');
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, secondBlock);
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, secondBlock, { disable_web_page_preview: true });
       
       // Subsequent blocks: Per-symbol details
       const listingBlocks = [];
@@ -283,7 +340,7 @@ module.exports = {
       if (listingBlocks.length > 0) {
         logger.info({ blockCount: listingBlocks.length }, '📤 Sending listing blocks');
         for (const blk of listingBlocks) {
-          await bot.sendMessage(config.TELEGRAM_CHAT_ID, blk);
+          await bot.sendMessage(config.TELEGRAM_CHAT_ID, blk, { disable_web_page_preview: true });
         }
       }
 
@@ -304,7 +361,8 @@ module.exports = {
     if (!bot) return;
     try {
       const filtered = snapshot.filter(s => newRootTfs.includes(String(s.root_tf)));
-      await this.sendStartupSummary({ snapshot: filtered });
+      // prefer header + per-signal blocks via signalManager which calls sendStartupSummaryHeader + sendRootSignalBlock
+      await this.sendStartupSummary ? this.sendStartupSummary({ snapshot: filtered }) : null;
     } catch (err) {
       logger.warn({ err }, '❌ Failed to send root candle update');
     }
