@@ -5,8 +5,8 @@
  *  - db.init()
  *  - telegram.init()
  *  - poller.initialScan()
- *  - targeted seeding for STARTUP_SEED_SYMBOLS
- *  - poller.scanOnce({ notifyNewSignals: false })  // silent persist-only quick scan
+ *  - targeted seeding (optional)
+ *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
  *  - signalManager.sendStartupSummary()
  *  - poller.start(), wsManager.start(), signalManager.start()
  */
@@ -78,11 +78,11 @@ async function start() {
         const rows = dbInst.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT ?').all(startupSeedCount);
         seedList = rows.map(r => ({ symbol: r.symbol }));
       } catch (e) {
-        logger.debug({ e }, 'Startup: failed to read symbols from DB for targeted seeding (will still attempt quick scan)');
+        logger.debug({ e }, 'Startup: failed to read symbols from DB for targeted seeding (will still attempt full iteration)');
       }
 
       if (seedList.length && typeof poller.backgroundSeedKlines === 'function') {
-        logger.info({ count: seedList.length }, 'Startup: seeding klines for top symbols before quick scan');
+        logger.info({ count: seedList.length }, 'Startup: seeding klines for top symbols before full flip pass');
         await poller.backgroundSeedKlines(seedList);
       } else {
         logger.info('Startup: no targeted seed list available or backgroundSeedKlines not present; skipping targeted seeding');
@@ -91,19 +91,22 @@ async function start() {
       logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
     }
 
-    // 3) silent quick scanOnce to persist any detected signals but DO NOT notify per-signal messages
+    // 3) Full iteration across all fetched symbols to detect flips (silent)
     try {
-      logger.info('Startup: running quick silent scanOnce() to detect flips and populate signals (no notifications)');
-      if (typeof poller.scanOnce === 'function') {
+      logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
+      if (typeof poller.scanAllForStartup === 'function') {
+        await poller.scanAllForStartup();
+      } else {
+        // fallback: silent scanOnce if scanAllForStartup not present
         await poller.scanOnce({ notifyNewSignals: false });
       }
     } catch (e) {
-      logger.warn({ e }, 'scanOnce failed during startup quick pass (continuing)');
+      logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
     }
 
     // 4) send startup summary now that snapshot should be populated
     try {
-      logger.info('Startup: sending startup summary (after targeted seeding and silent scan)');
+      logger.info('Startup: sending startup summary (after full flip pass)');
       await signalManager.sendStartupSummary();
     } catch (e) {
       logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
