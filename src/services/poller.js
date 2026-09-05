@@ -155,36 +155,54 @@ module.exports = {
     logger.info('backgroundSeedKlines: completed');
   },
 
+  /**
+   * seedKlinesForSymbol:
+   * - If timeframe is provided, seed that timeframe PLUS the MTF timeframes so alignment is available.
+   * - If timeframe is not provided, seed ROOT_TFS plus MTF_TFS (unique).
+   */
   async seedKlinesForSymbol(symbol, timeframe = null) {
-    const tfs = timeframe ? [timeframe] : (config.ROOT_TFS || []);
-    for (const tf of tfs) {
-      const interval = tf === 'D' ? 'D' : String(tf);
-      try {
-        const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
-        if (!klines || klines.length === 0) continue;
+    try {
+      const rootTfs = timeframe ? [String(timeframe)] : (config.ROOT_TFS || []);
+      const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
+      // Combine uniq: seed requested root(s) and all MTFs so computeMacdHistogram for MTFs won't be missing.
+      const tfsSet = new Set([...(rootTfs || []), ...(mtfTfs || [])]);
+      const tfs = Array.from(tfsSet);
 
-        const db = dbModule.get();
-        const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-        const insertMany = db.transaction((rows) => {
-          for (const k of rows) {
-            insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
-          }
-        });
-        insertMany(klines);
-
-        // Warm MACD if possible. Try computeAndStoreMacd then fallback to computeMacdHistogram.
+      for (const tf of tfs) {
+        const interval = String(tf) === 'D' ? 'D' : String(tf);
         try {
-          if (typeof macdUtil.computeAndStoreMacd === 'function') {
-            await macdUtil.computeAndStoreMacd(symbol, tf);
-          } else if (typeof macdUtil.computeMacdHistogram === 'function') {
-            await macdUtil.computeMacdHistogram(symbol, tf);
+          const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
+          if (!klines || klines.length === 0) {
+            logger.debug({ symbol, tf }, 'seedKlinesForSymbol: no klines returned from API');
+            continue;
+          }
+
+          const db = dbModule.get();
+          const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+          const insertMany = db.transaction((rows) => {
+            for (const k of rows) {
+              insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
+            }
+          });
+          insertMany(klines);
+          logger.debug({ symbol, tf, count: klines.length }, 'seedKlinesForSymbol: klines persisted');
+
+          // Warm MACD if possible. Try computeAndStoreMacd then fallback to computeMacdHistogram.
+          try {
+            if (typeof macdUtil.computeAndStoreMacd === 'function') {
+              await macdUtil.computeAndStoreMacd(symbol, tf);
+            } else if (typeof macdUtil.computeMacdHistogram === 'function') {
+              await macdUtil.computeMacdHistogram(symbol, tf);
+            }
+          } catch (err) {
+            logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd warm-up failed (continuing)');
           }
         } catch (err) {
-          logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd warm-up failed (continuing)');
+          logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: fetch failed (skipping tf)');
         }
-      } catch (err) {
-        logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: fetch failed (skipping tf)');
       }
+    } catch (err) {
+      logger.debug({ err, symbol, timeframe }, 'seedKlinesForSymbol: unexpected error');
     }
   },
 
@@ -286,7 +304,7 @@ module.exports = {
         let rows = selectStmt.all(symbol, tf);
         if (!rows || rows.length < 2) {
           // Seed missing klines (sync) and then re-check immediately
-          logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now');
+          logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now (will also seed MTF TFs)');
           await this.seedKlinesForSymbol(symbol, tf);
 
           // Re-query after seed
