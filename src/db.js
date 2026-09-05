@@ -1,9 +1,10 @@
 /**
- * SQLite wrapper to persist symbols, klines, signals, trades.
+ * SQLite wrapper to persist symbols, klines, signals, trades, market_data.
  * Adds missing columns on existing DB (migration).
  *
  * Added: close() to allow graceful shutdown.
  * Added: notification_state table and helpers, upsert/get latest signals snapshot helper.
+ * Added: market_data table for storing price, volume, market cap data.
  */
 const path = require('path');
 const fs = require('fs');
@@ -59,6 +60,15 @@ module.exports = {
         key TEXT PRIMARY KEY,
         value TEXT
       );
+      CREATE TABLE IF NOT EXISTS market_data (
+        symbol TEXT PRIMARY KEY,
+        price REAL DEFAULT 0,
+        volume_24h_usdt REAL DEFAULT 0,
+        volume_change_pct REAL,
+        market_cap REAL,
+        updated_at INTEGER DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_market_data_updated_at ON market_data(updated_at);
     `);
 
     // Migration: add additional columns to symbols if not present
@@ -79,6 +89,30 @@ module.exports = {
           logger.warn({ err, column: col.name }, 'Failed to add column (may already exist)');
         }
       }
+    }
+
+    // Migration: ensure market_data table has all columns
+    try {
+      const mdExisting = db.prepare("PRAGMA table_info(market_data)").all().map(r => r.name);
+      const mdToAdd = [
+        { name: 'price', type: 'REAL DEFAULT 0' },
+        { name: 'volume_24h_usdt', type: 'REAL DEFAULT 0' },
+        { name: 'volume_change_pct', type: 'REAL' },
+        { name: 'market_cap', type: 'REAL' },
+        { name: 'updated_at', type: 'INTEGER DEFAULT 0' }
+      ];
+      for (const col of mdToAdd) {
+        if (!mdExisting.includes(col.name)) {
+          try {
+            db.prepare(`ALTER TABLE market_data ADD COLUMN ${col.name} ${col.type}`).run();
+            logger.info({ column: col.name }, 'Added column to market_data table');
+          } catch (err) {
+            logger.warn({ err, column: col.name }, 'Failed to add market_data column (may already exist)');
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn({ err }, 'market_data migration check failed');
     }
 
     logger.info({ dbPath }, 'Database initialized');
