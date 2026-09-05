@@ -1,151 +1,190 @@
 const fetch = require('node-fetch');
-const bybit = require('./bybitRest');
 const dbModule = require('../db');
 const config = require('../config');
 const logger = require('pino')();
 
-const COINGECKO_BASE = 'https://api.coingecko.com/api/v3';
-
-/**
- * fetchCoinGeckoMarketCapBySymbol(baseSymbol)
- * Fetches market cap from CoinGecko API (internal helper)
- */
-async function fetchCoinGeckoMarketCapBySymbol(baseSymbol) {
-  try {
-    const q = encodeURIComponent(baseSymbol);
-    const res = await fetch(`${COINGECKO_BASE}/search?query=${q}`, { timeout: 8000 });
-    
-    if (!res.ok) {
-      logger.debug({ status: res.status, baseSymbol }, 'CoinGecko search returned non-ok');
-      return null;
-    }
-
-    const j = await res.json();
-    if (!j || !j.coins || j.coins.length === 0) {
-      logger.debug({ baseSymbol }, 'CoinGecko search returned no coins');
-      return null;
-    }
-
-    const found = j.coins.find(c => (c.symbol || '').toLowerCase() === baseSymbol.toLowerCase()) || j.coins[0];
-    
-    if (!found || !found.id) {
-      logger.debug({ baseSymbol, coinCount: j.coins.length }, 'CoinGecko: no matching coin found');
-      return null;
-    }
-
-    const id = found.id;
-    const marketsRes = await fetch(
-      `${COINGECKO_BASE}/coins/markets?vs_currency=usd&ids=${encodeURIComponent(id)}`,
-      { timeout: 8000 }
-    );
-
-    if (!marketsRes.ok) {
-      logger.debug({ status: marketsRes.status, coinId: id }, 'CoinGecko markets request failed');
-      return null;
-    }
-
-    const m = await marketsRes.json();
-    if (!m || !m.length) {
-      logger.debug({ coinId: id }, 'CoinGecko markets returned no data');
-      return null;
-    }
-
-    const marketCap = m[0].market_cap;
-    logger.debug({ baseSymbol, marketCap }, 'CoinGecko market cap fetched');
-    return marketCap;
-  } catch (err) {
-    logger.debug({ err: err && err.message ? err.message : err, baseSymbol }, 'CoinGecko market cap fetch failed');
-    return null;
-  }
-}
+const BYBIT_REST_BASE = config.BYBIT_REST_BASE || 'https://api.bybit.com';
+const COINGECKO_API_BASE = 'https://api.coingecko.com/api/v3';
 
 module.exports = {
   /**
    * updateSymbolMarketData(symbol)
-   * Fetches ticker and market cap, persists to DB, returns market data object
-   *
-   * Note: CoinGecko market cap fetch is performed in background (non-blocking)
-   * to reduce startup latency. If market_cap exists in DB we return it; otherwise
-   * we schedule a background fetch and DB update.
+   * Fetches price, 24h volume (USDT), volume change %, market cap
+   * Returns: { price, volume_24h_usdt, volume_change_pct, market_cap }
    */
   async updateSymbolMarketData(symbol) {
     try {
-      const db = dbModule.get();
-      
-      // Fetch 24h ticker
-      const ticker = await bybit.fetchTicker24h(symbol);
-      let lastPrice = 0;
-      let baseVolume = 0;
-
-      if (ticker) {
-        lastPrice = Number(ticker.last_price || ticker.last || ticker.last_trade_price || ticker.close || ticker.price || 0);
-        baseVolume = Number(ticker.volume || ticker.volume_24h || ticker.turnover_24h || 0);
+      if (!symbol) {
+        logger.debug('updateSymbolMarketData: symbol is empty');
+        return {
+          price: 0,
+          volume_24h_usdt: 0,
+          volume_change_pct: null,
+          market_cap: null
+        };
       }
 
-      const volume_24h_usdt = (baseVolume && lastPrice) ? Number((baseVolume * lastPrice).toFixed(8)) : 0;
+      // Fetch from Bybit v5 tickers (price + 24h volume in USDT)
+      let price = 0;
+      let volume24hUsdt = 0;
 
-      // Get previous volume
-      const row = db.prepare('SELECT volume_24h FROM symbols WHERE symbol = ?').get(symbol);
-      const last_stored = row ? (row.volume_24h || 0) : 0;
-
-      // Update symbol record (price + volumes)
-      const update = db.prepare('UPDATE symbols SET price = ?, prev_volume_24h = ?, volume_24h = ?, volume_24h_updated_at = ? WHERE symbol = ?');
-      const now = Date.now();
-      update.run(lastPrice, last_stored, volume_24h_usdt, now, symbol);
-
-      // Fetch existing market_cap from DB (fast)
-      let market_cap = null;
       try {
-        const existing = db.prepare('SELECT market_cap FROM symbols WHERE symbol = ?').get(symbol);
-        market_cap = existing ? existing.market_cap : null;
-      } catch (e) {
-        logger.debug({ e, symbol }, 'Failed to read existing market_cap from DB');
-        market_cap = null;
-      }
-
-      // If enabled but not present in DB, fetch in background (non-blocking)
-      if (config.COINGECKO_ENABLED && (!market_cap || market_cap === null)) {
-        (async () => {
-          try {
-            const base = symbol.replace(/USDT(\.P)?$/i, '');
-            const fetched = await fetchCoinGeckoMarketCapBySymbol(base);
-            if (fetched !== null) {
-              try {
-                db.prepare('UPDATE symbols SET market_cap = ? WHERE symbol = ?').run(fetched, symbol);
-                logger.debug({ symbol, marketCap: fetched }, 'CoinGecko market cap stored in DB (background)');
-              } catch (e) {
-                logger.debug({ err: e, symbol }, 'Failed to update market_cap in DB (background)');
-              }
-            }
-          } catch (e) {
-            logger.debug({ e, symbol }, 'Background CoinGecko fetch failed');
+        const tickerUrl = `${BYBIT_REST_BASE}/v5/market/tickers?category=linear&symbol=${symbol}`;
+        const res = await fetch(tickerUrl, { timeout: 5000 });
+        if (res.ok) {
+          const json = await res.json();
+          if (json.result && json.result.list && json.result.list.length > 0) {
+            const ticker = json.result.list[0];
+            price = Number(ticker.lastPrice || 0);
+            // turnover24h is volume in USDT (quote currency)
+            volume24hUsdt = Number(ticker.turnover24h || 0);
+            logger.debug({ symbol, price, volume24hUsdt }, 'Market data fetched from Bybit');
           }
-        })();
+        } else {
+          logger.debug({ symbol, status: res.status }, 'Bybit ticker API returned non-ok status');
+        }
+      } catch (err) {
+        logger.debug({ err: err && err.message, symbol }, 'Bybit ticker fetch failed');
       }
 
-      // Calculate volume change
-      let volume_change_pct = null;
-      if (last_stored && last_stored > 0) {
-        volume_change_pct = ((volume_24h_usdt - last_stored) / Math.abs(last_stored)) * 100;
+      // Fetch from CoinGecko if enabled (volume change % and market cap)
+      let volumeChangePct = null;
+      let marketCap = null;
+
+      if (config.COINGECKO_ENABLED) {
+        try {
+          const coinId = this.extractCoinIdFromSymbol(symbol);
+          if (coinId) {
+            const cgUrl = `${COINGECKO_API_BASE}/simple/price?ids=${coinId}&vs_currencies=usd&include_market_cap=true&include_24hr_vol_change=true`;
+            const res = await fetch(cgUrl, { timeout: 5000 });
+            if (res.ok) {
+              const json = await res.json();
+              if (json[coinId]) {
+                const data = json[coinId];
+                // Extract market cap
+                if (data.usd_market_cap) {
+                  marketCap = data.usd_market_cap;
+                }
+                // Extract 24h volume change
+                if (data.usd_24h_vol_change) {
+                  volumeChangePct = data.usd_24h_vol_change;
+                }
+                logger.debug({ symbol, coinId, volumeChangePct, marketCap }, 'CoinGecko market data fetched');
+              }
+            } else {
+              logger.debug({ symbol, coinId, status: res.status }, 'CoinGecko API returned non-ok status');
+            }
+          }
+        } catch (err) {
+          logger.debug({ err: err && err.message, symbol }, 'CoinGecko fetch failed');
+        }
       }
 
-      logger.debug(
-        { symbol, price: lastPrice, volume_24h_usdt, volume_change_pct, market_cap },
-        'Market data updated'
-      );
-
-      return {
-        symbol,
-        price: lastPrice,
-        base_volume_24h: baseVolume,
-        volume_24h_usdt,
-        prev_volume_24h: last_stored,
-        volume_change_pct,
-        market_cap
+      const result = {
+        price: price || 0,
+        volume_24h_usdt: volume24hUsdt || 0,
+        volume_change_pct: volumeChangePct,
+        market_cap: marketCap
       };
+
+      // Persist to DB
+      try {
+        const db = dbModule.get();
+        db.prepare('INSERT OR REPLACE INTO market_data (symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+          .run(symbol, result.price, result.volume_24h_usdt, result.volume_change_pct || null, result.market_cap || null, Date.now());
+      } catch (err) {
+        logger.debug({ err, symbol }, 'Failed to persist market data to DB');
+      }
+
+      return result;
     } catch (err) {
-      logger.error({ err, symbol }, 'updateSymbolMarketData error');
-      return null;
+      logger.error({ err, symbol }, 'updateSymbolMarketData: unexpected error');
+      return {
+        price: 0,
+        volume_24h_usdt: 0,
+        volume_change_pct: null,
+        market_cap: null
+      };
     }
+  },
+
+  /**
+   * getSymbolMarketData(symbol)
+   * Retrieves cached market data from DB (without fetching fresh)
+   */
+  async getSymbolMarketData(symbol) {
+    try {
+      const db = dbModule.get();
+      const row = db.prepare('SELECT price, volume_24h_usdt, volume_change_pct, market_cap FROM market_data WHERE symbol = ?').get(symbol);
+      if (row) {
+        return {
+          price: row.price || 0,
+          volume_24h_usdt: row.volume_24h_usdt || 0,
+          volume_change_pct: row.volume_change_pct,
+          market_cap: row.market_cap
+        };
+      }
+    } catch (err) {
+      logger.debug({ err, symbol }, 'getSymbolMarketData error');
+    }
+    return {
+      price: 0,
+      volume_24h_usdt: 0,
+      volume_change_pct: null,
+      market_cap: null
+    };
+  },
+
+  /**
+   * extractCoinIdFromSymbol(symbol)
+   * Maps USDT symbol to CoinGecko coin ID
+   * E.g., BTCUSDT -> bitcoin, ETHUSDT -> ethereum
+   */
+  extractCoinIdFromSymbol(symbol) {
+    if (!symbol) return null;
+
+    // Remove USDT/USDT.P suffix
+    const base = symbol.replace(/USDT[Pp]?$/i, '').toUpperCase();
+
+    // Common mappings
+    const coinIdMap = {
+      BTC: 'bitcoin',
+      ETH: 'ethereum',
+      BNB: 'binancecoin',
+      XRP: 'ripple',
+      ADA: 'cardano',
+      SOL: 'solana',
+      DOT: 'polkadot',
+      DOGE: 'dogecoin',
+      AVAX: 'avalanche-2',
+      MATIC: 'matic-network',
+      LINK: 'chainlink',
+      UNI: 'uniswap',
+      LTC: 'litecoin',
+      BCH: 'bitcoin-cash',
+      FIL: 'filecoin',
+      ATOM: 'cosmos',
+      XLM: 'stellar',
+      VET: 'vechain',
+      THETA: 'theta-token',
+      EOS: 'eos',
+      TRON: 'tron',
+      IOTA: 'iota',
+      NEO: 'neo',
+      XMR: 'monero',
+      ZEC: 'zcash',
+      DASH: 'dash',
+      MANA: 'decentraland',
+      SAND: 'the-sandbox',
+      APE: 'apecoin',
+      GMX: 'gmx',
+      ARB: 'arbitrum',
+      OP: 'optimism',
+      BLUR: 'blur',
+      JTO: 'jito',
+      WLD: 'world-coin'
+    };
+
+    return coinIdMap[base] || null;
   }
 };
