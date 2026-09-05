@@ -1,69 +1,67 @@
+/**
+ * Entrypoint - starts Express server and the poller/scanner
+ *
+ * Startup flow:
+ *  - db.init()
+ *  - telegram.init()
+ *  - TV cache cleanup scheduler
+ *  - poller.initialScan()
+ *  - targeted seeding (optional)
+ *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
+ *  - signalManager.sendStartupSummary()
+ *  - poller.start(), wsManager.start(), signalManager.start()
+ *  - Express server with optimized endpoints
+ */
+
+require('dotenv').config();
 const express = require('express');
-const path = require('path');
+const pino = require('pino');
 const config = require('./config');
-const logger = require('pino')();
-const dbModule = require('./db');
-const telegram = require('./services/telegram');
+const db = require('./db');
 const poller = require('./services/poller');
 const wsManager = require('./services/bybitWs');
-const tradeManager = require('./services/tradeManager');
 const signalManager = require('./services/signalManager');
+const telegram = require('./services/telegram');
+const tradeManager = require('./services/tradeManager');
 const tradingview = require('./services/tradingview');
+const debugRoutes = require('./routes/debug');
+
+const logger = pino({ level: config.LOG_LEVEL || 'info' });
+
+process.on('uncaughtException', (err) => {
+  logger.error({ err }, 'UNCAUGHT EXCEPTION - the process may terminate');
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error({ reason }, 'UNHANDLED REJECTION - promise rejected without handler');
+});
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use('/debug', debugRoutes);
+
+const PORT = process.env.PORT || config.PORT || 3000;
+let server;
+let heartbeatInterval;
 
 // ============================================================
-// INITIALIZATION
+// STATUS CACHING (optimize /status endpoint)
 // ============================================================
 
-logger.info('Starting trading bot application...');
+let cachedStatus = null;
+let lastStatusTime = 0;
+const STATUS_CACHE_MS = 5000; // Cache for 5 seconds
 
-// Initialize database
-try {
-  dbModule.init();
-  logger.info('✅ Database initialized');
-} catch (err) {
-  logger.error({ err }, '❌ Database initialization failed');
-  process.exit(1);
-}
-
-// Initialize Telegram
-try {
-  telegram.init();
-  logger.info('✅ Telegram initialized');
-} catch (err) {
-  logger.error({ err }, '❌ Telegram initialization failed');
-}
-
-// Initialize WS Manager
-try {
-  wsManager.start();
-  logger.info('✅ WebSocket manager started');
-} catch (err) {
-  logger.error({ err }, '❌ WebSocket manager startup failed');
-}
-
-// Initialize Signal Manager
-try {
-  signalManager.start();
-  logger.info('✅ Signal manager started');
-} catch (err) {
-  logger.error({ err }, '❌ Signal manager startup failed');
-}
-
-// Register WS callbacks for trade management
-try {
-  tradeManager.registerWs(wsManager);
-  logger.info('✅ Trade manager registered to WS events');
-} catch (err) {
-  logger.warn({ err }, '⚠️ Failed to register trade manager with WS (continuing)');
+function invalidateStatusCache() {
+  cachedStatus = null;
+  lastStatusTime = 0;
 }
 
 // ============================================================
-// TV RATING CACHE CLEANUP (scheduled daily at 2am UTC)
+// TV CACHE CLEANUP SCHEDULER (daily at 2am UTC)
 // ============================================================
 
-const scheduleTvCacheCleanup = () => {
+function scheduleTvCacheCleanup() {
   try {
     const now = new Date();
     const target = new Date(now);
@@ -90,459 +88,485 @@ const scheduleTvCacheCleanup = () => {
   } catch (err) {
     logger.error({ err }, '❌ Failed to schedule TV cache cleanup');
   }
-};
-
-scheduleTvCacheCleanup();
-
-// ============================================================
-// START POLLER (main scanning loop)
-// ============================================================
-
-try {
-  logger.info('Starting poller (initial scan + continuous boundary monitoring)...');
-  poller.start();
-  logger.info('✅ Poller started successfully');
-} catch (err) {
-  logger.error({ err }, '❌ Failed to start poller');
-  process.exit(1);
 }
 
 // ============================================================
-// EXPRESS SERVER SETUP
+// STARTUP SEQUENCE
 // ============================================================
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-
-// ============================================================
-// SIMPLE REQUEST LOGGING (lightweight)
-// ============================================================
-
-app.use((req, res, next) => {
-  if (!req.path.startsWith('/health')) {
-    logger.debug({ method: req.method, path: req.path }, 'HTTP request');
-  }
-  next();
-});
-
-// ============================================================
-// HEALTH CHECK ENDPOINT (lightweight, no DB queries)
-// ============================================================
-
-app.get('/health', (req, res) => {
+async function start() {
   try {
-    const uptime = process.uptime();
-    const memUsage = process.memoryUsage();
+    logger.info('🚀 Starting trading bot application...');
     
-    res.json({
-      status: 'ok',
-      timestamp: new Date().toISOString(),
-      uptime_seconds: Math.floor(uptime),
-      memory_usage_mb: {
-        heap_used: Math.round(memUsage.heapUsed / 1024 / 1024),
-        heap_total: Math.round(memUsage.heapTotal / 1024 / 1024),
-        rss: Math.round(memUsage.rss / 1024 / 1024)
-      },
-      config: {
-        root_tfs: config.ROOT_TFS,
-        mtf_tfs: config.MTF_TFS,
-        max_open_trades: config.MAX_OPEN_TRADES,
-        symbol_filter: config.SYMBOL_FILTER,
-        opentrade_enabled: config.OPENTRADE,
-        telegram_enabled: !!config.TELEGRAM_BOT_TOKEN
-      }
-    });
-  } catch (err) {
-    logger.error({ err }, 'Health check error');
-    res.status(500).json({ error: err.message });
-  }
-});
+    // 1) Initialize database
+    db.init();
+    logger.info('✅ Database initialized');
 
-// ============================================================
-// STATUS ENDPOINT (OPTIMIZED - caches results for 5 seconds)
-// ============================================================
+    // 2) Initialize telegram early so notifications are possible
+    telegram.init();
+    logger.info('✅ Telegram initialized');
 
-let cachedStatus = null;
-let lastStatusTime = 0;
-const STATUS_CACHE_MS = 5000; // Cache for 5 seconds
+    // 3) Schedule TV cache cleanup
+    scheduleTvCacheCleanup();
+    logger.info('✅ TV cache cleanup scheduled');
 
-app.get('/status', (req, res) => {
-  try {
-    const now = Date.now();
-    
-    // Return cached status if fresh
-    if (cachedStatus && (now - lastStatusTime) < STATUS_CACHE_MS) {
-      return res.json(cachedStatus);
-    }
-
-    const db = dbModule.get();
-    if (!db) {
-      return res.status(503).json({ error: 'Database not available' });
-    }
-
-    // Get open trades count (fast query)
-    const openTradesRow = db.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('open');
-    const openCount = openTradesRow?.cnt || 0;
-
-    // Get closed trades count (fast query)
-    const closedTradesRow = db.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('closed');
-    const closedCount = closedTradesRow?.cnt || 0;
-
-    // Get latest signals (limit to 20 instead of 50)
-    const signals = db.prepare(`
-      SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
-      FROM signals s1
-      INNER JOIN (
-        SELECT symbol, root_tf, MAX(detected_at) as max_dt
-        FROM signals
-        GROUP BY symbol, root_tf
-      ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
-      ORDER BY s1.detected_at DESC
-      LIMIT 20
-    `).all();
-
-    // Get only open trades (no joins)
-    const openTrades = db.prepare('SELECT id, symbol, opened_at, side, size, entry_price, tp, sl FROM trades WHERE status = ? ORDER BY opened_at DESC LIMIT 10').all('open');
-
-    // Get symbol count (fast with index)
-    const symbolCountRow = db.prepare('SELECT COUNT(*) as count FROM symbols').get();
-    const symbolCount = symbolCountRow?.count || 0;
-
-    const responseData = {
-      timestamp: new Date().toISOString(),
-      signals: {
-        latest_count: signals.length,
-        signals: signals.map(s => {
-          let meta = {};
-          try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (e) { meta = {}; }
-          return {
-            symbol: s.symbol,
-            root_tf: s.root_tf,
-            detected_at: new Date(s.detected_at).toISOString(),
-            state: s.state,
-            tv_score: meta.tvScore || 0,
-            mtf_score: meta.mtfScore || 0,
-            decision: meta.decision || 'unknown'
-          };
+    // 4) Background bybit probe (non-blocking)
+    try {
+      const bybitRest = require('./services/bybitRest');
+      bybitRest.probeHosts(3000)
+        .then((base) => {
+          if (base) logger.info({ base }, '✅ Bybit host probe completed');
+          else logger.warn('⚠️ Bybit host probe found no suitable base');
         })
-      },
-      trades: {
-        open_count: openCount,
-        closed_count: closedCount,
-        max_slots: config.MAX_OPEN_TRADES,
-        open_trades: openTrades.map(t => ({
-          id: t.id,
-          symbol: t.symbol,
-          opened_at: new Date(t.opened_at).toISOString(),
-          side: t.side,
-          size: t.size,
-          entry_price: t.entry_price
-        }))
-      },
-      symbols: {
-        total_count: symbolCount
-      }
-    };
-
-    // Cache the response
-    cachedStatus = responseData;
-    lastStatusTime = now;
-
-    res.json(responseData);
-  } catch (err) {
-    logger.error({ err }, 'Status endpoint error');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// SIGNALS ENDPOINT (single symbol)
-// ============================================================
-
-app.get('/signals/:symbol', (req, res) => {
-  try {
-    const { symbol } = req.params;
-    if (!symbol || symbol.length === 0) {
-      return res.status(400).json({ error: 'Symbol parameter required' });
+        .catch((e) => logger.debug({ e }, 'Bybit host probe failed (non-fatal)'));
+    } catch (e) {
+      logger.debug({ e }, 'Bybit host probe startup call failed');
     }
 
-    const db = dbModule.get();
-    const signals = db.prepare(`
-      SELECT symbol, root_tf, detected_at, state, meta
-      FROM signals
-      WHERE symbol = ?
-      ORDER BY detected_at DESC
-      LIMIT 100
-    `).all(symbol);
-
-    res.json({
-      symbol,
-      count: signals.length,
-      signals: signals.map(s => {
-        let meta = {};
-        try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (e) { meta = {}; }
-        return {
-          root_tf: s.root_tf,
-          detected_at: new Date(s.detected_at).toISOString(),
-          state: s.state,
-          tv_score: meta.tvScore || 0,
-          mtf_score: meta.mtfScore || 0,
-          decision: meta.decision || 'unknown'
-        };
-      })
-    });
-  } catch (err) {
-    logger.error({ err }, 'Signals endpoint error');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// MARKET DATA ENDPOINT
-// ============================================================
-
-app.get('/market/:symbol', (req, res) => {
-  try {
-    const { symbol } = req.params;
-    if (!symbol || symbol.length === 0) {
-      return res.status(400).json({ error: 'Symbol parameter required' });
+    // 5) Discover symbols
+    try {
+      logger.info('📊 Running initialScan() to populate symbols');
+      await poller.initialScan();
+      logger.info('✅ initialScan() completed');
+    } catch (e) {
+      logger.warn({ e }, '⚠️ initialScan failed during startup (continuing)');
     }
 
-    const db = dbModule.get();
-    const marketData = db.prepare(`
-      SELECT symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at
-      FROM market_data
-      WHERE symbol = ?
-    `).get(symbol);
-
-    if (!marketData) {
-      return res.json({
-        symbol,
-        data: {
-          price: 0,
-          volume_24h_usdt: 0,
-          volume_change_pct: null,
-          market_cap: null,
-          updated_at: null
-        }
-      });
-    }
-
-    res.json({
-      symbol,
-      data: {
-        price: marketData.price,
-        volume_24h_usdt: marketData.volume_24h_usdt,
-        volume_change_pct: marketData.volume_change_pct,
-        market_cap: marketData.market_cap,
-        updated_at: new Date(marketData.updated_at).toISOString()
-      }
-    });
-  } catch (err) {
-    logger.error({ err }, 'Market data endpoint error');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// TV RATING ENDPOINT
-// ============================================================
-
-app.get('/tv-rating/:symbol', (req, res) => {
-  try {
-    const { symbol } = req.params;
-    if (!symbol || symbol.length === 0) {
-      return res.status(400).json({ error: 'Symbol parameter required' });
-    }
-
-    const db = dbModule.get();
-    const cached = db.prepare(`
-      SELECT symbol, score, source, exchange, updated_at
-      FROM tv_ratings
-      WHERE symbol = ?
-    `).get(symbol);
-
-    if (!cached) {
-      return res.json({
-        symbol,
-        rating: {
-          score: 0,
-          source: 'not_cached',
-          updated_at: null
-        }
-      });
-    }
-
-    res.json({
-      symbol,
-      rating: {
-        score: cached.score,
-        source: cached.source,
-        exchange: cached.exchange,
-        updated_at: new Date(cached.updated_at).toISOString(),
-        age_minutes: Math.round((Date.now() - cached.updated_at) / 60000)
-      }
-    });
-  } catch (err) {
-    logger.error({ err }, 'TV rating endpoint error');
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============================================================
-// MANUAL SCAN ENDPOINT (non-blocking)
-// ============================================================
-
-app.post('/scan', async (req, res) => {
-  try {
-    logger.info('Manual scan triggered via API');
-    
-    // Don't wait for scan, return immediately
-    res.json({
-      status: 'scan_triggered',
-      message: 'Scan initiated (results will be sent via Telegram)',
-      timestamp: new Date().toISOString()
-    });
-
-    // Run scan in background (non-blocking)
-    setImmediate(async () => {
+    // 6) Targeted synchronous seeding for limited symbols
+    try {
+      const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
+      let seedList = [];
       try {
-        await poller.scanOnce({ notifyNewSignals: true });
-        logger.info('Manual scan completed successfully');
+        const dbInst = db.get();
+        const rows = dbInst.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT ?').all(startupSeedCount);
+        seedList = rows.map(r => ({ symbol: r.symbol }));
+      } catch (e) {
+        logger.debug({ e }, 'Failed to read symbols from DB for targeted seeding');
+      }
+
+      if (seedList.length && typeof poller.backgroundSeedKlines === 'function') {
+        logger.info({ count: seedList.length }, '🌱 Seeding klines for top symbols before full flip pass');
+        await poller.backgroundSeedKlines(seedList);
+        logger.info('✅ Targeted seeding completed');
+      } else {
+        logger.info('ℹ️ No targeted seed list available; skipping targeted seeding');
+      }
+    } catch (e) {
+      logger.warn({ e }, '⚠️ Targeted seeding failed (continuing)');
+    }
+
+    // 7) Full iteration across all symbols to detect flips (silent)
+    try {
+      logger.info('🔍 Running full symbol flip pass (silent) to populate signals for summary');
+      if (typeof poller.scanAllForStartup === 'function') {
+        await poller.scanAllForStartup();
+      } else {
+        await poller.scanOnce({ notifyNewSignals: false });
+      }
+      logger.info('✅ Full flip pass completed');
+    } catch (e) {
+      logger.warn({ e }, '⚠️ Full flip pass failed during startup (continuing)');
+    }
+
+    // 8) Send startup summary
+    try {
+      logger.info('📢 Sending startup summary');
+      await signalManager.sendStartupSummary();
+      logger.info('✅ Startup summary sent');
+    } catch (e) {
+      logger.debug({ e }, '⚠️ Failed to send startup summary (non-fatal)');
+    }
+
+    // 9) Start schedulers and managers
+    poller.start();
+    logger.info('✅ Poller started');
+    
+    wsManager.start();
+    logger.info('✅ WebSocket manager started');
+    
+    signalManager.start();
+    logger.info('✅ Signal manager started');
+    
+    tradeManager.registerWs(wsManager);
+    logger.info('✅ Trade manager registered to WS events');
+
+    // ============================================================
+    // EXPRESS ROUTES (optimized for speed)
+    // ============================================================
+
+    // Root endpoint
+    app.get('/', (req, res) => {
+      res.json({ 
+        ok: true, 
+        version: '0.3.0',
+        timestamp: new Date().toISOString()
+      });
+    });
+
+    // Health check (lightweight, no DB queries)
+    app.get('/health', (req, res) => {
+      try {
+        const uptime = process.uptime();
+        const memUsage = process.memoryUsage();
+        
+        res.json({
+          status: 'ok',
+          timestamp: new Date().toISOString(),
+          uptime_seconds: Math.floor(uptime),
+          memory_usage_mb: {
+            heap_used: Math.round(memUsage.heapUsed / 1024 / 1024),
+            heap_total: Math.round(memUsage.heapTotal / 1024 / 1024),
+            rss: Math.round(memUsage.rss / 1024 / 1024)
+          },
+          config: {
+            root_tfs: config.ROOT_TFS,
+            max_open_trades: config.MAX_OPEN_TRADES,
+            opentrade_enabled: config.OPENTRADE,
+            telegram_enabled: !!config.TELEGRAM_BOT_TOKEN
+          }
+        });
       } catch (err) {
-        logger.error({ err }, 'Manual scan error');
+        logger.error({ err }, 'Health check error');
+        res.status(500).json({ error: err.message });
       }
     });
-  } catch (err) {
-    logger.error({ err }, 'Manual scan endpoint error');
-    res.status(500).json({ error: err.message });
-  }
-});
 
-// ============================================================
-// ROOT PATH (API documentation)
-// ============================================================
+    // Status endpoint (OPTIMIZED with caching)
+    app.get('/status', (req, res) => {
+      try {
+        const now = Date.now();
+        
+        // Return cached status if fresh
+        if (cachedStatus && (now - lastStatusTime) < STATUS_CACHE_MS) {
+          return res.json(cachedStatus);
+        }
 
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Trading Bot API',
-    version: '1.0.0',
-    uptime: Math.floor(process.uptime()),
-    endpoints: {
-      health: {
-        method: 'GET',
-        path: '/health',
-        description: 'Health check and system status (lightweight)'
-      },
-      status: {
-        method: 'GET',
-        path: '/status',
-        description: 'Latest signals and open trades (cached 5 sec)',
-        cache_duration: '5 seconds'
-      },
-      signals: {
-        method: 'GET',
-        path: '/signals/:symbol',
-        description: 'Get all signals for a specific symbol',
-        example: '/signals/BTCUSDT'
-      },
-      market_data: {
-        method: 'GET',
-        path: '/market/:symbol',
-        description: 'Get cached market data for symbol',
-        example: '/market/BTCUSDT'
-      },
-      tv_rating: {
-        method: 'GET',
-        path: '/tv-rating/:symbol',
-        description: 'Get cached TradingView rating for symbol',
-        example: '/tv-rating/BTCUSDT'
-      },
-      scan: {
-        method: 'POST',
-        path: '/scan',
-        description: 'Trigger immediate scan (non-blocking, returns immediately)'
+        const dbInst = db.get();
+        if (!dbInst) {
+          return res.status(503).json({ error: 'Database not available' });
+        }
+
+        // Get trade counts (fast queries)
+        const openCount = dbInst.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('open')?.cnt || 0;
+        const closedCount = dbInst.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('closed')?.cnt || 0;
+
+        // Get latest signals (limit to 20)
+        const signals = dbInst.prepare(`
+          SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
+          FROM signals s1
+          INNER JOIN (
+            SELECT symbol, root_tf, MAX(detected_at) as max_dt
+            FROM signals
+            GROUP BY symbol, root_tf
+          ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
+          ORDER BY s1.detected_at DESC
+          LIMIT 20
+        `).all();
+
+        // Get open trades (simplified query)
+        const openTrades = dbInst.prepare('SELECT id, symbol, opened_at, side, size, entry_price, tp, sl FROM trades WHERE status = ? ORDER BY opened_at DESC LIMIT 10').all('open');
+
+        // Get symbol count
+        const symbolCount = dbInst.prepare('SELECT COUNT(*) as count FROM symbols').get()?.count || 0;
+
+        const responseData = {
+          timestamp: new Date().toISOString(),
+          signals: {
+            latest_count: signals.length,
+            signals: signals.map(s => {
+              let meta = {};
+              try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (e) { meta = {}; }
+              return {
+                symbol: s.symbol,
+                root_tf: s.root_tf,
+                detected_at: new Date(s.detected_at).toISOString(),
+                state: s.state,
+                tv_score: meta.tvScore || 0,
+                mtf_score: meta.mtfScore || 0,
+                decision: meta.decision || 'unknown'
+              };
+            })
+          },
+          trades: {
+            open_count: openCount,
+            closed_count: closedCount,
+            max_slots: config.MAX_OPEN_TRADES,
+            open_trades: openTrades.map(t => ({
+              id: t.id,
+              symbol: t.symbol,
+              opened_at: new Date(t.opened_at).toISOString(),
+              side: t.side,
+              size: t.size,
+              entry_price: t.entry_price
+            }))
+          },
+          symbols: {
+            total_count: symbolCount
+          }
+        };
+
+        // Cache the response
+        cachedStatus = responseData;
+        lastStatusTime = now;
+
+        res.json(responseData);
+      } catch (err) {
+        logger.error({ err }, 'Status endpoint error');
+        res.status(500).json({ error: err.message });
       }
-    }
-  });
-});
+    });
 
-// ============================================================
-// 404 HANDLER
-// ============================================================
+    // Signals endpoint (for specific symbol)
+    app.get('/signals/:symbol', (req, res) => {
+      try {
+        const { symbol } = req.params;
+        if (!symbol || symbol.length === 0) {
+          return res.status(400).json({ error: 'Symbol parameter required' });
+        }
 
-app.use((req, res) => {
-  res.status(404).json({
-    error: 'Not found',
-    path: req.path,
-    method: req.method,
-    documentation: 'GET /'
-  });
-});
+        const dbInst = db.get();
+        const signals = dbInst.prepare(`
+          SELECT symbol, root_tf, detected_at, state, meta
+          FROM signals
+          WHERE symbol = ?
+          ORDER BY detected_at DESC
+          LIMIT 100
+        `).all(symbol);
 
-// ============================================================
-// ERROR HANDLER (lightweight)
-// ============================================================
+        res.json({
+          symbol,
+          count: signals.length,
+          signals: signals.map(s => {
+            let meta = {};
+            try { meta = s.meta ? JSON.parse(s.meta) : {}; } catch (e) { meta = {}; }
+            return {
+              root_tf: s.root_tf,
+              detected_at: new Date(s.detected_at).toISOString(),
+              state: s.state,
+              tv_score: meta.tvScore || 0,
+              mtf_score: meta.mtfScore || 0,
+              decision: meta.decision || 'unknown'
+            };
+          })
+        });
+      } catch (err) {
+        logger.error({ err }, 'Signals endpoint error');
+        res.status(500).json({ error: err.message });
+      }
+    });
 
-app.use((err, req, res, next) => {
-  logger.error({ err, path: req.path, method: req.method }, 'Unhandled error in Express');
-  res.status(500).json({
-    error: 'Internal server error',
-    message: err.message
-  });
-});
+    // Market data endpoint
+    app.get('/market/:symbol', (req, res) => {
+      try {
+        const { symbol } = req.params;
+        if (!symbol || symbol.length === 0) {
+          return res.status(400).json({ error: 'Symbol parameter required' });
+        }
+
+        const dbInst = db.get();
+        const marketData = dbInst.prepare(`
+          SELECT symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at
+          FROM market_data
+          WHERE symbol = ?
+        `).get(symbol);
+
+        if (!marketData) {
+          return res.json({
+            symbol,
+            data: {
+              price: 0,
+              volume_24h_usdt: 0,
+              volume_change_pct: null,
+              market_cap: null,
+              updated_at: null
+            }
+          });
+        }
+
+        res.json({
+          symbol,
+          data: {
+            price: marketData.price,
+            volume_24h_usdt: marketData.volume_24h_usdt,
+            volume_change_pct: marketData.volume_change_pct,
+            market_cap: marketData.market_cap,
+            updated_at: new Date(marketData.updated_at).toISOString()
+          }
+        });
+      } catch (err) {
+        logger.error({ err }, 'Market data endpoint error');
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // TV rating endpoint
+    app.get('/tv-rating/:symbol', (req, res) => {
+      try {
+        const { symbol } = req.params;
+        if (!symbol || symbol.length === 0) {
+          return res.status(400).json({ error: 'Symbol parameter required' });
+        }
+
+        const dbInst = db.get();
+        const cached = dbInst.prepare(`
+          SELECT symbol, score, source, exchange, updated_at
+          FROM tv_ratings
+          WHERE symbol = ?
+        `).get(symbol);
+
+        if (!cached) {
+          return res.json({
+            symbol,
+            rating: {
+              score: 0,
+              source: 'not_cached',
+              updated_at: null
+            }
+          });
+        }
+
+        res.json({
+          symbol,
+          rating: {
+            score: cached.score,
+            source: cached.source,
+            exchange: cached.exchange,
+            updated_at: new Date(cached.updated_at).toISOString(),
+            age_minutes: Math.round((Date.now() - cached.updated_at) / 60000)
+          }
+        });
+      } catch (err) {
+        logger.error({ err }, 'TV rating endpoint error');
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // Manual scan endpoint (non-blocking)
+    app.post('/scan', async (req, res) => {
+      try {
+        logger.info('🔄 Manual scan triggered via API');
+        
+        invalidateStatusCache(); // Clear cache when scan triggered
+        
+        res.json({
+          status: 'scan_triggered',
+          message: 'Scan initiated (results will be sent via Telegram)',
+          timestamp: new Date().toISOString()
+        });
+
+        // Run scan in background (non-blocking)
+        setImmediate(async () => {
+          try {
+            await poller.scanOnce({ notifyNewSignals: true });
+            logger.info('✅ Manual scan completed successfully');
+            invalidateStatusCache(); // Clear cache after scan completes
+          } catch (err) {
+            logger.error({ err }, '❌ Manual scan error');
+          }
+        });
+      } catch (err) {
+        logger.error({ err }, 'Manual scan endpoint error');
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    // 404 handler
+    app.use((req, res) => {
+      res.status(404).json({
+        error: 'Not found',
+        path: req.path,
+        method: req.method
+      });
+    });
+
+    // Error handler
+    app.use((err, req, res, next) => {
+      logger.error({ err, path: req.path, method: req.method }, 'Unhandled error in Express');
+      res.status(500).json({
+        error: 'Internal server error',
+        message: err.message
+      });
+    });
+
+    // ============================================================
+    // START EXPRESS SERVER
+    // ============================================================
+
+    server = app.listen(PORT, '0.0.0.0', () => {
+      logger.info({ PORT }, '✅ Express server listening');
+    });
+
+    // ============================================================
+    // HEARTBEAT (log every 60 seconds)
+    // ============================================================
+
+    heartbeatInterval = setInterval(() => {
+      logger.info({ ts: new Date().toISOString(), uptime: Math.floor(process.uptime()) }, 'heartbeat');
+    }, 60_000);
+
+    logger.info('🎉 Startup complete - trading bot is ready');
+  } catch (err) {
+    logger.error({ err }, '❌ Failed to start application');
+    process.exit(1);
+  }
+}
 
 // ============================================================
 // GRACEFUL SHUTDOWN
 // ============================================================
 
-const gracefulShutdown = async (signal) => {
-  logger.info({ signal }, `${signal} received, graceful shutdown initiated`);
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, '🛑 Starting graceful shutdown');
   try {
-    logger.info('Closing WebSocket connections...');
-    await wsManager.closeAll();
-    logger.info('✅ WebSocket connections closed');
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
 
-    logger.info('Closing database...');
-    dbModule.close();
-    logger.info('✅ Database closed');
+    if (server && server.close) {
+      logger.info('Closing HTTP server...');
+      await new Promise((resolve) => server.close(resolve));
+      logger.info('✅ HTTP server closed');
+    }
 
-    logger.info('✅ Graceful shutdown completed');
-    process.exit(0);
+    try {
+      if (wsManager && typeof wsManager.closeAll === 'function') {
+        logger.info('Closing WebSocket connections...');
+        await wsManager.closeAll();
+        logger.info('✅ WebSocket connections closed');
+      }
+    } catch (e) {
+      logger.warn({ e }, '⚠️ Failed to close WS manager cleanly');
+    }
+
+    try {
+      const dbInst = db.get();
+      if (db && typeof db.close === 'function') {
+        logger.info('Closing database...');
+        db.close();
+        logger.info('✅ Database closed');
+      } else if (dbInst && typeof dbInst.close === 'function') {
+        logger.info('Closing database (via db.get())...');
+        dbInst.close();
+        logger.info('✅ Database closed');
+      }
+    } catch (e) {
+      logger.warn({ e }, '⚠️ Error closing DB');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
   } catch (err) {
     logger.error({ err }, '❌ Error during graceful shutdown');
-    process.exit(1);
+  } finally {
+    logger.info('✅ Shutdown complete, exiting process');
+    process.exit(0);
   }
-};
+}
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-process.on('uncaughtException', (err) => {
-  logger.error({ err }, '❌ Uncaught exception');
-  gracefulShutdown('uncaughtException');
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logger.error({ reason }, '❌ Unhandled rejection');
-});
-
 // ============================================================
-// START SERVER
+// START APPLICATION
 // ============================================================
 
-const PORT = config.PORT || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  logger.info({ port: PORT }, '✅ Express server started and listening');
-  logger.info('Trading bot is ready. Check /health endpoint for status');
-});
-
-server.on('error', (err) => {
-  logger.error({ err }, '❌ Server error');
-  if (err.code === 'EADDRINUSE') {
-    logger.error({ port: PORT }, `Port ${PORT} is already in use`);
-  }
-  process.exit(1);
-});
+start();
 
 module.exports = app;
