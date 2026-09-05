@@ -7,7 +7,7 @@
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (no topN limit)
+ * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals (no topN limit)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
  */
 
@@ -268,13 +268,13 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 /**
  * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION
  * 
- * Fetches ALL USDT/USDT.P perpetual pairs using cursor-based pagination.
+ * Fetches ALL USDT.P perpetual pairs using cursor-based pagination.
  * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
  * 
  * Algorithm:
  * 1. Use getBase() for single authoritative host
  * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
- * 3. Filter by USDT/USDT.P suffix
+ * 3. Filter by USDT.P suffix (default) or user-specified SYMBOL_FILTER_REGEX
  * 4. Accumulate ALL matching symbols
  * 5. Remove duplicates and sort A->Z
  * 6. Fall back to CoinGecko if REST fails
@@ -282,10 +282,10 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for all symbols');
 
-  // Symbol filter: accept USDT or USDT.P suffix (case-insensitive)
+  // Default stricter symbol filter: only USDT.P perpetuals
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
     ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
-    : /usdt(\.p)?$/i;
+    : /usdt\.p$/i;
 
   const base = getBase();
   if (!base) {
@@ -382,10 +382,10 @@ async function fetchAllSymbols() {
         totalRawInstruments += instruments.length;
         logger.info(
           { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
-          'fetchAllSymbols: page fetched, applying USDT filter'
+          'fetchAllSymbols: page fetched, applying USDT.P filter'
         );
 
-        // Filter for USDT/USDT.P pairs
+        // Filter for USDT.P pairs using stricter regex /usdt\.p$/i
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
@@ -393,15 +393,15 @@ async function fetchAllSymbols() {
               const sym = String(it.symbol);
               const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
 
-              // Match by regex (handles USDT and USDT.P)
+              // Match by configured regex (defaults to usdt.p only)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
 
-              // Match by explicit quote field
-              if (quote === 'USDT') return true;
+              // Match by explicit quote field (only accept 'USDT' + presence of '.P' in symbol)
+              if (quote === 'USDT' && /(\.p)$/i.test(sym)) return true;
 
-              // Match by symbol suffix
+              // If symbol suffix explicitly contains .P
               const su = sym.toUpperCase();
-              if (su.endsWith('USDT') || su.endsWith('USDT.P')) return true;
+              if (su.endsWith('USDT.P')) return true;
             } catch (e) {
               return false;
             }
@@ -447,7 +447,7 @@ async function fetchAllSymbols() {
     if (allSymbols.length === 0) {
       logger.warn(
         { totalRawInstruments, totalFiltered },
-        'fetchAllSymbols: no symbols matched USDT filter after full pagination'
+        'fetchAllSymbols: no symbols matched USDT.P filter after full pagination'
       );
       return [];
     }
