@@ -1,278 +1,184 @@
-const fetch = require('node-fetch');
-const logger = require('pino')();
-const dbModule = require('../db');
-
-const TV_SCANNER_URL = 'https://scanner.tradingview.com/crypto/scan';
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
-}
-
 /**
- * fetchTvRatingForSymbol with retry logic and better timeout handling
- * - Tries multiple exchanges (BYBIT, BINANCE, KUCOIN, COINBASE, KRAKEN, etc.)
- * - Longer timeout (12 seconds instead of 8)
- * - Retries with exponential backoff
- * - Falls back to zero score if all retries exhausted
+ * Entrypoint - starts Express server and the poller/scanner
+ *
+ * Startup flow:
+ *  - db.init()
+ *  - telegram.init()
+ *  - poller.initialScan()
+ *  - targeted seeding (optional)
+ *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
+ *  - signalManager.sendStartupSummary()
+ *  - poller.start(), wsManager.start(), signalManager.start()
  */
-async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
-  if (!symbol) {
-    logger.warn('fetchTvRatingForSymbol: symbol is empty');
-    return { source: 'error', score: 0 };
-  }
 
-  // Try multiple exchanges to increase hit rate
-  const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE,KUCOIN')
-    .split(',')
-    .map(s => s.trim())
-    .filter(s => s.length > 0);
+require('dotenv').config();
+const express = require('express');
+const pino = require('pino');
+const config = require('./config');
+const db = require('./db');
+const poller = require('./services/poller');
+const wsManager = require('./services/bybitWs');
+const signalManager = require('./services/signalManager');
+const telegram = require('./services/telegram');
+const tradeManager = require('./services/tradeManager');
+const debugRoutes = require('./routes/debug');
 
-  logger.debug({ symbol, exchanges: exchangeCandidates }, 'fetchTvRatingForSymbol: starting fetch');
+const logger = pino({ level: config.LOG_LEVEL || 'info' });
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    for (const ex of exchangeCandidates) {
+process.on('uncaughtException', (err) => {
+  logger.error({ err }, 'UNCAUGHT EXCEPTION - the process may terminate');
+});
+process.on('unhandledRejection', (reason) => {
+  logger.error({ reason }, 'UNHANDLED REJECTION - promise rejected without handler');
+});
+
+const app = express();
+app.use(express.json());
+app.use('/debug', debugRoutes);
+
+const PORT = process.env.PORT || config.PORT || 3000;
+let server;
+let heartbeatInterval;
+
+async function start() {
+  try {
+    logger.info('Starting app...');
+    db.init();
+
+    // init telegram early so any immediate notifications are possible
+    telegram.init();
+
+    // background bybit probe (non-blocking)
+    try {
+      const bybitRest = require('./services/bybitRest');
+      bybitRest.probeHosts(3000)
+        .then((base) => {
+          if (base) logger.info({ base }, 'probeHosts completed in background');
+          else logger.warn('probeHosts completed in background with no selected base');
+        })
+        .catch((e) => logger.debug({ e }, 'probeHosts background failure'));
+    } catch (e) {
+      logger.debug({ e }, 'probeHosts startup call failed');
+    }
+
+    // 1) Discover symbols
+    try {
+      logger.info('Startup: running initialScan() to populate symbols');
+      await poller.initialScan();
+    } catch (e) {
+      logger.warn({ e }, 'initialScan failed during startup (continuing)');
+    }
+
+    // 2) targeted synchronous seeding for a limited number of symbols so klines + MACD are available.
+    try {
+      const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
+      let seedList = [];
       try {
-        const ticker = `${ex}:${symbol}`;
-        const body = {
-          symbols: { tickers: [ticker], query: { types: [] } },
-          columns: ['Recommend.All|1', 'Recommend.Other|1', 'RSI|14', 'momentum|14']
-        };
-        
-        logger.debug({ attempt, exchange: ex, ticker }, 'TV fetch attempt');
-
-        // Increase timeout to 12 seconds (was 8)
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 12000);
-
-        const res = await fetch(TV_SCANNER_URL, {
-          method: 'POST',
-          body: JSON.stringify(body),
-          headers: { 
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-          },
-          signal: controller.signal,
-          timeout: 12000
-        });
-
-        clearTimeout(timeoutId);
-
-        if (!res.ok) {
-          logger.debug({ exchange: ex, symbol, status: res.status, attempt }, 'TV API non-ok response');
-          continue;
-        }
-
-        const json = await res.json();
-        
-        if (json && json.data && Array.isArray(json.data) && json.data.length > 0) {
-          const row = json.data[0];
-          const recommend = row.d && row.d[0];
-          
-          let score = 0;
-          if (typeof recommend === 'number') {
-            // TradingView Recommend.All: 1 (strong sell) ... 5 (strong buy)
-            // map 5 -> 1.0, 1 -> 0.0, normalize to 0..1 where 1 is best (buy)
-            score = Math.max(0, Math.min(1, (recommend - 1) / 4));
-          }
-          
-          logger.info({ symbol, ticker, recommend, score, attempt, exchange: ex }, '✅ TV rating fetched successfully');
-          return { source: 'tradingview', score: Math.round(score * 100) / 100, raw: row.d, exchange: ex };
-        }
-      } catch (err) {
-        const errorType = err.name === 'AbortError' ? 'timeout' : 'network';
-        logger.debug({ errorType, err: err && err.message ? err.message : err, symbol, exchange: ex, attempt }, 'TV fetch attempt failed');
-        continue;
+        const dbInst = db.get();
+        const rows = dbInst.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT ?').all(startupSeedCount);
+        seedList = rows.map(r => ({ symbol: r.symbol }));
+      } catch (e) {
+        logger.debug({ e }, 'Startup: failed to read symbols from DB for targeted seeding (will still attempt full iteration)');
       }
-    }
 
-    // Retry with exponential backoff
-    if (attempt < maxRetries) {
-      const backoffMs = 1000 * attempt;
-      logger.debug({ symbol, attempt, nextRetry: backoffMs, maxRetries }, 'TV fetch retry scheduled');
-      await sleep(backoffMs);
-    }
-  }
-
-  logger.warn({ symbol, attempts: maxRetries, exchanges: exchangeCandidates }, '⚠️ TV rating unavailable after all retries, using fallback score of 0');
-  return { source: 'fallback', score: 0, raw: null };
-}
-
-/**
- * getOrFetchTvRatingCached(symbol)
- * - Checks DB cache (valid for 2 hours)
- * - If fresh cache exists, returns it immediately
- * - Otherwise fetches fresh from TV API and caches result
- * - Graceful fallback if DB unavailable
- */
-async function getOrFetchTvRatingCached(symbol) {
-  if (!symbol) return { source: 'error', score: 0 };
-
-  try {
-    const dbInstance = dbModule.get();
-    if (!dbInstance) throw new Error('DB not available');
-
-    // Check if tv_ratings table exists, create if not
-    try {
-      dbInstance.prepare(`
-        CREATE TABLE IF NOT EXISTS tv_ratings (
-          symbol TEXT PRIMARY KEY,
-          score REAL DEFAULT 0,
-          source TEXT,
-          exchange TEXT,
-          updated_at INTEGER DEFAULT 0
-        );
-        CREATE INDEX IF NOT EXISTS idx_tv_ratings_updated_at ON tv_ratings(updated_at);
-      `).run();
-    } catch (err) {
-      logger.debug({ err }, 'tv_ratings table creation/check failed (continuing without cache)');
-    }
-
-    // Check cache (within 2 hours = 7200000 ms, increased from 1 hour)
-    const cached = dbInstance.prepare(`
-      SELECT score, source, exchange, updated_at 
-      FROM tv_ratings 
-      WHERE symbol = ? AND updated_at > ?
-    `).get(symbol, Date.now() - 7200000);
-    
-    if (cached) {
-      const ageMinutes = Math.round((Date.now() - cached.updated_at) / 60000);
-      logger.info({ symbol, source: cached.source, score: cached.score, ageMinutes }, '⏱️ TV rating retrieved from cache');
-      return { source: 'cache', score: cached.score, exchange: cached.exchange, cached: true };
-    }
-  } catch (err) {
-    logger.debug({ err: err && err.message, symbol }, 'Cache check failed (will fetch fresh)');
-  }
-
-  // Fetch fresh from TV API
-  logger.debug({ symbol }, 'Fetching fresh TV rating from API');
-  const fresh = await fetchTvRatingForSymbol(symbol);
-
-  // Try to cache result
-  try {
-    const dbInstance = dbModule.get();
-    if (dbInstance) {
-      dbInstance.prepare(`
-        INSERT OR REPLACE INTO tv_ratings 
-        (symbol, score, source, exchange, updated_at) 
-        VALUES (?, ?, ?, ?, ?)
-      `).run(symbol, fresh.score, fresh.source, fresh.exchange || null, Date.now());
-      logger.debug({ symbol, score: fresh.score, source: fresh.source }, 'TV rating cached');
-    }
-  } catch (err) {
-    logger.debug({ err: err && err.message, symbol }, 'Failed to cache TV rating (continuing)');
-  }
-
-  return fresh;
-}
-
-/**
- * fallbackScore(macdPositiveFraction, volChangePct)
- * Calculates a score based on MACD and volume metrics when TV data unavailable
- * - 60% weight on MACD positive fraction
- * - 40% weight on volume change normalization
- */
-function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) {
-  try {
-    const volNorm = Math.max(0, Math.min(1, (volChangePct + 100) / 200));
-    const score = Math.max(0, Math.min(1, 0.6 * macdPositiveFraction + 0.4 * volNorm));
-    return Math.round(score * 100) / 100;
-  } catch (err) {
-    logger.debug({ err }, 'fallbackScore calculation error');
-    return 0;
-  }
-}
-
-/**
- * clearOldTvRatingCache(olderThanHours)
- * - Cleans up TV ratings cache older than specified hours
- * - Useful to run periodically to keep DB size reasonable
- */
-function clearOldTvRatingCache(olderThanHours = 24) {
-  try {
-    const dbInstance = dbModule.get();
-    if (!dbInstance) return;
-
-    const cutoffTime = Date.now() - (olderThanHours * 3600000);
-    const stmt = dbInstance.prepare('DELETE FROM tv_ratings WHERE updated_at < ?');
-    const result = stmt.run(cutoffTime);
-    
-    if (result.changes > 0) {
-      logger.info({ deletedCount: result.changes, olderThanHours }, '🗑️ Cleared old TV ratings from cache');
-    }
-  } catch (err) {
-    logger.debug({ err: err && err.message }, 'Failed to clear old TV ratings cache');
-  }
-}
-
-/**
- * testTvApi(symbol)
- * - Test function to debug TV API connectivity
- * - Returns detailed diagnostics
- */
-async function testTvApi(symbol = 'BTCUSDT') {
-  logger.info({ symbol }, '🧪 Testing TV API connectivity...');
-  
-  const results = [];
-  const exchanges = ['BYBIT', 'BINANCE', 'KUCOIN', 'COINBASE'];
-
-  for (const ex of exchanges) {
-    try {
-      const ticker = `${ex}:${symbol}`;
-      const body = {
-        symbols: { tickers: [ticker], query: { types: [] } },
-        columns: ['Recommend.All|1']
-      };
-
-      const startTime = Date.now();
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 12000);
-
-      const res = await fetch(TV_SCANNER_URL, {
-        method: 'POST',
-        body: JSON.stringify(body),
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal
-      });
-
-      clearTimeout(timeoutId);
-      const elapsed = Date.now() - startTime;
-
-      if (res.ok) {
-        const json = await res.json();
-        const data = json?.data?.[0]?.d?.[0];
-        results.push({
-          exchange: ex,
-          ticker,
-          status: '✅ OK',
-          response_time_ms: elapsed,
-          score: data ? Math.round(((data - 1) / 4) * 100) / 100 : 'N/A'
-        });
+      if (seedList.length && typeof poller.backgroundSeedKlines === 'function') {
+        logger.info({ count: seedList.length }, 'Startup: seeding klines for top symbols before full flip pass');
+        await poller.backgroundSeedKlines(seedList);
       } else {
-        results.push({
-          exchange: ex,
-          ticker,
-          status: `❌ HTTP ${res.status}`,
-          response_time_ms: elapsed
-        });
+        logger.info('Startup: no targeted seed list available or backgroundSeedKlines not present; skipping targeted seeding');
       }
-    } catch (err) {
-      results.push({
-        exchange: ex,
-        ticker: `${ex}:${symbol}`,
-        status: `❌ ${err.name || 'Error'}`,
-        error: err.message
-      });
+    } catch (e) {
+      logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
     }
-  }
 
-  logger.info({ results }, '📊 TV API test results');
-  return results;
+    // 3) Full iteration across all fetched symbols to detect flips (silent)
+    try {
+      logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
+      if (typeof poller.scanAllForStartup === 'function') {
+        await poller.scanAllForStartup();
+      } else {
+        // fallback: silent scanOnce if scanAllForStartup not present
+        await poller.scanOnce({ notifyNewSignals: false });
+      }
+    } catch (e) {
+      logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
+    }
+
+    // 4) send startup summary now that snapshot should be populated
+    try {
+      logger.info('Startup: sending startup summary (after full flip pass)');
+      await signalManager.sendStartupSummary();
+    } catch (e) {
+      logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
+    }
+
+    // 5) start schedulers and managers
+    poller.start();
+    wsManager.start();
+    signalManager.start();
+    tradeManager.registerWs(wsManager);
+
+    app.get('/', (req, res) => res.json({ ok: true, version: '0.3.0' }));
+
+    server = app.listen(PORT, () => {
+      logger.info({ PORT }, 'Server listening');
+    });
+
+    heartbeatInterval = setInterval(() => {
+      logger.info('heartbeat', { ts: new Date().toISOString() });
+    }, 60_000);
+
+    logger.info('Startup complete');
+  } catch (err) {
+    logger.error({ err }, 'Failed to start application');
+    process.exit(1);
+  }
 }
 
-module.exports = {
-  fetchTvRatingForSymbol,
-  getOrFetchTvRatingCached,
-  fallbackScore,
-  clearOldTvRatingCache,
-  testTvApi
-};
+async function gracefulShutdown(signal) {
+  logger.info({ signal }, 'Starting graceful shutdown');
+  try {
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+
+    if (server && server.close) {
+      logger.info('Closing HTTP server');
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    try {
+      if (wsManager && typeof wsManager.closeAll === 'function') {
+        await wsManager.closeAll();
+        logger.info('WS Manager closed all connections');
+      } else if (wsManager && Array.isArray(wsManager.connections)) {
+        wsManager.connections.forEach((c) => { try { c.ws && c.ws.close(); } catch (e) {} });
+      }
+    } catch (e) {
+      logger.warn({ e }, 'Failed to close WS manager cleanly');
+    }
+
+    try {
+      const dbInstance = db.get();
+      if (db && typeof db.close === 'function') {
+        db.close();
+        logger.info('Database closed');
+      } else if (dbInstance && typeof dbInstance.close === 'function') {
+        dbInstance.close();
+        logger.info('Database closed (db.get())');
+      }
+    } catch (e) {
+      logger.warn({ e }, 'Error closing DB');
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  } catch (err) {
+    logger.error({ err }, 'Error during graceful shutdown');
+  } finally {
+    logger.info('Shutdown complete, exiting process');
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+start();
