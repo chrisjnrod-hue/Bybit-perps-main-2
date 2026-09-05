@@ -6,7 +6,7 @@
  * - heartbeat logging
  * - graceful shutdown that attempts to close DB and WS connections
  * - non-blocking bybit host probe (runs in background so startup is fast)
- * - sends startup telegram summary after services init (best-effort)
+ * - sends startup telegram summary after services init (now waits for initialScan & scanOnce)
  */
 
 require('dotenv').config();
@@ -46,6 +46,9 @@ async function start() {
     // init DB
     db.init();
 
+    // init telegram early so any immediate notifications are possible
+    telegram.init();
+
     // Start Bybit probe in background (do not await) so startup is not blocked by network probes.
     try {
       const bybitRest = require('./services/bybitRest');
@@ -61,14 +64,43 @@ async function start() {
       logger.debug({ e }, 'probeHosts startup call failed');
     }
 
-    // start REST poller (symbol discovery + root seeding)
+    // Ensure we populate symbols & seed klines before sending startup summary:
+    // 1) run an initialScan (discovers symbols)
+    // 2) run a quick scanOnce to detect flips and persist signals
+    try {
+      logger.info('Startup: running initialScan() to populate symbols');
+      await poller.initialScan();
+    } catch (e) {
+      logger.warn({ e }, 'initialScan failed during startup (continuing)');
+    }
+
+    try {
+      logger.info('Startup: running quick scanOnce() to detect flips and populate signals');
+      // run one quick pass that will persist any detected signals
+      if (typeof poller.scanOnce === 'function') {
+        await poller.scanOnce();
+      }
+    } catch (e) {
+      logger.warn({ e }, 'scanOnce failed during startup quick pass (continuing)');
+    }
+
+    // Now send startup summary — this should find the DB snapshot populated after the quick scan
+    try {
+      logger.info('Startup: sending startup summary (after initial scan/quick scan)');
+      await signalManager.sendStartupSummary();
+    } catch (e) {
+      logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
+    }
+
+    // start REST poller scheduling and background tasks
     poller.start();
+
     // start websockets manager (batched)
     wsManager.start();
+
     // start signal manager (consumes cache & WS events)
     signalManager.start();
-    // start telegram
-    telegram.init();
+
     // register trade manager to listen to WS kline events for breakeven logic
     tradeManager.registerWs(wsManager);
 
@@ -84,16 +116,6 @@ async function start() {
     }, 60_000);
 
     logger.info('Startup complete');
-
-    // Best-effort: send startup telegram summary after short delay so other services can seed initial state.
-    setTimeout(async () => {
-      try {
-        await signalManager.sendStartupSummary();
-      } catch (e) {
-        logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
-      }
-    }, 8_000);
-
   } catch (err) {
     logger.error({ err }, 'Failed to start application');
     // exit non-zero so Render restarts
