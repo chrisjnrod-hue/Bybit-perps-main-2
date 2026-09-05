@@ -1,184 +1,179 @@
-/**
- * Entrypoint - starts Express server and the poller/scanner
- *
- * Startup flow:
- *  - db.init()
- *  - telegram.init()
- *  - poller.initialScan()
- *  - targeted seeding (optional)
- *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
- *  - signalManager.sendStartupSummary()
- *  - poller.start(), wsManager.start(), signalManager.start()
- */
-
-require('dotenv').config();
 const express = require('express');
-const pino = require('pino');
+const path = require('path');
 const config = require('./config');
-const db = require('./db');
+const logger = require('pino')();
+const dbModule = require('./db');
+const telegram = require('./services/telegram');
 const poller = require('./services/poller');
 const wsManager = require('./services/bybitWs');
-const signalManager = require('./services/signalManager');
-const telegram = require('./services/telegram');
 const tradeManager = require('./services/tradeManager');
-const debugRoutes = require('./routes/debug');
-
-const logger = pino({ level: config.LOG_LEVEL || 'info' });
-
-process.on('uncaughtException', (err) => {
-  logger.error({ err }, 'UNCAUGHT EXCEPTION - the process may terminate');
-});
-process.on('unhandledRejection', (reason) => {
-  logger.error({ reason }, 'UNHANDLED REJECTION - promise rejected without handler');
-});
+const signalManager = require('./services/signalManager');
+const tradingview = require('./services/tradingview');
 
 const app = express();
-app.use(express.json());
-app.use('/debug', debugRoutes);
 
-const PORT = process.env.PORT || config.PORT || 3000;
-let server;
-let heartbeatInterval;
+// ============================================================
+// INITIALIZATION
+// ============================================================
 
-async function start() {
-  try {
-    logger.info('Starting app...');
-    db.init();
+// Initialize database
+dbModule.init();
+logger.info('Database initialized');
 
-    // init telegram early so any immediate notifications are possible
-    telegram.init();
+// Initialize Telegram
+telegram.init();
+logger.info('Telegram initialized');
 
-    // background bybit probe (non-blocking)
-    try {
-      const bybitRest = require('./services/bybitRest');
-      bybitRest.probeHosts(3000)
-        .then((base) => {
-          if (base) logger.info({ base }, 'probeHosts completed in background');
-          else logger.warn('probeHosts completed in background with no selected base');
-        })
-        .catch((e) => logger.debug({ e }, 'probeHosts background failure'));
-    } catch (e) {
-      logger.debug({ e }, 'probeHosts startup call failed');
-    }
+// Initialize WS Manager
+wsManager.start();
+logger.info('WebSocket manager started');
 
-    // 1) Discover symbols
-    try {
-      logger.info('Startup: running initialScan() to populate symbols');
-      await poller.initialScan();
-    } catch (e) {
-      logger.warn({ e }, 'initialScan failed during startup (continuing)');
-    }
+// Initialize Signal Manager
+signalManager.start();
+logger.info('Signal manager started');
 
-    // 2) targeted synchronous seeding for a limited number of symbols so klines + MACD are available.
-    try {
-      const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
-      let seedList = [];
-      try {
-        const dbInst = db.get();
-        const rows = dbInst.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT ?').all(startupSeedCount);
-        seedList = rows.map(r => ({ symbol: r.symbol }));
-      } catch (e) {
-        logger.debug({ e }, 'Startup: failed to read symbols from DB for targeted seeding (will still attempt full iteration)');
-      }
-
-      if (seedList.length && typeof poller.backgroundSeedKlines === 'function') {
-        logger.info({ count: seedList.length }, 'Startup: seeding klines for top symbols before full flip pass');
-        await poller.backgroundSeedKlines(seedList);
-      } else {
-        logger.info('Startup: no targeted seed list available or backgroundSeedKlines not present; skipping targeted seeding');
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
-    }
-
-    // 3) Full iteration across all fetched symbols to detect flips (silent)
-    try {
-      logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
-      if (typeof poller.scanAllForStartup === 'function') {
-        await poller.scanAllForStartup();
-      } else {
-        // fallback: silent scanOnce if scanAllForStartup not present
-        await poller.scanOnce({ notifyNewSignals: false });
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
-    }
-
-    // 4) send startup summary now that snapshot should be populated
-    try {
-      logger.info('Startup: sending startup summary (after full flip pass)');
-      await signalManager.sendStartupSummary();
-    } catch (e) {
-      logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
-    }
-
-    // 5) start schedulers and managers
-    poller.start();
-    wsManager.start();
-    signalManager.start();
-    tradeManager.registerWs(wsManager);
-
-    app.get('/', (req, res) => res.json({ ok: true, version: '0.3.0' }));
-
-    server = app.listen(PORT, () => {
-      logger.info({ PORT }, 'Server listening');
-    });
-
-    heartbeatInterval = setInterval(() => {
-      logger.info('heartbeat', { ts: new Date().toISOString() });
-    }, 60_000);
-
-    logger.info('Startup complete');
-  } catch (err) {
-    logger.error({ err }, 'Failed to start application');
-    process.exit(1);
-  }
+// Register WS callbacks for trade management
+try {
+  tradeManager.registerWs(wsManager);
+  logger.info('Trade manager registered to WS events');
+} catch (err) {
+  logger.warn({ err }, 'Failed to register trade manager with WS');
 }
 
-async function gracefulShutdown(signal) {
-  logger.info({ signal }, 'Starting graceful shutdown');
+// ============================================================
+// TV RATING CACHE CLEANUP (scheduled daily at 2am UTC)
+// ============================================================
+
+const scheduleTvCacheCleanup = () => {
+  const now = new Date();
+  const target = new Date(now);
+  target.setUTCHours(2, 0, 0, 0);
+  
+  // If 2am already passed today, schedule for tomorrow
+  if (target <= now) {
+    target.setUTCDate(target.getUTCDate() + 1);
+  }
+  
+  const waitMs = target - now;
+  logger.info({ nextCleanup: target.toISOString() }, 'TV cache cleanup scheduled');
+  
+  setTimeout(() => {
+    try {
+      logger.info('Running TV cache cleanup (removing ratings older than 24 hours)');
+      tradingview.clearOldTvRatingCache(24);
+      logger.info('TV cache cleanup completed');
+    } catch (err) {
+      logger.error({ err }, 'TV cache cleanup failed');
+    }
+    
+    // Reschedule for next day
+    scheduleTvCacheCleanup();
+  }, waitMs);
+};
+
+scheduleTvCacheCleanup();
+
+// ============================================================
+// START POLLER (main scanning loop)
+// ============================================================
+
+try {
+  logger.info('Starting poller (initial scan + continuous boundary monitoring)...');
+  poller.start();
+  logger.info('Poller started successfully');
+} catch (err) {
+  logger.error({ err }, 'Failed to start poller');
+  process.exit(1);
+}
+
+// ============================================================
+// EXPRESS SERVER (health check + management endpoints)
+// ============================================================
+
+app.use(express.json());
+
+// Health check
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    config: {
+      root_tfs: config.ROOT_TFS,
+      mtf_tfs: config.MTF_TFS,
+      max_open_trades: config.MAX_OPEN_TRADES,
+      symbol_filter: config.SYMBOL_FILTER
+    }
+  });
+});
+
+// Status endpoint (shows latest signals snapshot)
+app.get('/status', (req, res) => {
   try {
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    const db = dbModule.get();
+    const signals = db.prepare(`
+      SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
+      FROM signals s1
+      INNER JOIN (
+        SELECT symbol, root_tf, MAX(detected_at) as max_dt
+        FROM signals
+        GROUP BY symbol, root_tf
+      ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
+      ORDER BY s1.detected_at DESC
+      LIMIT 50
+    `).all();
 
-    if (server && server.close) {
-      logger.info('Closing HTTP server');
-      await new Promise((resolve) => server.close(resolve));
-    }
+    const trades = db.prepare('SELECT * FROM trades WHERE status = ? ORDER BY opened_at DESC LIMIT 20').all('open');
 
-    try {
-      if (wsManager && typeof wsManager.closeAll === 'function') {
-        await wsManager.closeAll();
-        logger.info('WS Manager closed all connections');
-      } else if (wsManager && Array.isArray(wsManager.connections)) {
-        wsManager.connections.forEach((c) => { try { c.ws && c.ws.close(); } catch (e) {} });
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Failed to close WS manager cleanly');
-    }
+    res.json({
+      timestamp: new Date().toISOString(),
+      latest_signals: signals.map(s => ({
+        symbol: s.symbol,
+        root_tf: s.root_tf,
+        detected_at: new Date(s.detected_at).toISOString(),
+        state: s.state,
+        meta: (() => { try { return JSON.parse(s.meta); } catch (e) { return {}; } })()
+      })),
+      open_trades: trades,
+      open_trades_count: trades.length,
+      max_trades: config.MAX_OPEN_TRADES
+    });
+  } catch (err) {
+    logger.error({ err }, 'Status endpoint error');
+    res.status(500).json({ error: err.message });
+  }
+});
 
-    try {
-      const dbInstance = db.get();
-      if (db && typeof db.close === 'function') {
-        db.close();
-        logger.info('Database closed');
-      } else if (dbInstance && typeof dbInstance.close === 'function') {
-        dbInstance.close();
-        logger.info('Database closed (db.get())');
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Error closing DB');
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  logger.info('SIGTERM received, graceful shutdown initiated');
+  try {
+    await wsManager.closeAll();
+    dbModule.close();
+    logger.info('Graceful shutdown completed');
+    process.exit(0);
   } catch (err) {
     logger.error({ err }, 'Error during graceful shutdown');
-  } finally {
-    logger.info('Shutdown complete, exiting process');
-    process.exit(0);
+    process.exit(1);
   }
-}
+});
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGINT', async () => {
+  logger.info('SIGINT received, graceful shutdown initiated');
+  try {
+    await wsManager.closeAll();
+    dbModule.close();
+    logger.info('Graceful shutdown completed');
+    process.exit(0);
+  } catch (err) {
+    logger.error({ err }, 'Error during graceful shutdown');
+    process.exit(1);
+  }
+});
 
-start();
+// Start server
+const PORT = config.PORT || 3000;
+app.listen(PORT, () => {
+  logger.info({ port: PORT }, 'Express server started');
+});
+
+module.exports = app;
