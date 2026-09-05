@@ -69,7 +69,6 @@ const scheduleTvCacheCleanup = () => {
     const target = new Date(now);
     target.setUTCHours(2, 0, 0, 0);
     
-    // If 2am already passed today, schedule for tomorrow
     if (target <= now) {
       target.setUTCDate(target.getUTCDate() + 1);
     }
@@ -86,7 +85,6 @@ const scheduleTvCacheCleanup = () => {
         logger.error({ err }, '❌ TV cache cleanup failed');
       }
       
-      // Reschedule for next day
       scheduleTvCacheCleanup();
     }, waitMs);
   } catch (err) {
@@ -116,14 +114,19 @@ try {
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request logging middleware
+// ============================================================
+// SIMPLE REQUEST LOGGING (lightweight)
+// ============================================================
+
 app.use((req, res, next) => {
-  logger.debug({ method: req.method, path: req.path }, 'HTTP request');
+  if (!req.path.startsWith('/health')) {
+    logger.debug({ method: req.method, path: req.path }, 'HTTP request');
+  }
   next();
 });
 
 // ============================================================
-// HEALTH CHECK ENDPOINT
+// HEALTH CHECK ENDPOINT (lightweight, no DB queries)
 // ============================================================
 
 app.get('/health', (req, res) => {
@@ -156,17 +159,36 @@ app.get('/health', (req, res) => {
 });
 
 // ============================================================
-// STATUS ENDPOINT (latest signals & open trades)
+// STATUS ENDPOINT (OPTIMIZED - caches results for 5 seconds)
 // ============================================================
+
+let cachedStatus = null;
+let lastStatusTime = 0;
+const STATUS_CACHE_MS = 5000; // Cache for 5 seconds
 
 app.get('/status', (req, res) => {
   try {
+    const now = Date.now();
+    
+    // Return cached status if fresh
+    if (cachedStatus && (now - lastStatusTime) < STATUS_CACHE_MS) {
+      return res.json(cachedStatus);
+    }
+
     const db = dbModule.get();
     if (!db) {
       return res.status(503).json({ error: 'Database not available' });
     }
 
-    // Get latest signals
+    // Get open trades count (fast query)
+    const openTradesRow = db.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('open');
+    const openCount = openTradesRow?.cnt || 0;
+
+    // Get closed trades count (fast query)
+    const closedTradesRow = db.prepare('SELECT COUNT(*) as cnt FROM trades WHERE status = ?').get('closed');
+    const closedCount = closedTradesRow?.cnt || 0;
+
+    // Get latest signals (limit to 20 instead of 50)
     const signals = db.prepare(`
       SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
       FROM signals s1
@@ -176,24 +198,17 @@ app.get('/status', (req, res) => {
         GROUP BY symbol, root_tf
       ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
       ORDER BY s1.detected_at DESC
-      LIMIT 50
+      LIMIT 20
     `).all();
 
-    // Get open trades
-    const openTrades = db.prepare('SELECT * FROM trades WHERE status = ? ORDER BY opened_at DESC LIMIT 20').all('open');
-    
-    // Get closed/failed trades count
-    const tradeCounts = db.prepare(`
-      SELECT 
-        (SELECT COUNT(*) FROM trades WHERE status = 'open') as open_count,
-        (SELECT COUNT(*) FROM trades WHERE status = 'closed') as closed_count,
-        (SELECT COUNT(*) FROM trades WHERE status = 'failed') as failed_count
-    `).get();
+    // Get only open trades (no joins)
+    const openTrades = db.prepare('SELECT id, symbol, opened_at, side, size, entry_price, tp, sl FROM trades WHERE status = ? ORDER BY opened_at DESC LIMIT 10').all('open');
 
-    // Get symbol count
-    const symbolCount = db.prepare('SELECT COUNT(*) as count FROM symbols').get();
+    // Get symbol count (fast with index)
+    const symbolCountRow = db.prepare('SELECT COUNT(*) as count FROM symbols').get();
+    const symbolCount = symbolCountRow?.count || 0;
 
-    res.json({
+    const responseData = {
       timestamp: new Date().toISOString(),
       signals: {
         latest_count: signals.length,
@@ -207,15 +222,13 @@ app.get('/status', (req, res) => {
             state: s.state,
             tv_score: meta.tvScore || 0,
             mtf_score: meta.mtfScore || 0,
-            decision: meta.decision || 'unknown',
-            market_data: meta.marketData || {}
+            decision: meta.decision || 'unknown'
           };
         })
       },
       trades: {
-        open_count: tradeCounts?.open_count || 0,
-        closed_count: tradeCounts?.closed_count || 0,
-        failed_count: tradeCounts?.failed_count || 0,
+        open_count: openCount,
+        closed_count: closedCount,
         max_slots: config.MAX_OPEN_TRADES,
         open_trades: openTrades.map(t => ({
           id: t.id,
@@ -223,16 +236,19 @@ app.get('/status', (req, res) => {
           opened_at: new Date(t.opened_at).toISOString(),
           side: t.side,
           size: t.size,
-          entry_price: t.entry_price,
-          tp: t.tp,
-          sl: t.sl,
-          status: t.status
+          entry_price: t.entry_price
         }))
       },
       symbols: {
-        total_count: symbolCount?.count || 0
+        total_count: symbolCount
       }
-    });
+    };
+
+    // Cache the response
+    cachedStatus = responseData;
+    lastStatusTime = now;
+
+    res.json(responseData);
   } catch (err) {
     logger.error({ err }, 'Status endpoint error');
     res.status(500).json({ error: err.message });
@@ -240,7 +256,7 @@ app.get('/status', (req, res) => {
 });
 
 // ============================================================
-// SIGNALS ENDPOINT (get all signals for a symbol)
+// SIGNALS ENDPOINT (single symbol)
 // ============================================================
 
 app.get('/signals/:symbol', (req, res) => {
@@ -341,7 +357,7 @@ app.get('/tv-rating/:symbol', (req, res) => {
 
     const db = dbModule.get();
     const cached = db.prepare(`
-      SELECT symbol, score, source, updated_at
+      SELECT symbol, score, source, exchange, updated_at
       FROM tv_ratings
       WHERE symbol = ?
     `).get(symbol);
@@ -362,6 +378,7 @@ app.get('/tv-rating/:symbol', (req, res) => {
       rating: {
         score: cached.score,
         source: cached.source,
+        exchange: cached.exchange,
         updated_at: new Date(cached.updated_at).toISOString(),
         age_minutes: Math.round((Date.now() - cached.updated_at) / 60000)
       }
@@ -373,24 +390,28 @@ app.get('/tv-rating/:symbol', (req, res) => {
 });
 
 // ============================================================
-// MANUAL SCAN ENDPOINT (trigger immediate scan)
+// MANUAL SCAN ENDPOINT (non-blocking)
 // ============================================================
 
 app.post('/scan', async (req, res) => {
   try {
     logger.info('Manual scan triggered via API');
-    poller.scanOnce({ notifyNewSignals: true })
-      .then(() => {
-        logger.info('Manual scan completed successfully');
-      })
-      .catch(err => {
-        logger.error({ err }, 'Manual scan error');
-      });
-
+    
+    // Don't wait for scan, return immediately
     res.json({
       status: 'scan_triggered',
       message: 'Scan initiated (results will be sent via Telegram)',
       timestamp: new Date().toISOString()
+    });
+
+    // Run scan in background (non-blocking)
+    setImmediate(async () => {
+      try {
+        await poller.scanOnce({ notifyNewSignals: true });
+        logger.info('Manual scan completed successfully');
+      } catch (err) {
+        logger.error({ err }, 'Manual scan error');
+      }
     });
   } catch (err) {
     logger.error({ err }, 'Manual scan endpoint error');
@@ -411,12 +432,13 @@ app.get('/', (req, res) => {
       health: {
         method: 'GET',
         path: '/health',
-        description: 'Health check and system status'
+        description: 'Health check and system status (lightweight)'
       },
       status: {
         method: 'GET',
         path: '/status',
-        description: 'Latest signals and open trades'
+        description: 'Latest signals and open trades (cached 5 sec)',
+        cache_duration: '5 seconds'
       },
       signals: {
         method: 'GET',
@@ -439,7 +461,7 @@ app.get('/', (req, res) => {
       scan: {
         method: 'POST',
         path: '/scan',
-        description: 'Trigger immediate scan (non-blocking)'
+        description: 'Trigger immediate scan (non-blocking, returns immediately)'
       }
     }
   });
@@ -459,7 +481,7 @@ app.use((req, res) => {
 });
 
 // ============================================================
-// ERROR HANDLER
+// ERROR HANDLER (lightweight)
 // ============================================================
 
 app.use((err, req, res, next) => {
@@ -477,17 +499,14 @@ app.use((err, req, res, next) => {
 const gracefulShutdown = async (signal) => {
   logger.info({ signal }, `${signal} received, graceful shutdown initiated`);
   try {
-    // Close WS connections
     logger.info('Closing WebSocket connections...');
     await wsManager.closeAll();
     logger.info('✅ WebSocket connections closed');
 
-    // Close database
     logger.info('Closing database...');
     dbModule.close();
     logger.info('✅ Database closed');
 
-    // Exit process
     logger.info('✅ Graceful shutdown completed');
     process.exit(0);
   } catch (err) {
@@ -499,15 +518,13 @@ const gracefulShutdown = async (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Uncaught exception handler
 process.on('uncaughtException', (err) => {
   logger.error({ err }, '❌ Uncaught exception');
   gracefulShutdown('uncaughtException');
 });
 
-// Unhandled rejection handler
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error({ reason, promise }, '❌ Unhandled rejection');
+  logger.error({ reason }, '❌ Unhandled rejection');
 });
 
 // ============================================================
@@ -520,7 +537,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   logger.info('Trading bot is ready. Check /health endpoint for status');
 });
 
-// Handle server errors
 server.on('error', (err) => {
   logger.error({ err }, '❌ Server error');
   if (err.code === 'EADDRINUSE') {
