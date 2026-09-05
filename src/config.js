@@ -62,6 +62,9 @@ module.exports = {
   // Whether to send root-candle open notifications
   NEW_ROOT_CANDLE_NOTIFY: envBool('NEW_ROOT_CANDLE_NOTIFY', true),
 
+  // Telegram send tuning: small delay between sequential messages (ms). Lower = faster but higher rate-limit risk.
+  TELEGRAM_SEND_DELAY_MS: Number(process.env.TELEGRAM_SEND_DELAY_MS || 100),
+
   // Legacy compatibility flags
   BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
   BREAK_EVEN_TRAILING: (process.env.BREAK_EVEN_TRAILING === 'true'),
