@@ -159,6 +159,7 @@ module.exports = {
    * seedKlinesForSymbol:
    * - If timeframe is provided, seed that timeframe PLUS the MTF timeframes so alignment is available.
    * - If timeframe is not provided, seed ROOT_TFS plus MTF_TFS (unique).
+   * - Use larger kline limit for D to improve MACD availability.
    */
   async seedKlinesForSymbol(symbol, timeframe = null) {
     try {
@@ -170,8 +171,11 @@ module.exports = {
 
       for (const tf of tfs) {
         const interval = String(tf) === 'D' ? 'D' : String(tf);
+        // Use larger limit for daily to ensure enough history for MACD (35+ bars)
+        const limit = (String(tf) === 'D') ? Math.max(Number(config.SEED_KLINES_LIMIT || 200), 500) : Number(config.SEED_KLINES_LIMIT || 200);
+
         try {
-          const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
+          const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, limit));
           if (!klines || klines.length === 0) {
             logger.debug({ symbol, tf }, 'seedKlinesForSymbol: no klines returned from API');
             continue;
@@ -185,7 +189,7 @@ module.exports = {
             }
           });
           insertMany(klines);
-          logger.debug({ symbol, tf, count: klines.length }, 'seedKlinesForSymbol: klines persisted');
+          logger.debug({ symbol, tf, count: klines.length, limit }, 'seedKlinesForSymbol: klines persisted');
 
           // Warm MACD if possible. Try computeAndStoreMacd then fallback to computeMacdHistogram.
           try {
