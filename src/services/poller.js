@@ -24,6 +24,10 @@ const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
 
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms || 0));
+}
+
 module.exports = {
   start() {
     if (isRunning) return;
@@ -84,10 +88,7 @@ module.exports = {
 
   /**
    * initialScan:
-   * - If config.USE_WS true, attempts wsManager.performInitialScan() (if function exists) with timeout
-   * - Falls back to bybit.fetchAllSymbols()
-   * - persists discovered symbols to DB
-   * - Kicks off background seeding for seedSymbols if SYMBOL_SEED_ALL true
+   * ... unchanged ...
    */
   async initialScan() {
     logger.info('poller.initialScan: starting');
@@ -147,9 +148,6 @@ module.exports = {
     }
   },
 
-  /**
-   * performWsInitialScan - delegates to bybitWs manager if it exposes performInitialScan()
-   */
   async performWsInitialScan() {
     try {
       const wsManager = require('./bybitWs');
@@ -163,10 +161,6 @@ module.exports = {
     return [];
   },
 
-  /**
-   * backgroundSeedKlines(symbols)
-   * - Seeds klines for given list with concurrency controlled by SEED_CONCURRENCY
-   */
   async backgroundSeedKlines(symbols = []) {
     if (!Array.isArray(symbols) || symbols.length === 0) {
       logger.info('backgroundSeedKlines: nothing to seed');
@@ -186,10 +180,6 @@ module.exports = {
     logger.info('backgroundSeedKlines: completed');
   },
 
-  /**
-   * seedKlinesForSymbol(symbol, timeframe)
-   * - Fetches klines for ROOT_TFS (or provided timeframe), stores to DB, and triggers MACD compute
-   */
   async seedKlinesForSymbol(symbol, timeframe = null) {
     const tfs = timeframe ? [timeframe] : (config.ROOT_TFS || []);
     for (const tf of tfs) {
@@ -250,12 +240,17 @@ module.exports = {
       if (newSignals.length > 0) {
         logger.info({ newSignals: newSignals.length }, 'scanOnce: notifying new signals found this boundary');
         const telegram = require('./telegram');
-        for (const s of newSignals) {
+
+        for (let i = 0; i < newSignals.length; i++) {
+          const s = newSignals[i];
+          const label = telegram.getLabel(i, { lowercase: true });
           try {
-            await telegram.sendNewSignalSingleBlock(s);
+            await telegram.sendNewSignalSingleBlock(s, label);
           } catch (e) {
             logger.debug({ e, s }, 'scanOnce: failed to send new-signal message');
           }
+          // brief pause between telegram messages to avoid rate-limit issues and keep deliveries reliable
+          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
         }
       } else {
         logger.info('scanOnce: no new signals found this boundary');
@@ -273,11 +268,6 @@ module.exports = {
     }
   },
 
-  /**
-   * scanSymbolRoots(symbol, { notifyImmediately = true })
-   * - For each ROOT_TF checks last 2 klines and calls macd.isMacdFlip()
-   * - If flip detected, calls signalManager.handleRootSignal({ notifyImmediately })
-   */
   async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
@@ -307,11 +297,6 @@ module.exports = {
     return results;
   },
 
-  /**
-   * scheduleAlignedTo5m:
-   * - Schedules scanOnce at the next 5m boundary and then every 5m
-   * - After running scanOnce, determines which root TFs have a new root candle and calls signalManager.handleNewRootCandle
-   */
   scheduleAlignedTo5m() {
     const msToNext5 = () => {
       const d = new Date();
