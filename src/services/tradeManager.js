@@ -100,6 +100,61 @@ module.exports = {
     logger.info('tradeManager registered to ws kline events for breakeven handling');
   },
 
+  async closeLeastProfitableTrade() {
+    if (!config.CLOSE_LEAST_PROFITABLE_ENABLED) return;
+
+    const db = dbModule.get();
+    const openTrades = db.prepare('SELECT * FROM trades WHERE status = ? ORDER BY id ASC').all('open');
+    
+    if (!openTrades || openTrades.length === 0) {
+      logger.debug('closeLeastProfitableTrade: no open trades');
+      return;
+    }
+
+    let leastProfitable = null;
+    let minProfit = Infinity;
+
+    for (const t of openTrades) {
+      const currentPrice = await this.fetchPrice(t.symbol);
+      if (!currentPrice || currentPrice <= 0) continue;
+
+      const isLong = (String(t.side || '').toLowerCase() !== 'sell');
+      let profit = 0;
+      if (isLong) {
+        profit = (currentPrice - t.entry_price) * t.size;
+      } else {
+        profit = (t.entry_price - currentPrice) * t.size;
+      }
+
+      if (profit < minProfit) {
+        minProfit = profit;
+        leastProfitable = t;
+      }
+    }
+
+    if (!leastProfitable) {
+      logger.info('closeLeastProfitableTrade: no valid trades to close');
+      return;
+    }
+
+    logger.info({ tradeId: leastProfitable.id, symbol: leastProfitable.symbol, profit: minProfit }, 'Closing least profitable trade before boundary');
+
+    try {
+      if (config.OPENTRADE) {
+        await bybit.closePosition({
+          category: 'linear',
+          symbol: leastProfitable.symbol,
+          side: leastProfitable.side === 'Buy' ? 'Sell' : 'Buy'
+        });
+      }
+
+      db.prepare('UPDATE trades SET status = ? WHERE id = ?').run('closed', leastProfitable.id);
+      logger.info({ tradeId: leastProfitable.id, symbol: leastProfitable.symbol }, 'Trade closed successfully');
+    } catch (err) {
+      logger.error({ err, tradeId: leastProfitable.id }, 'Failed to close least profitable trade');
+    }
+  },
+
   async evaluateBreakevenForSymbol(symbol, tf, klineData) {
     const db = dbModule.get();
     const openTrades = db.prepare('SELECT * FROM trades WHERE symbol = ? AND status = ?').all(symbol, 'open');
