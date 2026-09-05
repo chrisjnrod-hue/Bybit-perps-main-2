@@ -10,6 +10,8 @@ const TV_SCANNER_URL = 'https://scanner.tradingview.com/crypto/scan';
  * Falls back to calculated score if TV API fails
  */
 async function fetchTvRatingForSymbol(symbol) {
+  if (!symbol) return { source: 'error', score: 0 };
+
   const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE').split(',').map(s => s.trim());
   
   for (const ex of exchangeCandidates) {
@@ -46,7 +48,7 @@ async function fetchTvRatingForSymbol(symbol) {
         }
         
         logger.info({ symbol, ticker, recommend, score }, 'TV rating fetched successfully');
-        return { source: 'tradingview', score, raw: row.d };
+        return { source: 'tradingview', score: Math.round(score * 100) / 100, raw: row.d };
       }
     } catch (err) {
       logger.debug({ err: err && err.message ? err.message : err, symbol, exchange: ex }, 'TV fetch attempt failed');
@@ -67,7 +69,7 @@ function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) 
   try {
     const volNorm = Math.max(0, Math.min(1, (volChangePct + 100) / 200));
     const score = Math.max(0, Math.min(1, 0.6 * macdPositiveFraction + 0.4 * volNorm));
-    return score;
+    return Math.round(score * 100) / 100;
   } catch (err) {
     logger.debug({ err }, 'fallbackScore calculation error');
     return 0;
