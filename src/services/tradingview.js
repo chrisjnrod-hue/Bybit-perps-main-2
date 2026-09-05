@@ -9,9 +9,10 @@ function sleep(ms) {
 }
 
 /**
- * fetchTvRatingForSymbol with retry logic (maxRetries = 3)
- * - Tries multiple exchanges (BYBIT, BINANCE, etc.)
- * - Retries with exponential backoff if all exchanges fail
+ * fetchTvRatingForSymbol with retry logic and better timeout handling
+ * - Tries multiple exchanges (BYBIT, BINANCE, KUCOIN, COINBASE, KRAKEN, etc.)
+ * - Longer timeout (12 seconds instead of 8)
+ * - Retries with exponential backoff
  * - Falls back to zero score if all retries exhausted
  */
 async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
@@ -20,9 +21,20 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
     return { source: 'error', score: 0 };
   }
 
+  // Try more exchanges to increase hit rate
+  const allExchanges = [
+    'BYBIT', 'BINANCE', 'KUCOIN', 'COINBASE', 'KRAKEN', 
+    'UPBIT, 'OKX', 'GATE', 'HUOBI', 'MEXC'
+  ];
+  
+  const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE,KUCOIN')
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  logger.debug({ symbol, exchanges: exchangeCandidates }, 'fetchTvRatingForSymbol: starting fetch');
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE').split(',').map(s => s.trim());
-    
     for (const ex of exchangeCandidates) {
       try {
         const ticker = `${ex}:${symbol}`;
@@ -31,12 +43,24 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
           columns: ['Recommend.All|1', 'Recommend.Other|1', 'RSI|14', 'momentum|14']
         };
         
+        logger.debug({ attempt, exchange: ex, ticker }, 'TV fetch attempt');
+
+        // Increase timeout to 12 seconds (was 8)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 12000);
+
         const res = await fetch(TV_SCANNER_URL, {
           method: 'POST',
           body: JSON.stringify(body),
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 8000
+          headers: { 
+            'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+          },
+          signal: controller.signal,
+          timeout: 12000
         });
+
+        clearTimeout(timeoutId);
 
         if (!res.ok) {
           logger.debug({ exchange: ex, symbol, status: res.status, attempt }, 'TV API non-ok response');
@@ -56,11 +80,12 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
             score = Math.max(0, Math.min(1, (recommend - 1) / 4));
           }
           
-          logger.info({ symbol, ticker, recommend, score, attempt }, 'TV rating fetched successfully');
-          return { source: 'tradingview', score: Math.round(score * 100) / 100, raw: row.d };
+          logger.info({ symbol, ticker, recommend, score, attempt, exchange: ex }, '✅ TV rating fetched successfully');
+          return { source: 'tradingview', score: Math.round(score * 100) / 100, raw: row.d, exchange: ex };
         }
       } catch (err) {
-        logger.debug({ err: err && err.message ? err.message : err, symbol, exchange: ex, attempt }, 'TV fetch attempt failed');
+        const errorType = err.name === 'AbortError' ? 'timeout' : 'network';
+        logger.debug({ errorType, err: err && err.message ? err.message : err, symbol, exchange: ex, attempt }, 'TV fetch attempt failed');
         continue;
       }
     }
@@ -73,7 +98,7 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
     }
   }
 
-  logger.warn({ symbol, attempts: maxRetries, exchanges: (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE') }, 'TV rating unavailable after all retries, using fallback score of 0');
+  logger.warn({ symbol, attempts: maxRetries, exchanges: exchangeCandidates }, '⚠️ TV rating unavailable after all retries, using fallback score of 0');
   return { source: 'fallback', score: 0, raw: null };
 }
 
@@ -98,6 +123,7 @@ async function getOrFetchTvRatingCached(symbol) {
           symbol TEXT PRIMARY KEY,
           score REAL DEFAULT 0,
           source TEXT,
+          exchange TEXT,
           updated_at INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tv_ratings_updated_at ON tv_ratings(updated_at);
@@ -106,22 +132,24 @@ async function getOrFetchTvRatingCached(symbol) {
       logger.debug({ err }, 'tv_ratings table creation/check failed (continuing without cache)');
     }
 
-    // Check cache (within 1 hour = 3600000 ms)
+    // Check cache (within 2 hours = 7200000 ms, increased from 1 hour)
     const cached = db.prepare(`
-      SELECT score, source, updated_at 
+      SELECT score, source, exchange, updated_at 
       FROM tv_ratings 
       WHERE symbol = ? AND updated_at > ?
-    `).get(symbol, Date.now() - 3600000);
+    `).get(symbol, Date.now() - 7200000);
     
     if (cached) {
-      logger.debug({ symbol, source: cached.source, age: Date.now() - cached.updated_at }, 'TV rating retrieved from cache');
-      return { source: 'cache', score: cached.score, cached: true };
+      const ageMinutes = Math.round((Date.now() - cached.updated_at) / 60000);
+      logger.info({ symbol, source: cached.source, score: cached.score, ageMinutes }, '⏱️ TV rating retrieved from cache');
+      return { source: 'cache', score: cached.score, exchange: cached.exchange, cached: true };
     }
   } catch (err) {
     logger.debug({ err: err && err.message, symbol }, 'Cache check failed (will fetch fresh)');
   }
 
   // Fetch fresh from TV API
+  logger.debug({ symbol }, 'Fetching fresh TV rating from API');
   const fresh = await fetchTvRatingForSymbol(symbol);
 
   // Try to cache result
@@ -130,9 +158,9 @@ async function getOrFetchTvRatingCached(symbol) {
     if (db) {
       db.prepare(`
         INSERT OR REPLACE INTO tv_ratings 
-        (symbol, score, source, updated_at) 
-        VALUES (?, ?, ?, ?)
-      `).run(symbol, fresh.score, fresh.source, Date.now());
+        (symbol, score, source, exchange, updated_at) 
+        VALUES (?, ?, ?, ?, ?)
+      `).run(symbol, fresh.score, fresh.source, fresh.exchange || null, Date.now());
       logger.debug({ symbol, score: fresh.score, source: fresh.source }, 'TV rating cached');
     }
   } catch (err) {
@@ -174,16 +202,82 @@ function clearOldTvRatingCache(olderThanHours = 24) {
     const result = stmt.run(cutoffTime);
     
     if (result.changes > 0) {
-      logger.info({ deletedCount: result.changes, olderThanHours }, 'Cleared old TV ratings from cache');
+      logger.info({ deletedCount: result.changes, olderThanHours }, '🗑️ Cleared old TV ratings from cache');
     }
   } catch (err) {
     logger.debug({ err: err && err.message }, 'Failed to clear old TV ratings cache');
   }
 }
 
+/**
+ * testTvApi(symbol)
+ * - Test function to debug TV API connectivity
+ * - Returns detailed diagnostics
+ */
+async function testTvApi(symbol = 'BTCUSDT') {
+  logger.info({ symbol }, '🧪 Testing TV API connectivity...');
+  
+  const results = [];
+  const exchanges = ['BYBIT', 'BINANCE', 'KUCOIN', 'COINBASE'];
+
+  for (const ex of exchanges) {
+    try {
+      const ticker = `${ex}:${symbol}`;
+      const body = {
+        symbols: { tickers: [ticker], query: { types: [] } },
+        columns: ['Recommend.All|1']
+      };
+
+      const startTime = Date.now();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+
+      const res = await fetch(TV_SCANNER_URL, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+      const elapsed = Date.now() - startTime;
+
+      if (res.ok) {
+        const json = await res.json();
+        const data = json?.data?.[0]?.d?.[0];
+        results.push({
+          exchange: ex,
+          ticker,
+          status: '✅ OK',
+          response_time_ms: elapsed,
+          score: data ? Math.round(((data - 1) / 4) * 100) / 100 : 'N/A'
+        });
+      } else {
+        results.push({
+          exchange: ex,
+          ticker,
+          status: `❌ HTTP ${res.status}`,
+          response_time_ms: elapsed
+        });
+      }
+    } catch (err) {
+      results.push({
+        exchange: ex,
+        ticker: `${ex}:${symbol}`,
+        status: `❌ ${err.name || 'Error'}`,
+        error: err.message
+      });
+    }
+  }
+
+  logger.info({ results }, '📊 TV API test results');
+  return results;
+}
+
 module.exports = {
   fetchTvRatingForSymbol,
   getOrFetchTvRatingCached,
   fallbackScore,
-  clearOldTvRatingCache
+  clearOldTvRatingCache,
+  testTvApi
 };
