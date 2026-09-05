@@ -23,16 +23,11 @@ const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
-let seedingComplete = false;
 
 module.exports = {
   start() {
     if (isRunning) return;
     isRunning = true;
-
-    logger.info('═══════════════════════════════════════════════');
-    logger.info('🌱 Poller starting...');
-    logger.info('═══════════════════════════════════════════════');
 
     // Prevent opening trades until we've passed the next aligned 5m boundary.
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
@@ -41,8 +36,8 @@ module.exports = {
     try {
       bybit.probeHosts(3000)
         .then((base) => {
-          if (base) logger.info({ base }, '✅ probeHosts completed in background');
-          else logger.warn('⚠️ probeHosts completed in background with no selected base');
+          if (base) logger.info({ base }, 'probeHosts completed in background');
+          else logger.warn('probeHosts completed in background with no selected base');
         })
         .catch((e) => logger.debug({ e }, 'probeHosts background failure'));
     } catch (e) {
@@ -52,17 +47,11 @@ module.exports = {
     // Run initialScan immediately (fast)
     (async () => {
       try {
-        logger.info('═══════════════════════════════════════════════');
-        logger.info('🌱 poller: starting initialScan');
-        logger.info('═══════════════════════════════════════════════');
+        logger.info('poller: starting initialScan');
         await this.initialScan();
-        logger.info('═══════════════════════════════════════════════');
-        logger.info('✅ poller: initialScan completed - SEEDING NOW COMPLETE');
-        logger.info('═══════════════════════════════════════════════');
-        seedingComplete = true;
-        logger.info({ seedingComplete }, '✅ poller: seedingComplete flag set to TRUE');
+        logger.info('poller: initialScan completed');
       } catch (err) {
-        logger.error({ err }, '❌ poller: initialScan failed');
+        logger.error({ err }, 'poller: initialScan failed');
       }
     })();
 
@@ -84,20 +73,13 @@ module.exports = {
       setTimeout(() => {
         try {
           signalManager.setOpenTradesAllowed(true);
-          logger.info('✅ Open trades enabled at next 5m boundary (interval mode)');
+          logger.info('Open trades enabled at next 5m boundary (interval mode)');
         } catch (e) { logger.debug({ e }, 'Failed to set open trades allowed'); }
       }, msToNext5());
     } else {
       // Align to 5m boundaries
       this.scheduleAlignedTo5m();
     }
-  },
-
-  /**
-   * Check if seeding is complete
-   */
-  isSeedingComplete() {
-    return seedingComplete;
   },
 
   /**
@@ -112,7 +94,7 @@ module.exports = {
 
     let allSymbols = [];
 
-    const useWs = !!config.USE_WS;
+    const useWs = !!config.USE_WS; // config flag
 
     if (useWs) {
       try {
@@ -126,7 +108,7 @@ module.exports = {
           logger.warn('poller: WS initial scan returned no symbols; will fallback to REST');
           allSymbols = [];
         } else {
-          logger.info({ count: allSymbols.length }, '✅ poller: WS initial scan provided symbols');
+          logger.info({ count: allSymbols.length }, 'poller: WS initial scan provided symbols');
         }
       } catch (e) {
         logger.debug({ e }, 'poller: WS initial scan failed or timed out; fallback to REST');
@@ -154,12 +136,11 @@ module.exports = {
       }
     });
     insertMany(allSymbols.filter(s => s && s.symbol));
-    logger.info({ total: allSymbols.length }, '✅ poller.initialScan: symbols persisted to DB');
+    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted');
 
-    // Background seed if configured
+    // Background seed if configured to seed all
     const seedSymbols = bybit.getSeedSymbols(allSymbols);
     if (seedSymbols && seedSymbols.length) {
-      logger.info({ seedCount: seedSymbols.length }, '🌱 poller.initialScan: starting background seeding');
       setImmediate(() => this.backgroundSeedKlines(seedSymbols));
     } else {
       logger.info('poller.initialScan: no seed symbols to process (SYMBOL_SEED_ALL disabled or none)');
@@ -191,28 +172,18 @@ module.exports = {
       logger.info('backgroundSeedKlines: nothing to seed');
       return;
     }
-    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, '🌱 backgroundSeedKlines: starting');
-
-    let completedCount = 0;
+    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting');
 
     for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
       const batch = symbols.slice(i, i + SEED_CONCURRENCY);
-      const jobs = batch.map(s => 
-        limiter.schedule(() => this.seedKlinesForSymbol(s.symbol))
-          .then(() => {
-            completedCount++;
-            if (completedCount % 10 === 0) {
-              logger.debug({ completedCount, total: symbols.length }, '🌱 backgroundSeedKlines: batch progress');
-            }
-          })
-      );
+      const jobs = batch.map(s => limiter.schedule(() => this.seedKlinesForSymbol(s.symbol)));
       try {
         await Promise.all(jobs);
       } catch (e) {
         logger.debug({ e }, 'backgroundSeedKlines: batch failed (continuing)');
       }
     }
-    logger.info({ completed: completedCount, total: symbols.length }, '✅ backgroundSeedKlines: completed');
+    logger.info('backgroundSeedKlines: completed');
   },
 
   /**
@@ -224,13 +195,8 @@ module.exports = {
     for (const tf of tfs) {
       const interval = tf === 'D' ? 'D' : String(tf);
       try {
-        logger.debug({ symbol, tf }, '🌱 Seeding klines for symbol/timeframe');
-        
         const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
-        if (!klines || klines.length === 0) {
-          logger.debug({ symbol, tf }, '⚠️ No klines returned from fetch');
-          continue;
-        }
+        if (!klines || klines.length === 0) continue;
 
         const db = dbModule.get();
         const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
@@ -240,11 +206,9 @@ module.exports = {
           }
         });
         insertMany(klines);
-        logger.debug({ symbol, tf, klinesCount: klines.length }, '✅ Klines seeded and persisted');
 
         try {
           await macdUtil.computeAndStoreMacd(symbol, tf);
-          logger.debug({ symbol, tf }, '✅ MACD computed successfully');
         } catch (err) {
           logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd compute failed (continuing)');
         }
@@ -270,8 +234,6 @@ module.exports = {
       const scanStart = Date.now();
 
       const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      logger.info({ symbolCount: rows.length }, '🔍 scanOnce: scanning symbols');
-      
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
         const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
@@ -286,7 +248,7 @@ module.exports = {
       const newSignals = after.filter(r => !prevKeys.has(r.key) && r.detected_at >= scanStart);
 
       if (newSignals.length > 0) {
-        logger.info({ newSignals: newSignals.length }, '📢 scanOnce: new signals detected, notifying');
+        logger.info({ newSignals: newSignals.length }, 'scanOnce: notifying new signals found this boundary');
         const telegram = require('./telegram');
         for (const s of newSignals) {
           try {
@@ -296,7 +258,7 @@ module.exports = {
           }
         }
       } else {
-        logger.debug('scanOnce: no new signals found this boundary');
+        logger.info('scanOnce: no new signals found this boundary');
       }
 
       // Persist last scan metadata
@@ -330,7 +292,6 @@ module.exports = {
         }
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
-          logger.info({ symbol, tf }, '🚨 MACD flip detected!');
           const sig = await signalManager.handleRootSignal({
             symbol,
             root_tf: tf,
@@ -367,7 +328,7 @@ module.exports = {
 
     const schedule = async () => {
       const wait = msToNext5();
-      logger.info({ wait }, '⏰ scheduleAlignedTo5m: waiting ms until next 5m boundary');
+      logger.info({ wait }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
       setTimeout(async () => {
         try {
           // Run scan
@@ -404,7 +365,7 @@ module.exports = {
             firstBoundaryPassed = true;
             try {
               signalManager.setOpenTradesAllowed(true);
-              logger.info('✅ scheduleAlignedTo5m: open trades enabled after first boundary');
+              logger.info('scheduleAlignedTo5m: open trades enabled after first boundary');
             } catch (e) {
               logger.debug({ e }, 'scheduleAlignedTo5m: failed to set open trades allowed');
             }
