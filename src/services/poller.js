@@ -172,10 +172,17 @@ module.exports = {
         });
         insertMany(klines);
 
+        // Warm MACD if possible. The macd module in this repo may or may not expose a computeAndStoreMacd helper.
+        // Try computeAndStoreMacd() first, otherwise call computeMacdHistogram() to warm any caches and avoid throwing.
         try {
-          await macdUtil.computeAndStoreMacd(symbol, tf);
+          if (typeof macdUtil.computeAndStoreMacd === 'function') {
+            await macdUtil.computeAndStoreMacd(symbol, tf);
+          } else if (typeof macdUtil.computeMacdHistogram === 'function') {
+            // compute and ignore result (warm)
+            await macdUtil.computeMacdHistogram(symbol, tf);
+          }
         } catch (err) {
-          logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd compute failed (continuing)');
+          logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd warm-up failed (continuing)');
         }
       } catch (err) {
         logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: fetch failed (skipping tf)');
@@ -238,6 +245,32 @@ module.exports = {
       }
     } catch (err) {
       logger.error({ err }, 'scanOnce: unexpected error');
+    }
+  },
+
+  /**
+   * scanAllForStartup:
+   * - Ensures there's a full quiet pass over all symbols at startup to populate signals DB.
+   * - This method is intentionally silent (no Telegram per-signal notifications).
+   * - index.js expects poller.scanAllForStartup to exist.
+   */
+  async scanAllForStartup() {
+    try {
+      logger.info('scanAllForStartup: starting full startup pass (silent)');
+      const db = dbModule.get();
+      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
+        const page = rows.slice(i, i + config.PAGE_SIZE);
+        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
+        try {
+          await Promise.all(tasks);
+        } catch (e) {
+          logger.debug({ e }, 'scanAllForStartup: page tasks error (continuing)');
+        }
+      }
+      logger.info('scanAllForStartup: completed full startup pass');
+    } catch (err) {
+      logger.error({ err }, 'scanAllForStartup: unexpected error');
     }
   },
 
