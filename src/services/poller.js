@@ -172,13 +172,11 @@ module.exports = {
         });
         insertMany(klines);
 
-        // Warm MACD if possible. The macd module in this repo may or may not expose a computeAndStoreMacd helper.
-        // Try computeAndStoreMacd() first, otherwise call computeMacdHistogram() to warm any caches and avoid throwing.
+        // Warm MACD if possible. Try computeAndStoreMacd then fallback to computeMacdHistogram.
         try {
           if (typeof macdUtil.computeAndStoreMacd === 'function') {
             await macdUtil.computeAndStoreMacd(symbol, tf);
           } else if (typeof macdUtil.computeMacdHistogram === 'function') {
-            // compute and ignore result (warm)
             await macdUtil.computeMacdHistogram(symbol, tf);
           }
         } catch (err) {
@@ -274,17 +272,33 @@ module.exports = {
     }
   },
 
+  /**
+   * scanSymbolRoots:
+   * - For each configured root TF, ensure klines exist. If a seed was required we now re-query and attempt flip detection.
+   */
   async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
     for (const tf of tfList) {
       try {
         const db = dbModule.get();
-        const rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
+        const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2');
+        let rows = selectStmt.all(symbol, tf);
         if (!rows || rows.length < 2) {
+          // Seed missing klines (sync) and then re-check immediately
+          logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now');
           await this.seedKlinesForSymbol(symbol, tf);
-          continue;
+
+          // Re-query after seed
+          rows = selectStmt.all(symbol, tf);
+          if (!rows || rows.length < 2) {
+            logger.debug({ symbol, tf }, 'scanSymbolRoots: still insufficient klines after seeding, skipping tf for now');
+            continue;
+          } else {
+            logger.info({ symbol, tf }, 'scanSymbolRoots: klines seeded and available, re-checking flip');
+          }
         }
+
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
           const sig = await signalManager.handleRootSignal({
