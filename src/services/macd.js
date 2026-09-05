@@ -14,19 +14,24 @@ module.exports = {
   },
 
   async computeMacdHistogram(symbol, timeframe) {
-    const series = await this.getKlineSeries(symbol, timeframe, 500);
-    const closes = series.map(s => s.close);
-    if (closes.length < 35) return null;
-    const macdInput = { values: closes, ...macdOptions };
-    const out = MACD.calculate(macdInput);
-    const offset = closes.length - out.length;
-    const withTime = out.map((o, idx) => ({
-      time: series[offset + idx].time,
-      MACD: o.MACD,
-      signal: o.signal,
-      histogram: o.histogram
-    }));
-    return withTime;
+    try {
+      const series = await this.getKlineSeries(symbol, timeframe, 500);
+      const closes = series.map(s => s.close);
+      if (closes.length < 35) return null;
+      const macdInput = { values: closes, ...macdOptions };
+      const out = MACD.calculate(macdInput);
+      const offset = closes.length - out.length;
+      const withTime = out.map((o, idx) => ({
+        time: series[offset + idx].time,
+        MACD: o.MACD,
+        signal: o.signal,
+        histogram: o.histogram
+      }));
+      return withTime;
+    } catch (err) {
+      logger.debug({ err, symbol, timeframe }, 'computeMacdHistogram error');
+      return null;
+    }
   },
 
   async isMacdFlip(symbol, timeframe) {
@@ -46,10 +51,6 @@ module.exports = {
     }
   },
 
-  /**
-   * getMtfStatus(symbol, tfs)
-   * Returns status for multiple timeframes: { 5: 'POSITIVE'|'NEGATIVE'|'UNKNOWN', 15: ..., 60: ..., D: ... }
-   */
   async getMtfStatus(symbol, tfs = []) {
     const status = {};
     for (const tf of tfs) {
@@ -75,32 +76,25 @@ module.exports = {
     return status;
   },
 
-  /**
-   * getSignalMetrics(symbol, rootTf, mtfTfs)
-   * Computes all metrics for a signal: TV score, MTF status, MACD values, market data
-   */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
-      // TV score
       let tvScore = 0;
       let tvSource = 'fallback';
       try {
         const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
-        tvScore = tvResult.score || 0;
-        tvSource = tvResult.source || 'fallback';
+        tvScore = tvResult && typeof tvResult.score === 'number' ? tvResult.score : 0;
+        tvSource = tvResult && tvResult.source ? tvResult.source : 'error';
       } catch (e) {
         logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
         tvScore = 0;
+        tvSource = 'error';
       }
 
-      // MTF status
       const mtfStatus = await this.getMtfStatus(symbol, mtfTfs);
 
-      // Root MACD histogram
       const rootHist = await this.computeMacdHistogram(symbol, rootTf);
       const rootMacd = rootHist && rootHist.length > 0 ? rootHist[rootHist.length - 1] : null;
 
-      // Market data
       let marketDataResult = null;
       try {
         marketDataResult = await marketData.updateSymbolMarketData(symbol);
@@ -118,10 +112,10 @@ module.exports = {
           histogram: rootMacd.histogram
         } : null,
         market_data: marketDataResult ? {
-          price: marketDataResult.price,
-          volume_24h_usdt: marketDataResult.volume_24h_usdt,
-          volume_change_pct: marketDataResult.volume_change_pct,
-          market_cap: marketDataResult.market_cap
+          price: marketDataResult.price || 0,
+          volume_24h_usdt: marketDataResult.volume_24h_usdt || 0,
+          volume_change_pct: marketDataResult.volume_change_pct || null,
+          market_cap: marketDataResult.market_cap || null
         } : null
       };
     } catch (err) {
