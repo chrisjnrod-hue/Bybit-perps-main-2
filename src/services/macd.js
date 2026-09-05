@@ -1,4 +1,3 @@
-// src/services/macd.js
 const { MACD } = require('technicalindicators');
 const dbModule = require('../db');
 const logger = require('pino')();
@@ -49,7 +48,7 @@ module.exports = {
 
   /**
    * getMtfStatus(symbol, tfs)
-   * Returns status for multiple timeframes with proper error handling
+   * Returns status for multiple timeframes: { 5: 'POSITIVE'|'NEGATIVE'|'UNKNOWN', 15: ..., 60: ..., D: ... }
    */
   async getMtfStatus(symbol, tfs = []) {
     const status = {};
@@ -57,7 +56,6 @@ module.exports = {
       try {
         const hist = await this.computeMacdHistogram(symbol, tf);
         if (!hist || hist.length < 1) {
-          logger.debug({ symbol, tf }, 'No histogram data, marking UNKNOWN');
           status[tf] = 'UNKNOWN';
           continue;
         }
@@ -69,7 +67,6 @@ module.exports = {
         } else {
           status[tf] = 'UNKNOWN';
         }
-        logger.debug({ symbol, tf, status: status[tf], histogram: last.histogram }, 'MTF status computed');
       } catch (err) {
         logger.debug({ err, symbol, tf }, 'getMtfStatus error for timeframe');
         status[tf] = 'UNKNOWN';
@@ -84,6 +81,7 @@ module.exports = {
    */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
+      // TV score
       let tvScore = 0;
       let tvSource = 'fallback';
       try {
@@ -95,11 +93,14 @@ module.exports = {
         tvScore = 0;
       }
 
+      // MTF status
       const mtfStatus = await this.getMtfStatus(symbol, mtfTfs);
 
+      // Root MACD histogram
       const rootHist = await this.computeMacdHistogram(symbol, rootTf);
       const rootMacd = rootHist && rootHist.length > 0 ? rootHist[rootHist.length - 1] : null;
 
+      // Market data
       let marketDataResult = null;
       try {
         marketDataResult = await marketData.updateSymbolMarketData(symbol);
