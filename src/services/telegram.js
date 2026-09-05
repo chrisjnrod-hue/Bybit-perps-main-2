@@ -14,7 +14,6 @@ module.exports = {
     if (!bot) bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: false });
   },
 
-  // Alphabetic label generator: 0 -> 'a', 25 -> 'z', 26 -> 'aa', ...
   getLabel(index, { lowercase = true } = {}) {
     if (typeof index !== 'number' || index < 0) return '';
     let i = index + 1;
@@ -28,9 +27,7 @@ module.exports = {
     return lowercase ? label.toLowerCase() : label;
   },
 
-  _sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms || 0));
-  },
+  _sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms || 0)); },
 
   buildAlignmentLines(alignment) {
     const lines = [];
@@ -65,7 +62,6 @@ module.exports = {
     return lines.join('\n');
   },
 
-  // Compose a detailed per-signal message (no label)
   buildSignalMessage(signal) {
     const { symbol, root_tf, detected_at, meta = {} } = signal || {};
     const timeStr = detected_at ? new Date(detected_at).toISOString() : new Date().toISOString();
@@ -98,23 +94,18 @@ module.exports = {
     return msgParts.join('\n');
   },
 
-  /**
-   * sendNewSignalSingleBlock(signal, label)
-   * - if label provided (e.g., 'a'), message will be prefixed with 'a) '
-   */
-  async sendNewSignalSingleBlock(signal, label = null) {
+  // No alphabetical prefixing here anymore — label is accepted but ignored
+  async sendNewSignalSingleBlock(signal, _label = null) {
     if (!bot) return;
     try {
       const baseMsg = this.buildSignalMessage(signal);
-      const msg = label ? `${label}) ${baseMsg}` : baseMsg;
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf, label }, 'Telegram new-signal message sent (detail block)');
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
     } catch (err) {
       logger.warn({ err }, 'Failed to send telegram new-signal block');
     }
   },
 
-  // Keep sendRootSignalBlock for callers which use it directly
   async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, mtfScore = 0 }) {
     if (!bot) return;
     const timeStr = new Date(detected_at).toISOString();
@@ -163,9 +154,9 @@ module.exports = {
 
   /**
    * sendStartupSummary:
-   * - single summary block: counts per root TF only (no alphabetic symbol listing)
-   * - then per-signal detailed blocks, alphabetically ordered and labeled a), b), ...
-   * - finally recommended header and labeled short recommended lines
+   * - single summary block: counts per root TF and vertical list of all signal symbol names (one per line)
+   * - then per-signal detailed blocks (no alphabetical labels)
+   * - then recommended block
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -181,9 +172,9 @@ module.exports = {
         try {
           const poller = require('./poller');
           try { await poller.initialScan(); } catch (e) { logger.debug({ e }, 'sendStartupSummary: initialScan failed (continuing)'); }
-          try { if (typeof poller.scanOnce === 'function') await poller.scanOnce({ notifyNewSignals: false }); } catch (e) { logger.debug({ e }, 'sendStartupSummary: scanOnce failed (continuing)'); }
+          try { if (typeof poller.scanAllForStartup === 'function') await poller.scanAllForStartup(); else if (typeof poller.scanOnce === 'function') await poller.scanOnce({ notifyNewSignals: false }); } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed (continuing)'); }
         } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: unable to require poller (continuing)');
+          logger.debug({ e }, 'sendStartupSummary: could not require poller (continuing)');
         }
 
         const waitMs = Number(config.STARTUP_SUMMARY_WAIT_MS || 15000);
@@ -201,11 +192,13 @@ module.exports = {
         }
       }
 
-      // Build counts per root_tf (no alphabetic symbol listing)
+      // Build counts per root_tf
       const tfCounts = {};
+      const symbolSet = new Set();
       for (const s of signals) {
         const tf = String(s.root_tf || 'unknown');
         tfCounts[tf] = (tfCounts[tf] || 0) + 1;
+        if (s.symbol) symbolSet.add(s.symbol);
       }
 
       const orderedRootTfs = Array.isArray(config.ROOT_TFS) && config.ROOT_TFS.length
@@ -216,10 +209,15 @@ module.exports = {
       }
 
       const summaryParts = orderedRootTfs.map(tf => `${tf}: ${tfCounts[tf] || 0}`);
-      const header = `Startup root TF summary (${signals.length} signals):\n${summaryParts.join(' • ')}`;
+
+      // vertical symbol list (one symbol per line)
+      const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+      const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
+
+      const header = `Startup root TF summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, header);
 
-      // Per-signal blocks: alphabetical order by symbol, then tf — each labeled a), b), ...
+      // Per-signal detail blocks (no alphabetical labels)
       signals.sort((a, b) => {
         const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
         if (s !== 0) return s;
@@ -227,11 +225,10 @@ module.exports = {
       });
 
       for (let i = 0; i < signals.length; i++) {
-        const label = this.getLabel(i, { lowercase: true });
         try {
-          await this.sendNewSignalSingleBlock(signals[i], label);
+          await this.sendNewSignalSingleBlock(signals[i], null);
         } catch (e) {
-          logger.debug({ e, i }, 'sendStartupSummary: failed to send per-signal labeled block (continuing)');
+          logger.debug({ e, i }, 'sendStartupSummary: failed to send per-signal detail block');
         }
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
@@ -279,7 +276,7 @@ module.exports = {
         }
       }
 
-      logger.info('Startup telegram summary sent (counts summary + labeled per-signal blocks + recommended)');
+      logger.info('Startup telegram summary sent (counts summary + vertical symbol list + per-signal blocks + recommended)');
     } catch (err) {
       logger.warn({ err }, 'Failed to send startup telegram summary');
     }
