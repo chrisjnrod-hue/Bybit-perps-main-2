@@ -23,8 +23,7 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
 
   // Try more exchanges to increase hit rate
   const allExchanges = [
-    'BYBIT', 'BINANCE', 'KUCOIN', 'COINBASE', 'KRAKEN', 
-    'UPBIT, 'OKX', 'GATE', 'HUOBI', 'MEXC'
+    'BYBIT', 'BINANCE',
   ];
   
   const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE,KUCOIN')
