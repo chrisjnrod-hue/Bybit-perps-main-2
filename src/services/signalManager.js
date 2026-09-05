@@ -86,7 +86,7 @@ module.exports = {
       };
 
       if (notifyImmediately) {
-        // send telegram block immediately
+        // send telegram block immediately (detailed root-signal block)
         await telegram.sendRootSignalBlock({
           symbol,
           root_tf,
@@ -202,9 +202,6 @@ module.exports = {
   /**
    * sendStartupSummary:
    * - builds a snapshot of latest root signals and sends the initial multi-block telegram message
-   * - first block: root tfs signal summary A-Z + numeric count
-   * - second block: recommended signals to open (respects MAX_OPEN_TRADES and shows acceptance reason)
-   * - subsequent blocks: A-Z listing of all root TF signals per block
    */
   async sendStartupSummary() {
     try {
@@ -221,7 +218,7 @@ module.exports = {
   /**
    * handleNewRootCandle:
    * - Called with list of root tfs that opened a new candle (e.g., ['60','D'])
-   * - Sends a full root-summary + recommended + listings
+   * - Sends a full root-summary + recommended + listings (handled in telegram)
    */
   async handleNewRootCandle(newRootTfs = []) {
     try {
