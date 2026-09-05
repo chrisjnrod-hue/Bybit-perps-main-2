@@ -40,10 +40,8 @@ module.exports = {
     try {
       logger.info({ symbol, root_tf }, 'Root signal received');
 
-      // ALWAYS fetch fresh market data and TV rating (best-effort, with fallbacks)
+      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
       let mdata = null;
-      let tv = { score: 0, source: 'error' };
-
       try {
         mdata = await marketData.updateSymbolMarketData(symbol);
         if (!mdata) {
@@ -54,15 +52,20 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
+      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
+      let tv = { score: 0, source: 'error' };
       try {
-        const tvRes = await tradingview.fetchTvRatingForSymbol(symbol);
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
+        const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
         if (tvRes && typeof tvRes.score === 'number') {
-          tv = { score: tvRes.score, source: tvRes.source || 'tradingview' };
+          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
+          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
         } else {
+          logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
           tv = { score: 0, source: 'error' };
         }
       } catch (err) {
-        logger.warn({ err, symbol }, 'handleRootSignal: TV rating fetch failed, using zero');
+        logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
         tv = { score: 0, source: 'error' };
       }
 
@@ -114,10 +117,12 @@ module.exports = {
             tvSource: tv.source || 'error',
             mtfScore
           });
+          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
       } else {
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
         return signalObj;
       }
 
@@ -160,6 +165,7 @@ module.exports = {
           if (passFilters) {
             try {
               await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
+              logger.info({ symbol }, 'handleRootSignal: trade opening initiated');
             } catch (err) {
               logger.error({ err, symbol }, 'handleRootSignal: openTrade error');
             }
