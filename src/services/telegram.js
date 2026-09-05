@@ -1,302 +1,269 @@
-// src/services/telegram.js
-const TelegramBot = require('node-telegram-bot-api');
+const dbModule = require('../db');
+const wsManager = require('./bybitWs');
+const macd = require('./macd');
+const telegram = require('./telegram');
+const tradeManager = require('./tradeManager');
+const marketData = require('./marketData');
+const tradingview = require('./tradingview');
 const config = require('../config');
 const logger = require('pino')();
-const dbModule = require('../db');
 
-let bot = null;
+let openTradesAllowed = true;
+
+function setOpenTradesAllowed(v) {
+  openTradesAllowed = !!v;
+  logger.info({ openTradesAllowed }, 'signalManager: openTradesAllowed set');
+}
+
+const inProgress = new Map();
+
 module.exports = {
-  init() {
-    if (!config.TELEGRAM_BOT_TOKEN) {
-      logger.warn('Telegram token not configured; telegram disabled');
-      return;
+  start() {
+    logger.info('SignalManager started');
+  },
+
+  setOpenTradesAllowed,
+
+  /**
+   * handleRootSignal:
+   * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
+   * - returns the persisted signal object
+   * - ALWAYS fetches fresh market data and TV rating for complete signal block
+   */
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+    const key = `${symbol}:${root_tf}`;
+    if (inProgress.has(key)) {
+      logger.debug({ key }, 'handleRootSignal: already in progress');
+      return null;
     }
-    if (!bot) bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: false });
-  },
-
-  getLabel(index, { lowercase = true } = {}) {
-    if (typeof index !== 'number' || index < 0) return '';
-    let i = index + 1;
-    const chars = [];
-    while (i > 0) {
-      i -= 1;
-      chars.unshift(String.fromCharCode((i % 26) + 65));
-      i = Math.floor(i / 26);
-    }
-    const label = chars.join('');
-    return lowercase ? label.toLowerCase() : label;
-  },
-
-  _sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms || 0)); },
-
-  buildAlignmentLines(alignment) {
-    const lines = [];
-    let positiveCount = 0;
-    let total = 0;
-    for (const tf of Object.keys(alignment || {})) {
-      const info = alignment[tf];
-      total++;
-      const ok = info && typeof info.histogram !== 'undefined';
-      const posSym = ok ? (info.positive ? '🟢' : '🔴') : '⚪';
-      if (info && info.positive) positiveCount++;
-      const hist = ok ? `hist=${Number(info.histogram).toFixed(6)}` : '';
-      const rise = ok ? (info.rising ? '↑' : '↓') : '';
-      lines.push(`${tf}: ${posSym} ${ok ? (info.positive ? 'POS' : 'NEG') : 'unknown'} ${hist} ${rise}`.trim());
-    }
-    const mtfScore = total ? (positiveCount / total) : 0;
-    return { lines: lines.join('\n'), mtfScore, positiveCount, total };
-  },
-
-  formatMarketData(md = {}) {
-    const price = (typeof md.price === 'number') ? md.price : (md.price ? Number(md.price) : null);
-    const vol24 = (typeof md.volume_24h_usdt === 'number') ? md.volume_24h_usdt : (md.volume_24h_usdt ? Number(md.volume_24h_usdt) : null);
-    const volChange = (typeof md.volume_change_pct === 'number') ? md.volume_change_pct : (md.volume_change_pct ? Number(md.volume_change_pct) : null);
-    const marketCap = (typeof md.market_cap === 'number') ? md.market_cap : (md.market_cap ? Number(md.market_cap) : null);
-
-    const lines = [
-      `💰 Price: ${price !== null ? price.toLocaleString('en-US', { maximumFractionDigits: 8 }) : 'n/a'}`,
-      `💵 24h Volume: ${vol24 !== null ? vol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT' : 'n/a'}`,
-      `📈 Volume Change: ${volChange !== null ? volChange.toFixed(2) + '%' : 'n/a'}`,
-      `💎 Market Cap: ${marketCap ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
-    ];
-    return lines.join('\n');
-  },
-
-  buildSignalMessage(signal) {
-    const { symbol, root_tf, detected_at, meta = {} } = signal || {};
-    const timeStr = detected_at ? new Date(detected_at).toISOString() : new Date().toISOString();
-    const alignment = meta.alignment || {};
-    const tvScore = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
-    const mtfScore = (typeof meta.mtfScore === 'number') ? meta.mtfScore : null;
-    const decision = meta.decision || 'monitor';
-    const reason = meta.acceptReason || meta.reason || 'n/a';
-
-    const { lines: alignmentLines, mtfScore: computedMtfScore } = this.buildAlignmentLines(alignment);
-    const usedMtfScore = (mtfScore !== null) ? mtfScore : computedMtfScore;
-
-    const scoringLine = `📊 Scoring:\nTV: ${(tvScore * 100).toFixed(0)}% • MTF: ${(usedMtfScore * 100).toFixed(0)}%`;
-    const mtfHeader = `🛰️ MTF Status:`;
-    const marketBlock = `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
-
-    const msgParts = [
-      `🎯 New signal: ${symbol} (${root_tf})`,
-      `⏰ Time: ${timeStr}`,
-      `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision} (reason: ${reason})`,
-      '',
-      scoringLine,
-      '',
-      mtfHeader,
-      alignmentLines || 'No MTF data',
-      '',
-      marketBlock
-    ];
-
-    return msgParts.join('\n');
-  },
-
-  // No alphabetical prefixing here anymore — label is accepted but ignored
-  async sendNewSignalSingleBlock(signal, _label = null) {
-    if (!bot) return;
+    inProgress.set(key, true);
     try {
-      const baseMsg = this.buildSignalMessage(signal);
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
+      logger.info({ symbol, root_tf }, 'Root signal received');
+
+      // ALWAYS fetch fresh market data and TV rating (best-effort, with fallbacks)
+      let mdata = null;
+      let tv = { score: 0, source: 'error' };
+
+      try {
+        mdata = await marketData.updateSymbolMarketData(symbol);
+        if (!mdata) {
+          mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
+        }
+      } catch (err) {
+        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using zeros');
+        mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
+      }
+
+      try {
+        const tvRes = await tradingview.fetchTvRatingForSymbol(symbol);
+        if (tvRes && typeof tvRes.score === 'number') {
+          tv = { score: tvRes.score, source: tvRes.source || 'tradingview' };
+        } else {
+          tv = { score: 0, source: 'error' };
+        }
+      } catch (err) {
+        logger.warn({ err, symbol }, 'handleRootSignal: TV rating fetch failed, using zero');
+        tv = { score: 0, source: 'error' };
+      }
+
+      // Subscribe to MTF websockets (for alignment updates)
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
+
+      // Evaluate MTF alignment
+      const alignment = await this.evaluateMtfAlignment(symbol);
+      const mtfTfs = Object.keys(alignment || {});
+      const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
+      const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
+
+      // Apply decision rules
+      const accept = await this.applyDecision(alignment);
+
+      // Compose meta and persist signal to DB
+      const meta = {
+        tvScore: tv.score || 0,
+        tvSource: tv.source || 'error',
+        mtfScore,
+        alignment,
+        acceptReason: accept && accept.reason ? accept.reason : null,
+        decision: accept && accept.decision ? accept.decision : 'monitor',
+        marketData: mdata || {}
+      };
+
+      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+
+      const signalObj = {
+        key,
+        symbol,
+        root_tf,
+        detected_at,
+        state: 'detected',
+        meta
+      };
+
+      if (notifyImmediately) {
+        // send telegram block immediately with all metrics
+        try {
+          await telegram.sendRootSignalBlock({
+            symbol,
+            root_tf,
+            alignment,
+            detected_at,
+            accept,
+            marketData: mdata || {},
+            tvScore: tv.score || 0,
+            tvSource: tv.source || 'error',
+            mtfScore
+          });
+        } catch (err) {
+          logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
+        }
+      } else {
+        return signalObj;
+      }
+
+      // Only when decision is 'accept' do we attempt to open a trade
+      if (accept && accept.decision === 'accept') {
+        if (!config.OPENTRADE) {
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
+        } else if (!openTradesAllowed) {
+          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
+        } else {
+          // Apply market-level filters
+          let passFilters = true;
+          if (config.MIN_MARKET_CAP > 0) {
+            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
+              passFilters = false;
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
+            }
+          }
+          if (config.MIN_24H_USDT_VOLUME > 0) {
+            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+              passFilters = false;
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
+            }
+          }
+          if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
+            const change = mdata?.volume_change_pct;
+            if (change === null || change === undefined) {
+              if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
+                passFilters = false;
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
+            } else {
+              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+                passFilters = false;
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
+            }
+          }
+
+          if (passFilters) {
+            try {
+              await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
+            } catch (err) {
+              logger.error({ err, symbol }, 'handleRootSignal: openTrade error');
+            }
+          } else {
+            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
+          }
+        }
+      }
+
+      return signalObj;
     } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram new-signal block');
-    }
-  },
-
-  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, mtfScore = 0 }) {
-    if (!bot) return;
-    const timeStr = new Date(detected_at).toISOString();
-    let alignmentLines = Object.entries(alignment || {}).map(([tf, info]) => {
-      if (!info || !info.hasOwnProperty('histogram')) return `${tf}: unknown`;
-      return `${tf}: ${info.positive ? 'POS' : 'NEG'} hist=${Number(info.histogram).toFixed(6)} ${info.rising ? '↑' : '↓'}`;
-    }).join('\n');
-
-    const decision = accept && accept.decision ? accept.decision : 'monitor';
-
-    const price = marketData?.price ? Number(marketData.price) : null;
-    const vol24 = marketData?.volume_24h_usdt ? Number(marketData.volume_24h_usdt) : null;
-    const prevVol = marketData?.prev_volume_24h ? Number(marketData.prev_volume_24h) : null;
-    const volChange = (typeof marketData?.volume_change_pct === 'number') ? Number(marketData.volume_change_pct) : null;
-    const marketCap = marketData?.market_cap ? Number(marketData.market_cap) : null;
-
-    const marketLines = [
-      `💰 Price: ${price ? price.toLocaleString('en-US', { maximumFractionDigits: 8 }) : 'n/a'}`,
-      `💵 24h USDT Volume: ${vol24 ? vol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'n/a'}`,
-      `Prev 24h USDT Volume: ${prevVol ? prevVol.toLocaleString('en-US', { maximumFractionDigits: 2 }) : 'n/a'}`,
-      `📈 24h Volume Change: ${volChange !== null ? volChange.toFixed(2) + '%' : 'n/a'}`,
-      `💎 Market Cap: ${marketCap ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
-    ].join('\n');
-
-    const msg = [
-      `🎯 Root signal: ${symbol} (${root_tf})`,
-      `⏰ Time: ${timeStr}`,
-      `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision}`,
-      '',
-      `📊 Scoring: TV: ${(tvScore * 100).toFixed(0)}% • MTF: ${(mtfScore * 100).toFixed(0)}%`,
-      '',
-      `🛰️ MTF status:\n${alignmentLines}`,
-      '',
-      `💱 Market data:\n${marketLines}`,
-      '',
-      `Accept reason: ${accept?.reason || 'n/a'}`
-    ].join('\n');
-
-    try {
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol, root_tf }, 'Telegram message sent with market data');
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram');
+      logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
+      return null;
+    } finally {
+      setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
     }
   },
 
   /**
-   * sendStartupSummary:
-   * - single summary block: counts per root TF and vertical list of all signal symbol names (one per line)
-   * - then per-signal detailed blocks (no alphabetical labels)
-   * - then recommended block
+   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
    */
-  async sendStartupSummary({ snapshot = [] } = {}) {
-    if (!bot) return;
-    try {
-      const db = dbModule.get();
-
-      let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals.length && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-        signals = dbModule.getLatestSignalsSnapshot() || [];
-      }
-
-      if (!signals.length) {
-        try {
-          const poller = require('./poller');
-          try { await poller.initialScan(); } catch (e) { logger.debug({ e }, 'sendStartupSummary: initialScan failed (continuing)'); }
-          try { if (typeof poller.scanAllForStartup === 'function') await poller.scanAllForStartup(); else if (typeof poller.scanOnce === 'function') await poller.scanOnce({ notifyNewSignals: false }); } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed (continuing)'); }
-        } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: could not require poller (continuing)');
-        }
-
-        const waitMs = Number(config.STARTUP_SUMMARY_WAIT_MS || 15000);
-        const retryMs = Number(config.STARTUP_SUMMARY_RETRY_MS || 500);
-        const start = Date.now();
-        while (Date.now() - start < waitMs) {
-          try {
-            signals = dbModule.getLatestSignalsSnapshot() || [];
-          } catch (e) {
-            logger.debug({ e }, 'sendStartupSummary: error fetching snapshot while waiting');
-            signals = [];
-          }
-          if (signals && signals.length) break;
-          await this._sleep(retryMs);
-        }
-      }
-
-      // Build counts per root_tf
-      const tfCounts = {};
-      const symbolSet = new Set();
-      for (const s of signals) {
-        const tf = String(s.root_tf || 'unknown');
-        tfCounts[tf] = (tfCounts[tf] || 0) + 1;
-        if (s.symbol) symbolSet.add(s.symbol);
-      }
-
-      const orderedRootTfs = Array.isArray(config.ROOT_TFS) && config.ROOT_TFS.length
-        ? config.ROOT_TFS.map(String)
-        : Object.keys(tfCounts);
-      for (const tf of Object.keys(tfCounts)) {
-        if (!orderedRootTfs.includes(tf)) orderedRootTfs.push(tf);
-      }
-
-      const summaryParts = orderedRootTfs.map(tf => `${tf}: ${tfCounts[tf] || 0}`);
-
-      // vertical symbol list (one symbol per line)
-      const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
-      const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
-
-      const header = `Startup root TF summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, header);
-
-      // Per-signal detail blocks (no alphabetical labels)
-      signals.sort((a, b) => {
-        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
-        if (s !== 0) return s;
-        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
-      });
-
-      for (let i = 0; i < signals.length; i++) {
-        try {
-          await this.sendNewSignalSingleBlock(signals[i], null);
-        } catch (e) {
-          logger.debug({ e, i }, 'sendStartupSummary: failed to send per-signal detail block');
-        }
-        await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-      }
-
-      // Recommended header and short labeled lines
-      let openCount = 0;
+  async evaluateMtfAlignment(symbol) {
+    const result = {};
+    for (const tf of config.MTF_TFS) {
       try {
-        const row = db.prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
-        openCount = row ? Number(row.cnt || 0) : 0;
-      } catch (e) {
-        logger.debug({ e }, 'sendStartupSummary: failed to read open trades count (assuming 0)');
-        openCount = 0;
-      }
-      const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
-      const recHeader = `Recommended to open (slots: ${maxSlots}):`;
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
-
-      const candidates = signals
-        .map(s => ({
-          symbol: s.symbol,
-          root_tf: s.root_tf,
-          tvScore: s.meta?.tvScore || 0,
-          mtfScore: s.meta?.mtfScore || 0,
-          acceptDecision: s.meta?.decision || 'monitor',
-          reason: s.meta?.acceptReason || 'n/a',
-          raw: s
-        }))
-        .filter(c => c.acceptDecision === 'accept')
-        .sort((a, b) => {
-          if (b.tvScore !== a.tvScore) return b.tvScore - a.tvScore;
-          return b.mtfScore - a.mtfScore;
-        });
-
-      const recommended = candidates.slice(0, maxSlots);
-
-      if (recommended.length === 0) {
-        await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals');
-      } else {
-        for (let i = 0; i < recommended.length; i++) {
-          const r = recommended[i];
-          const label = this.getLabel(i, { lowercase: true });
-          const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${(r.tvScore * 100).toFixed(0)}% MTF:${(r.mtfScore * 100).toFixed(0)}% - ${r.reason}${config.OPENTRADE ? '' : ' (SIMULATED)'}`;
-          await bot.sendMessage(config.TELEGRAM_CHAT_ID, line);
-          await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+        const hist = await macd.computeMacdHistogram(symbol, tf);
+        if (!hist || hist.length === 0) {
+          result[tf] = { ok: false, positive: false };
+          continue;
         }
+        const last = hist[hist.length - 1];
+        const prev = hist[hist.length - 2] || last;
+        result[tf] = {
+          histogram: last.histogram,
+          macd: last.MACD,
+          signal: last.signal,
+          rising: last.histogram > prev.histogram,
+          positive: last.histogram > 0,
+          ok: true
+        };
+      } catch (err) {
+        logger.debug({ err, symbol, tf }, 'evaluateMtfAlignment error for timeframe');
+        result[tf] = { ok: false, positive: false };
       }
+    }
+    return result;
+  },
 
-      logger.info('Startup telegram summary sent (counts summary + vertical symbol list + per-signal blocks + recommended)');
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send startup telegram summary');
+  /**
+   * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
+   */
+  async applyDecision(alignment) {
+    const tfList = Object.keys(alignment);
+    if (!tfList || tfList.length === 0) {
+      return { decision: 'reject', reason: 'no_mtf_data' };
+    }
+
+    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    if (allPositive) return { decision: 'accept', reason: 'all_positive' };
+
+    const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
+    if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
+      const d = alignment['D'];
+      if (d && d.rising) return { decision: 'accept', reason: 'daily_rising' };
+      return { decision: 'monitor', reason: 'daily_not_rising' };
+    }
+
+    if (negatives.length >= 1) {
+      return { decision: 'monitor', reason: 'some_negative' };
+    }
+
+    return { decision: 'reject', reason: 'unknown' };
+  },
+
+  /**
+   * sendStartupSummary: builds a snapshot of latest root signals and sends initial telegram message
+   */
+  async sendStartupSummary() {
+    try {
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
+      const telegramSvc = require('./telegram');
+
+      await telegramSvc.sendStartupSummary({ snapshot });
+    } catch (e) {
+      logger.debug({ e }, 'sendStartupSummary failed');
     }
   },
 
-  async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
-    if (!bot) return;
+  /**
+   * handleNewRootCandle: Called when new root candle opens
+   */
+  async handleNewRootCandle(newRootTfs = []) {
     try {
-      let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-        signals = dbModule.getLatestSignalsSnapshot() || [];
-      }
-
-      const filtered = (newRootTfs && newRootTfs.length)
-        ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
-        : signals;
-
-      await this.sendStartupSummary({ snapshot: filtered });
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send root candle update');
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
+      const telegramSvc = require('./telegram');
+      await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
+    } catch (e) {
+      logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
     }
   }
 };
