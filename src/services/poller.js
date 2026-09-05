@@ -6,11 +6,13 @@ const logger = require('pino')();
 const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
+const tradeManager = require('./tradeManager');
 
 const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
+let lastRootCandleState = {}; // Track last root candle to prevent duplicate flips
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
@@ -39,6 +41,14 @@ module.exports = {
         logger.info('poller: starting initialScan');
         await this.initialScan();
         logger.info('poller: initialScan completed');
+        
+        // Full silent startup scan
+        try {
+          await this.scanAllForStartup();
+          logger.info('poller: startup full scan completed');
+        } catch (err) {
+          logger.error({ err }, 'poller: scanAllForStartup error');
+        }
       } catch (err) {
         logger.error({ err }, 'poller: initialScan failed');
       }
@@ -109,7 +119,7 @@ module.exports = {
     const now = Date.now();
     const insertMany = db.transaction((rows) => {
       for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT(\.P)?$/i, ''), s.quote || 'USDT', now);
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT[Pp]?$/i, ''), s.quote || 'USDT', now);
       }
     });
     insertMany(allSymbols.filter(s => s && s.symbol));
@@ -155,16 +165,10 @@ module.exports = {
     logger.info('backgroundSeedKlines: completed');
   },
 
-  /**
-   * seedKlinesForSymbol:
-   * - If timeframe is provided, seed that timeframe PLUS the MTF timeframes so alignment is available.
-   * - If timeframe is not provided, seed ROOT_TFS plus MTF_TFS (unique).
-   */
   async seedKlinesForSymbol(symbol, timeframe = null) {
     try {
       const rootTfs = timeframe ? [String(timeframe)] : (config.ROOT_TFS || []);
       const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
-      // Combine uniq: seed requested root(s) and all MTFs so computeMacdHistogram for MTFs won't be missing.
       const tfsSet = new Set([...(rootTfs || []), ...(mtfTfs || [])]);
       const tfs = Array.from(tfsSet);
 
@@ -187,7 +191,6 @@ module.exports = {
           insertMany(klines);
           logger.debug({ symbol, tf, count: klines.length }, 'seedKlinesForSymbol: klines persisted');
 
-          // Warm MACD if possible. Try computeAndStoreMacd then fallback to computeMacdHistogram.
           try {
             if (typeof macdUtil.computeAndStoreMacd === 'function') {
               await macdUtil.computeAndStoreMacd(symbol, tf);
@@ -206,10 +209,6 @@ module.exports = {
     }
   },
 
-  /**
-   * scanOnce:
-   * - options.notifyNewSignals controls whether to send per-signal telegram messages for newly detected signals.
-   */
   async scanOnce({ notifyNewSignals = true } = {}) {
     try {
       const db = dbModule;
@@ -240,7 +239,7 @@ module.exports = {
           for (let i = 0; i < newSignals.length; i++) {
             const s = newSignals[i];
             try {
-              await telegram.sendNewSignalSingleBlock(s); // midcandle behavior: detail block (no label)
+              await telegram.sendNewSignalSingleBlock(s);
             } catch (e) {
               logger.debug({ e, s }, 'scanOnce: failed to send new-signal message');
             }
@@ -264,12 +263,6 @@ module.exports = {
     }
   },
 
-  /**
-   * scanAllForStartup:
-   * - Ensures there's a full quiet pass over all symbols at startup to populate signals DB.
-   * - This method is intentionally silent (no Telegram per-signal notifications).
-   * - index.js expects poller.scanAllForStartup to exist.
-   */
   async scanAllForStartup() {
     try {
       logger.info('scanAllForStartup: starting full startup pass (silent)');
@@ -290,10 +283,6 @@ module.exports = {
     }
   },
 
-  /**
-   * scanSymbolRoots:
-   * - For each configured root TF, ensure klines exist. If a seed was required we now re-query and attempt flip detection.
-   */
   async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
@@ -303,11 +292,9 @@ module.exports = {
         const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2');
         let rows = selectStmt.all(symbol, tf);
         if (!rows || rows.length < 2) {
-          // Seed missing klines (sync) and then re-check immediately
           logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now (will also seed MTF TFs)');
           await this.seedKlinesForSymbol(symbol, tf);
 
-          // Re-query after seed
           rows = selectStmt.all(symbol, tf);
           if (!rows || rows.length < 2) {
             logger.debug({ symbol, tf }, 'scanSymbolRoots: still insufficient klines after seeding, skipping tf for now');
@@ -316,6 +303,17 @@ module.exports = {
             logger.info({ symbol, tf }, 'scanSymbolRoots: klines seeded and available, re-checking flip');
           }
         }
+
+        // Track last root candle open_time to prevent duplicate flip detections
+        const stateKey = `${symbol}:${tf}`;
+        const latestCandleTime = rows[rows.length - 1].open_time; // oldest in DESC = latest candle
+        
+        if (lastRootCandleState[stateKey] === latestCandleTime) {
+          logger.debug({ symbol, tf, candleTime: latestCandleTime }, 'scanSymbolRoots: already processed this candle, skipping flip detection');
+          continue;
+        }
+        
+        lastRootCandleState[stateKey] = latestCandleTime;
 
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
@@ -353,7 +351,7 @@ module.exports = {
       logger.info({ wait }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
       setTimeout(async () => {
         try {
-          // Run silent scanOnce so signals are persisted but individual per-signal messages are suppressed.
+          // Run silent scanOnce
           await this.scanOnce({ notifyNewSignals: false });
 
           const now = new Date();
@@ -368,6 +366,23 @@ module.exports = {
               if (!isNaN(tfNum)) {
                 const minutesSinceEpoch = Math.floor(now.getTime() / 60000);
                 if (minutesSinceEpoch % tfNum === 0) newRootTfs.push(String(tf));
+              }
+            }
+          }
+
+          // Close least profitable trade if enabled and max trades filled
+          if (config.CLOSE_LEAST_PROFITABLE_ENABLED && newRootTfs.length > 0) {
+            const openCount = dbModule.get().prepare('SELECT COUNT(*) as c FROM trades WHERE status = ?').get('open').c || 0;
+            if (openCount >= config.MAX_OPEN_TRADES) {
+              const minutesSinceHour = new Date().getUTCMinutes();
+              const closeMins = config.CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY || 5;
+              if (minutesSinceHour >= (60 - closeMins)) {
+                logger.info({ openCount, closeMins }, 'Closing least profitable trade before boundary');
+                try {
+                  await tradeManager.closeLeastProfitableTrade();
+                } catch (err) {
+                  logger.error({ err }, 'Error closing least profitable trade');
+                }
               }
             }
           }
