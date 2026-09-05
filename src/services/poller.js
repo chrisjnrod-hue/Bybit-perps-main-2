@@ -11,7 +11,10 @@ const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
-function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms || 0)); }
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms || 0));
+}
 
 module.exports = {
   start() {
@@ -43,6 +46,7 @@ module.exports = {
 
     if (config.ROOT_MIDSCAN_INTERVAL && Number(config.ROOT_MIDSCAN_INTERVAL) > 0) {
       setInterval(() => this.scanOnce(), Number(config.ROOT_MIDSCAN_INTERVAL) * 1000);
+
       const msToNext5 = () => {
         const d = new Date();
         const m = d.getUTCMinutes();
@@ -66,6 +70,7 @@ module.exports = {
 
   async initialScan() {
     logger.info('poller.initialScan: starting');
+
     let allSymbols = [];
     const useWs = !!config.USE_WS;
 
@@ -179,43 +184,9 @@ module.exports = {
   },
 
   /**
-   * scanAllForStartup:
-   * - Iterates every symbol fetched from the DB and checks all ROOT_TFS
-   * - Ensures seeding & MACD compute happen when needed, then runs flip detection for each tf
-   * - Persists detected signals (notifyImmediately=false) so the summary routine can read them
+   * scanOnce:
+   * - options.notifyNewSignals controls whether to send per-signal telegram messages for newly detected signals.
    */
-  async scanAllForStartup() {
-    try {
-      const db = dbModule.get();
-      const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      if (!rows || rows.length === 0) {
-        logger.info('scanAllForStartup: no symbols to process');
-        return;
-      }
-
-      const scanStart = Date.now();
-      for (const r of rows) {
-        try {
-          // For each symbol, ensure each root tf is evaluated and persisted if flip found
-          await this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart });
-        } catch (e) {
-          logger.debug({ e, symbol: r.symbol }, 'scanAllForStartup: error processing symbol (continuing)');
-        }
-      }
-
-      // persist last scan metadata
-      try {
-        db.setState('lastStartupScanAt', scanStart);
-      } catch (e) {
-        logger.debug({ e }, 'scanAllForStartup: failed to persist lastStartupScanAt');
-      }
-
-      logger.info({ count: rows.length }, 'scanAllForStartup: completed full symbol flip pass');
-    } catch (err) {
-      logger.error({ err }, 'scanAllForStartup: unexpected error');
-    }
-  },
-
   async scanOnce({ notifyNewSignals = true } = {}) {
     try {
       const db = dbModule;
@@ -246,7 +217,7 @@ module.exports = {
           for (let i = 0; i < newSignals.length; i++) {
             const s = newSignals[i];
             try {
-              await telegram.sendNewSignalSingleBlock(s);
+              await telegram.sendNewSignalSingleBlock(s); // midcandle behavior: detail block (no label)
             } catch (e) {
               logger.debug({ e, s }, 'scanOnce: failed to send new-signal message');
             }
@@ -276,20 +247,11 @@ module.exports = {
     for (const tf of tfList) {
       try {
         const db = dbModule.get();
-        let rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
-
+        const rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
         if (!rows || rows.length < 2) {
-          logger.debug({ symbol, tf }, 'scanSymbolRoots: missing klines, seeding now');
           await this.seedKlinesForSymbol(symbol, tf);
-          try { await macdUtil.computeAndStoreMacd(symbol, tf); } catch (e) { logger.debug({ e, symbol, tf }, 'computeAndStoreMacd failed after seeding'); }
-          rows = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2').all(symbol, tf);
-        }
-
-        if (!rows || rows.length < 2) {
-          logger.debug({ symbol, tf }, 'scanSymbolRoots: klines still missing after seeding, skipping tf');
           continue;
         }
-
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
           const sig = await signalManager.handleRootSignal({
@@ -326,8 +288,8 @@ module.exports = {
       logger.info({ wait }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
       setTimeout(async () => {
         try {
-          // Run silent full pass so signals are persisted but individual per-signal messages are suppressed.
-          await this.scanAllForStartup();
+          // Run silent scanOnce so signals are persisted but individual per-signal messages are suppressed.
+          await this.scanOnce({ notifyNewSignals: false });
 
           const now = new Date();
           const minute = now.getUTCMinutes();
