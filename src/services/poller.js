@@ -56,18 +56,6 @@ module.exports = {
         logger.info('🌱 poller: starting initialScan');
         logger.info('═══════════════════════════════════════════════');
         await this.initialScan();
-
-        // Immediately run a scanOnce after initialScan completes so signals are detected early
-        logger.info('═══════════════════════════════════════════════');
-        logger.info('🌱 poller: initialScan complete, running immediate scanOnce to detect signals');
-        logger.info('═══════════════════════════════════════════════');
-        try {
-          await this.scanOnce();
-          logger.info('✅ poller: immediate scanOnce completed');
-        } catch (e) {
-          logger.debug({ e }, 'poller: immediate scanOnce failed (continuing)');
-        }
-
         logger.info('═══════════════════════════════════════════════');
         logger.info('✅ poller: initialScan completed - SEEDING NOW COMPLETE');
         logger.info('═══════════════════════════════════════════════');
@@ -302,7 +290,7 @@ module.exports = {
         const telegram = require('./telegram');
         for (const s of newSignals) {
           try {
-            await telegram.sendNewSignalSingleBlock ? telegram.sendNewSignalSingleBlock(s) : telegram.sendRootSignalBlock ? telegram.sendRootSignalBlock(s) : telegram.sendNewSignalSingleBlock(s);
+            await telegram.sendNewSignalSingleBlock(s);
           } catch (e) {
             logger.debug({ e, s }, 'scanOnce: failed to send new-signal message');
           }
