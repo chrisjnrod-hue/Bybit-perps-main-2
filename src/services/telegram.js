@@ -124,7 +124,6 @@ module.exports = {
     }
   },
 
-  // Accept tvScorePct as optional param (prefer it when formatting)
   async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvScorePct = null, tvSource = 'error', mtfScore = 0 }) {
     if (!bot) return;
     const timeStr = new Date(detected_at).toISOString();
@@ -173,6 +172,9 @@ module.exports = {
    * - Summary header with counts per root TF + vertical symbol list
    * - Per-signal detailed blocks (no alphabetical labels)
    * - Recommended block with highest-scoring signals
+   *
+   * This version is defensive: it will still show recommended lines even when no signals have decision === 'accept'
+   * by falling back to top non-rejected signals.
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -184,37 +186,34 @@ module.exports = {
         signals = dbModule.getLatestSignalsSnapshot() || [];
       }
 
-      if (!signals.length) {
+      // If still empty, try reading signals table as fallback
+      if (!Array.isArray(signals) || signals.length === 0) {
         try {
-          const poller = require('./poller');
-          try { await poller.initialScan(); } catch (e) { logger.debug({ e }, 'sendStartupSummary: initialScan failed'); }
-          try { 
-            if (typeof poller.scanAllForStartup === 'function') {
-              await poller.scanAllForStartup();
-            } else if (typeof poller.scanOnce === 'function') {
-              await poller.scanOnce({ notifyNewSignals: false });
+          if (db && db.prepare) {
+            const rows = db.prepare('SELECT key, symbol, root_tf, detected_at, state, meta FROM signals ORDER BY detected_at DESC LIMIT ?').all(500);
+            if (rows && rows.length) {
+              signals = rows.map(r => {
+                let meta = r.meta;
+                if (typeof meta === 'string') {
+                  try { meta = JSON.parse(meta); } catch (e) { /* keep as string */ }
+                }
+                return {
+                  key: r.key,
+                  symbol: r.symbol,
+                  root_tf: r.root_tf,
+                  detected_at: r.detected_at,
+                  state: r.state,
+                  meta
+                };
+              });
             }
-          } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed'); }
-        } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: could not require poller');
-        }
-
-        const waitMs = Number(config.STARTUP_SUMMARY_WAIT_MS || 15000);
-        const retryMs = Number(config.STARTUP_SUMMARY_RETRY_MS || 500);
-        const start = Date.now();
-        while (Date.now() - start < waitMs) {
-          try {
-            signals = dbModule.getLatestSignalsSnapshot() || [];
-          } catch (e) {
-            logger.debug({ e }, 'sendStartupSummary: error fetching snapshot');
-            signals = [];
           }
-          if (signals && signals.length) break;
-          await this._sleep(retryMs);
+        } catch (e) {
+          logger.debug({ e }, 'sendStartupSummary: fallback DB read failed');
         }
       }
 
-      // Build counts per root_tf
+      // Build counts per root_tf and symbol set
       const tfCounts = {};
       const symbolSet = new Set();
       for (const s of signals) {
@@ -271,26 +270,43 @@ module.exports = {
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      const candidates = signals
-        .map(s => ({
+      // Build normalized candidate objects defensively
+      const normalizedCandidates = signals.map(s => {
+        const meta = s.meta || {};
+        // Accept various possible shapes for the decision
+        const dec = (meta && meta.decision) || (meta && meta.accept && meta.accept.decision) || (meta && meta.acceptDecision) || 'monitor';
+        const tvPct = (typeof meta.tvScorePct === 'number') ? meta.tvScorePct : (typeof meta.tvScore === 'number' ? Math.round(meta.tvScore * 100) : 0);
+        const mtf = (typeof meta.mtfScore === 'number') ? meta.mtfScore : 0;
+        return {
+          key: s.key,
           symbol: s.symbol,
           root_tf: s.root_tf,
-          // prefer explicit percent if available
-          tvScorePct: s.meta?.tvScorePct ?? (typeof s.meta?.tvScore === 'number' ? Math.round(s.meta.tvScore * 100) : 0),
-          mtfScore: s.meta?.mtfScore || 0,
-          acceptDecision: s.meta?.decision || 'monitor',
-          reason: s.meta?.acceptReason || 'n/a',
+          tvScorePct: tvPct,
+          mtfScore: mtf,
+          acceptDecision: String(dec),
+          reason: meta?.acceptReason || meta?.reason || 'n/a',
           raw: s
-        }))
-        .filter(c => c.acceptDecision === 'accept')
-        .sort((a, b) => {
-          if (b.tvScorePct !== a.tvScorePct) return b.tvScorePct - a.tvScorePct;
-          return b.mtfScore - a.mtfScore;
-        });
+        };
+      });
+
+      // First try explicitly accepted signals
+      let candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() === 'accept');
+
+      // If none accepted, fall back to top non-rejected signals (so we still show recommended lines)
+      if (candidates.length === 0) {
+        candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() !== 'reject');
+      }
+
+      // Sort candidates by tvScorePct desc then mtfScore desc
+      candidates.sort((a, b) => {
+        if (b.tvScorePct !== a.tvScorePct) return b.tvScorePct - a.tvScorePct;
+        return b.mtfScore - a.mtfScore;
+      });
 
       const recommended = candidates.slice(0, maxSlots);
 
-      if (recommended.length === 0) {
+      if (!recommended || recommended.length === 0) {
+        // If there truly are no candidates (e.g., no signals), still send the default note
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
       } else {
         for (let i = 0; i < recommended.length; i++) {
