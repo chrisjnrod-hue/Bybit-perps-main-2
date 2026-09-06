@@ -1,3 +1,18 @@
+/**
+ * src/services/signalManager.js
+ *
+ * Responsibilities:
+ * - Orchestrates per-symbol "root" signals (market data, TV rating, MTF alignment, decision)
+ * - Persists a signal snapshot to DB (via dbModule.insertSignal)
+ * - Sends Telegram blocks immediately (or returns the signal object)
+ * - Computes a fallback TV-like score when TradingView is unavailable
+ *
+ * Notes:
+ * - Expects tradingview.getOrFetchTvRatingCached() to return { score, score_pct, source, exchange }
+ * - Expects tradingview.fallbackScore({ macdPositiveFraction, volChangePct }) to return { score, score_pct }
+ * - Normalizes marketData into a compact predictable object for renderers
+ */
+
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -27,8 +42,8 @@ module.exports = {
   /**
    * handleRootSignal:
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
-   * - returns the persisted signal object
-   * - ALWAYS fetches fresh market data and TV rating for complete signal block
+   * - returns the persisted signal object (or null on error)
+   * - ALWAYS attempts to fetch fresh market data and TV rating for complete signal block
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
@@ -37,10 +52,11 @@ module.exports = {
       return null;
     }
     inProgress.set(key, true);
+
     try {
       logger.info({ symbol, root_tf }, 'Root signal received');
 
-      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
+      // 1) ALWAYS fetch fresh market data (best-effort)
       let mdata = null;
       try {
         mdata = await marketData.updateSymbolMarketData(symbol);
@@ -52,7 +68,7 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
-      // Normalize market data to consistent keys (both snake_case and camelCase) so renderers can pick what they expect
+      // Normalize market data to consistent keys (both snake_case and camelCase)
       const normalizedMdata = (function(md) {
         const price = Number(md?.price ?? md?.last_price ?? md?.last ?? md?.close ?? 0) || 0;
         const vol24 =
@@ -79,7 +95,7 @@ module.exports = {
         };
       })(mdata);
 
-      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
+      // 2) FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
       let tv = { score: 0, score_pct: 0, source: 'error' };
       try {
         logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
@@ -100,19 +116,38 @@ module.exports = {
         tv = { score: 0, score_pct: 0, source: 'error' };
       }
 
-      // Subscribe to MTF websockets (for alignment updates)
-      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
+      // 3) Subscribe to MTF websockets (for alignment updates)
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { logger.debug({ e }, 'subscribeSymbolMTF failed (non-fatal)'); }
 
-      // Evaluate MTF alignment
+      // 4) Evaluate MTF alignment (MACD histograms)
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
       const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-      // Apply decision rules
+      // 5) Compute TV fallback if TradingView was unavailable or returned zero
+      // Use MACD alignment (mtfScore) and volume change (normalizedMdata.volume_change_pct) to compute a fallback
+      if ((tv.source && String(tv.source).toLowerCase().startsWith('fallback')) || tv.score === 0) {
+        try {
+          const macdPositiveFraction = mtfScore || 0;
+          const volChangePct = (typeof normalizedMdata.volume_change_pct === 'number') ? normalizedMdata.volume_change_pct : 0;
+          const fb = tradingview.fallbackScore
+            ? tradingview.fallbackScore({ macdPositiveFraction, volChangePct })
+            : (typeof tradingview.fallbackScore === 'function' ? tradingview.fallbackScore({ macdPositiveFraction, volChangePct }) : null);
+
+          if (fb && typeof fb.score === 'number') {
+            logger.info({ symbol, computedFallbackScore: fb.score, computedFallbackPct: fb.score_pct }, 'Computed fallback TV-like score from MACD/volume');
+            tv = { score: fb.score, score_pct: (typeof fb.score_pct === 'number' ? fb.score_pct : Math.round((fb.score || 0) * 100)), source: 'fallback_computed' };
+          }
+        } catch (e) {
+          logger.debug({ e, symbol }, 'Failed to compute fallback TV score (continuing with original tv object)');
+        }
+      }
+
+      // 6) Apply decision rules based on alignment
       const accept = await this.applyDecision(alignment);
 
-      // Compose meta and persist signal to DB
+      // 7) Compose meta and persist signal to DB
       const meta = {
         tvScore: tv.score || 0,            // raw 0..1
         tvScorePct: tv.score_pct || 0,     // integer 0..100 - preferred for display
@@ -124,8 +159,30 @@ module.exports = {
         marketData: normalizedMdata
       };
 
-      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+      try {
+        if (typeof dbModule.insertSignal === 'function') {
+          dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+        } else {
+          // best-effort fallback if DB API differs
+          const db = dbModule.get && dbModule.get();
+          if (db && db.prepare && db.run) {
+            // try to persist minimal row (guarded)
+            try {
+              db.prepare('INSERT OR REPLACE INTO signals (key, symbol, root_tf, detected_at, state, meta) VALUES (?, ?, ?, ?, ?, ?)').run(
+                `${symbol}:${root_tf}`, symbol, root_tf, detected_at, 'detected', JSON.stringify(meta)
+              );
+            } catch (e) {
+              logger.debug({ e }, 'insertSignal fallback insert failed (non-fatal)');
+            }
+          } else {
+            logger.debug('dbModule.insertSignal not available; skipping persistence');
+          }
+        }
+      } catch (e) {
+        logger.debug({ e, symbol, root_tf }, 'Failed to persist signal (non-fatal)');
+      }
 
+      // Build the signal object we will return / notify with
       const signalObj = {
         key,
         symbol,
@@ -135,9 +192,10 @@ module.exports = {
         meta
       };
 
+      // 8) Send Telegram block immediately if requested
       if (notifyImmediately) {
-        // send telegram block immediately with all metrics
         try {
+          // Pass explicit tvScorePct to the telegram sender (preferred)
           await telegram.sendRootSignalBlock({
             symbol,
             root_tf,
@@ -145,7 +203,7 @@ module.exports = {
             detected_at,
             accept,
             marketData: normalizedMdata,
-            tvScoreRaw: tv.score || 0,
+            tvScore: tv.score || 0,
             tvScorePct: tv.score_pct || 0,
             tvSource: tv.source || 'error',
             mtfScore
@@ -159,7 +217,7 @@ module.exports = {
         return signalObj;
       }
 
-      // Only when decision is 'accept' do we attempt to open a trade
+      // 9) Open trade if decision accepted and configured
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
           logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
@@ -168,18 +226,21 @@ module.exports = {
         } else {
           // Apply market-level filters
           let passFilters = true;
+
           if (config.MIN_MARKET_CAP > 0) {
             if (!normalizedMdata || !normalizedMdata.market_cap || Number(normalizedMdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
               logger.info({ symbol, market_cap: normalizedMdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
+
           if (config.MIN_24H_USDT_VOLUME > 0) {
             if (!normalizedMdata || !normalizedMdata.volume_24h_usdt || Number(normalizedMdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
               logger.info({ symbol, volume_24h_usdt: normalizedMdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
+
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
             const change = normalizedMdata?.volume_change_pct;
             if (change === null || change === undefined) {
@@ -213,12 +274,14 @@ module.exports = {
       logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
       return null;
     } finally {
+      // Keep in-progress lock for a while to avoid duplicate rapid reprocessing
       setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
     }
   },
 
   /**
    * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
+   * Example result: { '5': { histogram, MACD, signal, rising, positive, ok }, '15': {...} }
    */
   async evaluateMtfAlignment(symbol) {
     const result = {};
@@ -249,6 +312,10 @@ module.exports = {
 
   /**
    * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
    */
   async applyDecision(alignment) {
     const tfList = Object.keys(alignment);
@@ -279,7 +346,7 @@ module.exports = {
   async sendStartupSummary() {
     try {
       const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
+      const snapshot = db.getLatestSignalsSnapshot ? db.getLatestSignalsSnapshot() : [];
       const telegramSvc = require('./telegram');
 
       await telegramSvc.sendStartupSummary({ snapshot });
@@ -294,7 +361,7 @@ module.exports = {
   async handleNewRootCandle(newRootTfs = []) {
     try {
       const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
+      const snapshot = db.getLatestSignalsSnapshot ? db.getLatestSignalsSnapshot() : [];
       const telegramSvc = require('./telegram');
       await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
     } catch (e) {
