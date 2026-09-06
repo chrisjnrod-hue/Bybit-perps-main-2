@@ -14,18 +14,17 @@ function sleep(ms) {
  * - Longer timeout (12 seconds instead of 8)
  * - Retries with exponential backoff
  * - Falls back to zero score if all retries exhausted
+ *
+ * Returns:
+ *  { source, score } where score is raw 0..1
+ *  { score_pct } integer 0..100 (easy for renderers)
  */
 async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
   if (!symbol) {
     logger.warn('fetchTvRatingForSymbol: symbol is empty');
-    return { source: 'error', score: 0 };
+    return { source: 'error', score: 0, score_pct: 0 };
   }
 
-  // Try more exchanges to increase hit rate
-  const allExchanges = [
-    'BYBIT', 'BINANCE',
-  ];
-  
   const exchangeCandidates = (process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE,KUCOIN')
     .split(',')
     .map(s => s.trim())
@@ -79,8 +78,11 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
             score = Math.max(0, Math.min(1, (recommend - 1) / 4));
           }
           
-          logger.info({ symbol, ticker, recommend, score, attempt, exchange: ex }, '✅ TV rating fetched successfully');
-          return { source: 'tradingview', score: Math.round(score * 100) / 100, raw: row.d, exchange: ex };
+          // Keep raw 0..1 score and add explicit percent for consumers
+          const scorePct = Math.round(score * 100);
+          
+          logger.info({ symbol, ticker, recommend, score, scorePct, attempt, exchange: ex }, '✅ TV rating fetched successfully');
+          return { source: 'tradingview', score, score_pct: scorePct, raw: row.d, exchange: ex };
         }
       } catch (err) {
         const errorType = err.name === 'AbortError' ? 'timeout' : 'network';
@@ -98,7 +100,7 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
   }
 
   logger.warn({ symbol, attempts: maxRetries, exchanges: exchangeCandidates }, '⚠️ TV rating unavailable after all retries, using fallback score of 0');
-  return { source: 'fallback', score: 0, raw: null };
+  return { source: 'fallback', score: 0, score_pct: 0, raw: null };
 }
 
 /**
@@ -107,9 +109,11 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
  * - If fresh cache exists, returns it immediately
  * - Otherwise fetches fresh from TV API and caches result
  * - Graceful fallback if DB unavailable
+ *
+ * Returns object with { score (0..1), score_pct (0..100), source, exchange, cached }
  */
 async function getOrFetchTvRatingCached(symbol) {
-  if (!symbol) return { source: 'error', score: 0 };
+  if (!symbol) return { source: 'error', score: 0, score_pct: 0 };
 
   try {
     const db = dbModule.get();
@@ -131,7 +135,7 @@ async function getOrFetchTvRatingCached(symbol) {
       logger.debug({ err }, 'tv_ratings table creation/check failed (continuing without cache)');
     }
 
-    // Check cache (within 2 hours = 7200000 ms, increased from 1 hour)
+    // Check cache (within 2 hours = 7200000 ms)
     const cached = db.prepare(`
       SELECT score, source, exchange, updated_at 
       FROM tv_ratings 
@@ -140,8 +144,10 @@ async function getOrFetchTvRatingCached(symbol) {
     
     if (cached) {
       const ageMinutes = Math.round((Date.now() - cached.updated_at) / 60000);
-      logger.info({ symbol, source: cached.source, score: cached.score, ageMinutes }, '⏱️ TV rating retrieved from cache');
-      return { source: 'cache', score: cached.score, exchange: cached.exchange, cached: true };
+      const rawScore = Number(cached.score) || 0;
+      const scorePct = Math.round(rawScore * 100);
+      logger.info({ symbol, source: cached.source, score: rawScore, scorePct, ageMinutes }, '⏱️ TV rating retrieved from cache');
+      return { source: 'cache', score: rawScore, score_pct: scorePct, exchange: cached.exchange, cached: true };
     }
   } catch (err) {
     logger.debug({ err: err && err.message, symbol }, 'Cache check failed (will fetch fresh)');
@@ -151,7 +157,7 @@ async function getOrFetchTvRatingCached(symbol) {
   logger.debug({ symbol }, 'Fetching fresh TV rating from API');
   const fresh = await fetchTvRatingForSymbol(symbol);
 
-  // Try to cache result
+  // Try to cache result (store raw 0..1 score)
   try {
     const db = dbModule.get();
     if (db) {
@@ -166,7 +172,14 @@ async function getOrFetchTvRatingCached(symbol) {
     logger.debug({ err: err && err.message, symbol }, 'Failed to cache TV rating (continuing)');
   }
 
-  return fresh;
+  // Ensure returned object always has score_pct
+  return {
+    source: fresh.source || 'unknown',
+    score: typeof fresh.score === 'number' ? fresh.score : 0,
+    score_pct: typeof fresh.score_pct === 'number' ? fresh.score_pct : Math.round((fresh.score || 0) * 100),
+    exchange: fresh.exchange || null,
+    raw: fresh.raw || null
+  };
 }
 
 /**
@@ -179,17 +192,16 @@ function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) 
   try {
     const volNorm = Math.max(0, Math.min(1, (volChangePct + 100) / 200));
     const score = Math.max(0, Math.min(1, 0.6 * macdPositiveFraction + 0.4 * volNorm));
-    return Math.round(score * 100) / 100;
+    const pct = Math.round(score * 100);
+    return { score: Math.round(score * 100) / 100, score_pct: pct };
   } catch (err) {
     logger.debug({ err }, 'fallbackScore calculation error');
-    return 0;
+    return { score: 0, score_pct: 0 };
   }
 }
 
 /**
  * clearOldTvRatingCache(olderThanHours)
- * - Cleans up TV ratings cache older than specified hours
- * - Useful to run periodically to keep DB size reasonable
  */
 function clearOldTvRatingCache(olderThanHours = 24) {
   try {
@@ -210,8 +222,6 @@ function clearOldTvRatingCache(olderThanHours = 24) {
 
 /**
  * testTvApi(symbol)
- * - Test function to debug TV API connectivity
- * - Returns detailed diagnostics
  */
 async function testTvApi(symbol = 'BTCUSDT') {
   logger.info({ symbol }, '🧪 Testing TV API connectivity...');
@@ -244,12 +254,14 @@ async function testTvApi(symbol = 'BTCUSDT') {
       if (res.ok) {
         const json = await res.json();
         const data = json?.data?.[0]?.d?.[0];
+        const rawScore = (typeof data === 'number') ? Math.max(0, Math.min(1, (data - 1) / 4)) : null;
         results.push({
           exchange: ex,
           ticker,
           status: '✅ OK',
           response_time_ms: elapsed,
-          score: data ? Math.round(((data - 1) / 4) * 100) / 100 : 'N/A'
+          score: rawScore !== null ? Math.round(rawScore * 100) / 100 : 'N/A',
+          score_pct: rawScore !== null ? Math.round(rawScore * 100) : 'N/A'
         });
       } else {
         results.push({
