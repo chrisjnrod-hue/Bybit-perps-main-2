@@ -25,14 +25,13 @@ module.exports = {
         };
       }
 
-      // Fetch previous persisted market_data (for computing volume change if needed)
-      let prevRow = null;
+      // Read previously persisted current row (if any) to compute change and fallback market cap
+      let prevCurrentRow = null;
       try {
         const db = dbModule.get();
-        prevRow = db.prepare('SELECT price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data WHERE symbol = ?').get(symbol);
+        prevCurrentRow = db.prepare('SELECT price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data WHERE symbol = ?').get(symbol);
       } catch (e) {
-        // ignore DB read errors for prev row
-        prevRow = null;
+        prevCurrentRow = null;
       }
 
       // Fetch from Bybit v5 tickers (price + 24h volume in USDT)
@@ -43,13 +42,15 @@ module.exports = {
         const tickerUrl = `${BYBIT_REST_BASE}/v5/market/tickers?category=linear&symbol=${symbol}`;
         const res = await fetch(tickerUrl, { timeout: 5000 });
         if (res.ok) {
-          const json = await res.json();
-          if (json.result && json.result.list && json.result.list.length > 0) {
+          const json = await res.json().catch(() => null);
+          if (json && json.result && Array.isArray(json.result.list) && json.result.list.length > 0) {
             const ticker = json.result.list[0];
             price = Number(ticker.lastPrice || ticker.last || ticker.close || 0);
             // turnover24h is volume in USDT (quote currency)
             volume24hUsdt = Number(ticker.turnover24h || ticker.volume || 0);
             logger.debug({ symbol, price, volume24hUsdt }, 'Market data fetched from Bybit');
+          } else {
+            logger.debug({ symbol, body: json }, 'Bybit ticker API responded but unexpected shape');
           }
         } else {
           logger.debug({ symbol, status: res.status }, 'Bybit ticker API returned non-ok status');
@@ -58,64 +59,67 @@ module.exports = {
         logger.debug({ err: err && err.message, symbol }, 'Bybit ticker fetch failed');
       }
 
-      // Fetch from CoinGecko if enabled (market cap and optional percent metrics)
-      let volumeChangePctFromCg = null;
+      // Fetch from CoinGecko if enabled (market cap)
       let marketCapFromCg = null;
-
+      // Note: CoinGecko simple/price endpoint does not provide a "volume change %" for volume, only the raw volume number.
       if (config.COINGECKO_ENABLED) {
         try {
           const coinId = this.extractCoinIdFromSymbol(symbol);
           if (coinId) {
-            // simple/price with include flags: returns usd_market_cap, usd_24h_vol, usd_24h_change (price change %)
-            const cgUrl = `${COINGECKO_API_BASE}/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true`;
+            const cgUrl = `${COINGECKO_API_BASE}/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true`;
             const res = await fetch(cgUrl, { timeout: 5000 });
             if (res.ok) {
-              const json = await res.json();
+              const json = await res.json().catch(() => null);
               if (json && json[coinId]) {
                 const data = json[coinId];
                 if (typeof data.usd_market_cap !== 'undefined' && data.usd_market_cap !== null) {
                   marketCapFromCg = Number(data.usd_market_cap) || null;
                 }
-                if (typeof data.usd_24h_vol !== 'undefined' && data.usd_24h_vol !== null) {
-                  // If Bybit turnover is missing, use CG volume
-                  if (!volume24hUsdt || volume24hUsdt === 0) {
-                    volume24hUsdt = Number(data.usd_24h_vol) || volume24hUsdt;
-                  }
+                // If Bybit had no volume, fallback to CoinGecko's usd_24h_vol
+                if ((!volume24hUsdt || volume24hUsdt === 0) && typeof data.usd_24h_vol !== 'undefined' && data.usd_24h_vol !== null) {
+                  volume24hUsdt = Number(data.usd_24h_vol) || volume24hUsdt;
                 }
-                // Note: usd_24h_change from simple/price is price % change; if you want price change, you can map it.
-                // We will not override our computed volume change with price-change.
                 logger.debug({ symbol, coinId, marketCapFromCg }, 'CoinGecko market data fetched (simple/price)');
+              } else {
+                logger.debug({ symbol, coinId, body: json }, 'CoinGecko simple/price returned empty for coinId');
               }
             } else {
               logger.debug({ symbol, coinId, status: res.status }, 'CoinGecko API returned non-ok status');
             }
+          } else {
+            logger.debug({ symbol }, 'extractCoinIdFromSymbol returned null; cannot query CoinGecko for market cap');
           }
         } catch (err) {
           logger.debug({ err: err && err.message, symbol }, 'CoinGecko fetch failed');
         }
       }
 
-      // Compute volume change pct if we have a previous persisted volume
+      // Compute volume change pct using previous persisted current row (prevCurrentRow) if available
       let computedVolChangePct = null;
       try {
-        const prevVol = prevRow && typeof prevRow.volume_24h_usdt === 'number' ? Number(prevRow.volume_24h_usdt) : (prevRow && prevRow.volume_24h_usdt ? Number(prevRow.volume_24h_usdt) : null);
+        const prevVol = prevCurrentRow && typeof prevCurrentRow.volume_24h_usdt === 'number'
+          ? Number(prevCurrentRow.volume_24h_usdt)
+          : (prevCurrentRow && prevCurrentRow.volume_24h_usdt ? Number(prevCurrentRow.volume_24h_usdt) : null);
+
         if (prevVol && prevVol > 0) {
           computedVolChangePct = ((volume24hUsdt - prevVol) / prevVol) * 100;
         } else {
+          // if previous persisted value missing, we cannot compute change yet
           computedVolChangePct = null;
         }
       } catch (e) {
         computedVolChangePct = null;
       }
 
-      // Final chosen volume change: prefer CoinGecko-provided volume percent if you ever fetch it (we didn't map a CG volume percent),
-      // otherwise use computedVolChangePct
-      const finalVolumeChangePct = (typeof volumeChangePctFromCg === 'number' && !Number.isNaN(volumeChangePctFromCg))
-        ? Number(volumeChangePctFromCg)
-        : (typeof computedVolChangePct === 'number' && !Number.isNaN(computedVolChangePct) ? Number(computedVolChangePct) : null);
+      // Final chosen volume change: prefer computed change (we don't have a CG-provided volume change %)
+      const finalVolumeChangePct = (typeof computedVolChangePct === 'number' && !Number.isNaN(computedVolChangePct))
+        ? Number(computedVolChangePct)
+        : null;
 
-      // Final market cap: prefer CoinGecko value if present
-      const finalMarketCap = (typeof marketCapFromCg === 'number' && !Number.isNaN(marketCapFromCg)) ? marketCapFromCg : (prevRow && prevRow.market_cap ? Number(prevRow.market_cap) : null);
+      // Final market cap: prefer CoinGecko value if present, otherwise fallback to previous persisted market_cap
+      const finalMarketCap = (typeof marketCapFromCg === 'number' && !Number.isNaN(marketCapFromCg))
+        ? marketCapFromCg
+        : (prevCurrentRow && prevCurrentRow.market_cap ? Number(prevCurrentRow.market_cap) : null);
 
       const result = {
         price: price || 0,
@@ -124,13 +128,76 @@ module.exports = {
         market_cap: finalMarketCap
       };
 
-      // Persist to DB
+      // Persist: keep a current row and append to history table
       try {
         const db = dbModule.get();
-        db.prepare('INSERT OR REPLACE INTO market_data (symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-          .run(symbol, result.price, result.volume_24h_usdt, result.volume_change_pct === null ? null : result.volume_change_pct, result.market_cap === null ? null : result.market_cap, Date.now());
+
+        // Ensure tables exist
+        try {
+          db.prepare(`CREATE TABLE IF NOT EXISTS market_data (
+            symbol TEXT PRIMARY KEY,
+            price REAL,
+            volume_24h_usdt REAL,
+            volume_change_pct REAL,
+            market_cap REAL,
+            updated_at INTEGER
+          )`).run();
+        } catch (e) { /* ignore */ }
+
+        try {
+          db.prepare(`CREATE TABLE IF NOT EXISTS market_data_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            price REAL,
+            volume_24h_usdt REAL,
+            volume_change_pct REAL,
+            market_cap REAL,
+            updated_at INTEGER
+          )`).run();
+        } catch (e) { /* ignore */ }
+
+        // Insert previous current row into history if it exists (so history has previous snapshot)
+        try {
+          if (prevCurrentRow) {
+            db.prepare(`INSERT INTO market_data_history (symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)`)
+              .run(symbol,
+                   prevCurrentRow.price || 0,
+                   prevCurrentRow.volume_24h_usdt || 0,
+                   prevCurrentRow.volume_change_pct === null ? null : prevCurrentRow.volume_change_pct,
+                   prevCurrentRow.market_cap === null ? null : prevCurrentRow.market_cap,
+                   prevCurrentRow.updated_at || Date.now());
+          }
+        } catch (e) {
+          logger.debug({ e, symbol }, 'Failed to append previous market_data to history (non-fatal)');
+        }
+
+        // Upsert current
+        try {
+          db.prepare('INSERT OR REPLACE INTO market_data (symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+            .run(symbol, result.price, result.volume_24h_usdt, result.volume_change_pct === null ? null : result.volume_change_pct, result.market_cap === null ? null : result.market_cap, Date.now());
+        } catch (e) {
+          logger.debug({ e, symbol }, 'Failed to upsert market_data (non-fatal)');
+        }
+
+        // Also append the new snapshot into history for auditing
+        try {
+          db.prepare(`INSERT INTO market_data_history (symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at)
+                      VALUES (?, ?, ?, ?, ?, ?)`)
+            .run(symbol, result.price, result.volume_24h_usdt, result.volume_change_pct === null ? null : result.volume_change_pct, result.market_cap === null ? null : result.market_cap, Date.now());
+        } catch (e) {
+          logger.debug({ e, symbol }, 'Failed to insert market_data_history (non-fatal)');
+        }
       } catch (err) {
-        logger.debug({ err, symbol }, 'Failed to persist market data to DB');
+        logger.debug({ err, symbol }, 'Failed to persist market data to DB (non-fatal)');
+      }
+
+      // Debug logs to explain n/a cases
+      if (result.market_cap === null) {
+        logger.debug({ symbol, COINGECKO_ENABLED: config.COINGECKO_ENABLED }, 'market_cap not available (CoinGecko disabled or no data). Enable COINGECKO_ENABLED=true to fetch market cap.');
+      }
+      if (result.volume_change_pct === null) {
+        logger.debug({ symbol, reason: prevCurrentRow ? 'prev volume is zero or missing' : 'no previous persisted record to compute change yet' }, 'volume_change_pct unavailable (n/a)');
       }
 
       return result;
