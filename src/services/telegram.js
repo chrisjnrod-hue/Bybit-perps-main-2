@@ -48,16 +48,28 @@ module.exports = {
   },
 
   formatMarketData(md = {}) {
+    // Accept either normalized keys or provider keys
     const price = (typeof md.price === 'number') ? md.price : (md.price ? Number(md.price) : null);
     const vol24 = (typeof md.volume_24h_usdt === 'number') ? md.volume_24h_usdt : (md.volume_24h_usdt ? Number(md.volume_24h_usdt) : null);
     const volChange = (typeof md.volume_change_pct === 'number') ? md.volume_change_pct : (md.volume_change_pct ? Number(md.volume_change_pct) : null);
     const marketCap = (typeof md.market_cap === 'number') ? md.market_cap : (md.market_cap ? Number(md.market_cap) : null);
 
+    // Also accept camelCase aliases
+    const priceAlt = (typeof md.last === 'number') ? md.last : (md.last ? Number(md.last) : null);
+    const vol24Alt = (typeof md.volume24h === 'number') ? md.volume24h : (md.volume24h ? Number(md.volume24h) : null);
+    const volChangeAlt = (typeof md.volumeChangePct === 'number') ? md.volumeChangePct : (md.volumeChangePct ? Number(md.volumeChangePct) : null);
+    const marketCapAlt = (typeof md.marketCap === 'number') ? md.marketCap : (md.marketCap ? Number(md.marketCap) : null);
+
+    const finalPrice = price !== null ? price : (priceAlt !== null ? priceAlt : 0);
+    const finalVol24 = vol24 !== null ? vol24 : (vol24Alt !== null ? vol24Alt : 0);
+    const finalVolChange = volChange !== null ? volChange : (volChangeAlt !== null ? volChangeAlt : null);
+    const finalMarketCap = marketCap !== null ? marketCap : (marketCapAlt !== null ? marketCapAlt : null);
+
     const lines = [
-      `💰 Price: ${price !== null && price > 0 ? '$' + price.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '0'}`,
-      `💵 24h Volume: ${vol24 !== null && vol24 > 0 ? '$' + vol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT' : '0 USDT'}`,
-      `📈 Volume Change: ${volChange !== null ? volChange.toFixed(2) + '%' : 'n/a'}`,
-      `💎 Market Cap: ${marketCap && marketCap > 0 ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
+      `💰 Price: ${finalPrice !== null && finalPrice > 0 ? '$' + finalPrice.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '0'}`,
+      `💵 24h Volume: ${finalVol24 !== null && finalVol24 > 0 ? '$' + finalVol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT' : '0 USDT'}`,
+      `📈 Volume Change: ${finalVolChange !== null ? (Number(finalVolChange).toFixed(2) + '%') : 'n/a'}`,
+      `💎 Market Cap: ${finalMarketCap && finalMarketCap > 0 ? '$' + finalMarketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
     ];
     return lines.join('\n');
   },
@@ -66,7 +78,12 @@ module.exports = {
     const { symbol, root_tf, detected_at, meta = {} } = signal || {};
     const timeStr = detected_at ? new Date(detected_at).toISOString() : new Date().toISOString();
     const alignment = meta.alignment || {};
-    const tvScore = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
+
+    // Prefer explicit percent field (tvScorePct) if present, else compute from raw tvScore safely
+    const tvScoreRaw = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
+    const tvScorePctFromMeta = (typeof meta.tvScorePct === 'number' && !isNaN(meta.tvScorePct)) ? meta.tvScorePct : null;
+    const tvPercent = tvScorePctFromMeta !== null ? tvScorePctFromMeta : Math.round((tvScoreRaw || 0) * 100);
+
     const tvSource = meta.tvSource || 'error';
     const mtfScore = (typeof meta.mtfScore === 'number') ? meta.mtfScore : null;
     const decision = meta.decision || 'monitor';
@@ -74,9 +91,8 @@ module.exports = {
 
     const { lines: alignmentLines, mtfScore: computedMtfScore } = this.buildAlignmentLines(alignment);
     const usedMtfScore = (mtfScore !== null) ? mtfScore : computedMtfScore;
-
-    const tvPercent = Math.round((tvScore || 0) * 100);
     const mtfPercent = Math.round((usedMtfScore || 0) * 100);
+
     const scoringLine = `📊 Scoring:\nTV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`;
     const mtfHeader = `🛰️ MTF Status:`;
     const marketBlock = `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
@@ -108,7 +124,8 @@ module.exports = {
     }
   },
 
-  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvSource = 'error', mtfScore = 0 }) {
+  // Accept tvScorePct as optional param (prefer it when formatting)
+  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvScorePct = null, tvSource = 'error', mtfScore = 0 }) {
     if (!bot) return;
     const timeStr = new Date(detected_at).toISOString();
     
@@ -120,7 +137,9 @@ module.exports = {
     }).join('\n');
 
     const decision = accept && accept.decision ? accept.decision : 'monitor';
-    const tvPercent = Math.round((tvScore || 0) * 100);
+
+    // prefer explicit percentage if provided
+    const tvPercent = (typeof tvScorePct === 'number' && !isNaN(tvScorePct)) ? tvScorePct : Math.round((tvScore || 0) * 100);
     const mtfPercent = Math.round((mtfScore || 0) * 100);
 
     const marketLines = this.formatMarketData(marketData || {});
@@ -256,7 +275,8 @@ module.exports = {
         .map(s => ({
           symbol: s.symbol,
           root_tf: s.root_tf,
-          tvScore: s.meta?.tvScore || 0,
+          // prefer explicit percent if available
+          tvScorePct: s.meta?.tvScorePct ?? (typeof s.meta?.tvScore === 'number' ? Math.round(s.meta.tvScore * 100) : 0),
           mtfScore: s.meta?.mtfScore || 0,
           acceptDecision: s.meta?.decision || 'monitor',
           reason: s.meta?.acceptReason || 'n/a',
@@ -264,7 +284,7 @@ module.exports = {
         }))
         .filter(c => c.acceptDecision === 'accept')
         .sort((a, b) => {
-          if (b.tvScore !== a.tvScore) return b.tvScore - a.tvScore;
+          if (b.tvScorePct !== a.tvScorePct) return b.tvScorePct - a.tvScorePct;
           return b.mtfScore - a.mtfScore;
         });
 
@@ -276,7 +296,7 @@ module.exports = {
         for (let i = 0; i < recommended.length; i++) {
           const r = recommended[i];
           const label = this.getLabel(i, { lowercase: true });
-          const tvPercent = Math.round((r.tvScore || 0) * 100);
+          const tvPercent = r.tvScorePct;
           const mtfPercent = Math.round((r.mtfScore || 0) * 100);
           const simNote = config.OPENTRADE ? '' : ' [SIMULATED]';
           const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${tvPercent}% MTF:${mtfPercent}% - ${r.reason}${simNote}`;
