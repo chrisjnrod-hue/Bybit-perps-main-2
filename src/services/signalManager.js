@@ -52,21 +52,52 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
+      // Normalize market data to consistent keys (both snake_case and camelCase) so renderers can pick what they expect
+      const normalizedMdata = (function(md) {
+        const price = Number(md?.price ?? md?.last_price ?? md?.last ?? md?.close ?? 0) || 0;
+        const vol24 =
+          Number(md?.volume_24h_usdt ?? md?.volume_24h ?? md?.volumeUsd24h ?? md?.volume ?? md?.turnover24h ?? 0) || 0;
+        const marketCapRaw = md?.market_cap ?? md?.marketCap ?? md?.marketCapUsd ?? null;
+        const market_cap = marketCapRaw !== null && marketCapRaw !== undefined ? Number(marketCapRaw) : null;
+        const volChange = (md?.volume_change_pct ?? md?.volumeChangePct ?? md?.volume_change ?? null);
+        const volume_change_pct = (typeof volChange === 'number') ? volChange : (volChange !== null && !isNaN(Number(volChange)) ? Number(volChange) : null);
+
+        return {
+          // canonical/primary keys
+          price,
+          market_cap,
+          volume_24h_usdt: vol24,
+          volume_change_pct,
+
+          // handy aliases
+          marketCap: market_cap,
+          volume24h: vol24,
+          volumeChangePct: volume_change_pct,
+
+          // raw payload for debugging
+          raw: md || {}
+        };
+      })(mdata);
+
       // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
-      let tv = { score: 0, source: 'error' };
+      let tv = { score: 0, score_pct: 0, source: 'error' };
       try {
         logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
         const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
         if (tvRes && typeof tvRes.score === 'number') {
-          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
-          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
+          tv = {
+            score: tvRes.score,
+            score_pct: typeof tvRes.score_pct === 'number' ? tvRes.score_pct : Math.round((tvRes.score || 0) * 100),
+            source: tvRes.source || 'unknown'
+          };
+          logger.info({ symbol, score: tv.score, score_pct: tv.score_pct, source: tv.source }, 'TV rating acquired');
         } else {
           logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
-          tv = { score: 0, source: 'error' };
+          tv = { score: 0, score_pct: 0, source: 'error' };
         }
       } catch (err) {
         logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
-        tv = { score: 0, source: 'error' };
+        tv = { score: 0, score_pct: 0, source: 'error' };
       }
 
       // Subscribe to MTF websockets (for alignment updates)
@@ -83,13 +114,14 @@ module.exports = {
 
       // Compose meta and persist signal to DB
       const meta = {
-        tvScore: tv.score || 0,
+        tvScore: tv.score || 0,            // raw 0..1
+        tvScorePct: tv.score_pct || 0,     // integer 0..100 - preferred for display
         tvSource: tv.source || 'error',
         mtfScore,
         alignment,
         acceptReason: accept && accept.reason ? accept.reason : null,
         decision: accept && accept.decision ? accept.decision : 'monitor',
-        marketData: mdata || {}
+        marketData: normalizedMdata
       };
 
       dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
@@ -112,12 +144,13 @@ module.exports = {
             alignment,
             detected_at,
             accept,
-            marketData: mdata || {},
-            tvScore: tv.score || 0,
+            marketData: normalizedMdata,
+            tvScoreRaw: tv.score || 0,
+            tvScorePct: tv.score_pct || 0,
             tvSource: tv.source || 'error',
             mtfScore
           });
-          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
+          logger.info({ symbol, root_tf, tvScorePct: tv.score_pct }, 'Telegram root signal block sent');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
@@ -136,19 +169,19 @@ module.exports = {
           // Apply market-level filters
           let passFilters = true;
           if (config.MIN_MARKET_CAP > 0) {
-            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
+            if (!normalizedMdata || !normalizedMdata.market_cap || Number(normalizedMdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
-              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
+              logger.info({ symbol, market_cap: normalizedMdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
           if (config.MIN_24H_USDT_VOLUME > 0) {
-            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+            if (!normalizedMdata || !normalizedMdata.volume_24h_usdt || Number(normalizedMdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
-              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
+              logger.info({ symbol, volume_24h_usdt: normalizedMdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
-            const change = mdata?.volume_change_pct;
+            const change = normalizedMdata?.volume_change_pct;
             if (change === null || change === undefined) {
               if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
                 passFilters = false;
@@ -216,10 +249,6 @@ module.exports = {
 
   /**
    * applyDecision: Determine signal acceptance based on alignment
-   * - All positive: accept
-   * - Only daily negative and rising: accept
-   * - Some negative: monitor
-   * - Otherwise: reject
    */
   async applyDecision(alignment) {
     const tfList = Object.keys(alignment);
