@@ -209,6 +209,12 @@ module.exports = {
     }
   },
 
+  /**
+   * Feature 3: scanOnce at 5-min boundary
+   * - Scans all ROOT_TFS for new flips
+   * - Checks alignment confirmation for each symbol
+   * - Sends individual signal blocks per new flip detected
+   */
   async scanOnce({ notifyNewSignals = true } = {}) {
     try {
       const db = dbModule;
@@ -240,16 +246,41 @@ module.exports = {
             const s = newSignals[i];
             try {
               await telegram.sendNewSignalSingleBlock(s);
+              logger.info({ symbol: s.symbol, root_tf: s.root_tf }, 'Sent individual signal block');
             } catch (e) {
               logger.debug({ e, s }, 'scanOnce: failed to send new-signal message');
             }
             await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+          }
+
+          // After all signals sent, check alignment confirmation for monitored symbols
+          for (let i = 0; i < rows.length; i++) {
+            const symbol = rows[i].symbol;
+            try {
+              await signalManager.checkAlignmentConfirmation(symbol);
+            } catch (e) {
+              logger.debug({ e, symbol }, 'scanOnce: alignment check error');
+            }
+            await sleep(50);
           }
         } else {
           logger.info('scanOnce: notifications suppressed for this run (silent startup/root-open scan)');
         }
       } else {
         logger.info('scanOnce: no new signals found this boundary');
+        
+        // Still check alignment confirmations even if no new signals
+        if (notifyNewSignals) {
+          for (let i = 0; i < rows.length; i++) {
+            const symbol = rows[i].symbol;
+            try {
+              await signalManager.checkAlignmentConfirmation(symbol);
+            } catch (e) {
+              logger.debug({ e, symbol }, 'scanOnce: alignment check error');
+            }
+            await sleep(50);
+          }
+        }
       }
 
       try {
@@ -351,8 +382,8 @@ module.exports = {
       logger.info({ wait }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
       setTimeout(async () => {
         try {
-          // Run silent scanOnce
-          await this.scanOnce({ notifyNewSignals: false });
+          // Feature 3: Run scan with notifications enabled at 5-min boundary
+          await this.scanOnce({ notifyNewSignals: true });
 
           const now = new Date();
           const minute = now.getUTCMinutes();
