@@ -1,5 +1,12 @@
 /**
  * src/services/signalManager.js
+ *
+ * Responsibilities:
+ * - Orchestrates per-symbol "root" signals (market data, TV rating, MTF alignment, decision)
+ * - Persists a signal snapshot to DB (via dbModule.insertSignal when available)
+ * - Sends Telegram blocks immediately (or returns the signal object)
+ * - Computes a fallback TV-like score when TradingView is unavailable
+ *
  * v0.4.0 Updates:
  * - Feature 1: Prioritizes root TFS (240, 1D, 60 weighted higher)
  * - Feature 2: Enforces MTF flip validation for 1D signals (1H, 4H, 1D flips only)
@@ -23,10 +30,12 @@ function setOpenTradesAllowed(v) {
 }
 
 const inProgress = new Map();
-const alignmentAlertsSent = new Map(); // Track alignment confirmations per symbol per 5-min block
+const lastSignalPerBoundary = new Map(); // Track signals per 5-min block to deduplicate
 
 async function fetchLatestSignalsSnapshotFallback(limit = 500) {
+  // Try multiple fallbacks to obtain a recent snapshot of signals for summaries
   try {
+    // 1) Prefer dbModule.getLatestSignalsSnapshot()
     if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
       try {
         const snap = dbModule.getLatestSignalsSnapshot();
@@ -36,6 +45,7 @@ async function fetchLatestSignalsSnapshotFallback(limit = 500) {
       }
     }
 
+    // 2) Try dbModule.get().prepare(...) reading signals table if available
     if (dbModule && typeof dbModule.get === 'function') {
       try {
         const db = dbModule.get();
@@ -81,18 +91,19 @@ function getCurrentBoundaryBlockId() {
 
 /**
  * Feature 1: Prioritize root TFS by weight
+ * Returns an object with TF => priority score
  */
 function evaluateTimeframeHierarchy(alignment) {
   const priorityMap = {};
   const rootPriority = config.ROOT_TFS_PRIORITY || ['240', 'D', '60'];
   
   for (const tf of Object.keys(alignment)) {
-    let priority = 1;
+    let priority = 1; // default
     const tfStr = String(tf);
     
     if (rootPriority.includes(tfStr)) {
       const idx = rootPriority.indexOf(tfStr);
-      priority = Math.max(3 - idx, 1);
+      priority = Math.max(3 - idx, 1); // 240=3, D=2, 60=1
     }
     
     priorityMap[tf] = priority;
@@ -103,6 +114,9 @@ function evaluateTimeframeHierarchy(alignment) {
 
 /**
  * Feature 2: Validate MTF flip enforcement for 1D signals
+ * If ENFORCE_MTF_FLIP_1D is true and root_tf is '1D' or 'D':
+ *   - Only accept if 1H, 4H, and 1D all flipped (confirmed flip)
+ *   - Prevents 5m/15m noise from triggering 1D signals
  */
 async function validateMtfFlipEnforcement(symbol, root_tf, alignment) {
   if (!config.ENFORCE_MTF_FLIP_1D) {
@@ -114,7 +128,8 @@ async function validateMtfFlipEnforcement(symbol, root_tf, alignment) {
     return { valid: true, reason: 'Not a 1D signal; enforcement N/A' };
   }
 
-  const requiredTfs = ['60', '240', 'D'];
+  // For 1D signals, require 1H, 4H, 1D to all flip
+  const requiredTfs = ['60', '240', 'D']; // 1H=60, 4H=240, 1D=D
   const alignedTfs = Object.keys(alignment).filter(tf => alignment[tf] && alignment[tf].positive);
 
   const allRequired = requiredTfs.every(tf => alignedTfs.includes(tf));
@@ -131,6 +146,47 @@ async function validateMtfFlipEnforcement(symbol, root_tf, alignment) {
   return { valid: true, reason: '1D signal MTF flip validated' };
 }
 
+/**
+ * Feature 3: Check if signal already sent in current 5-min boundary
+ */
+function isSignalDuplicateInBlock(symbol, root_tf) {
+  const blockId = getCurrentBoundaryBlockId();
+  const signalKey = `${symbol}:${root_tf}`;
+  const fullKey = `${blockId}:${signalKey}`;
+
+  if (lastSignalPerBoundary.has(fullKey)) {
+    return true;
+  }
+
+  return false;
+}
+
+function markSignalInBlock(symbol, root_tf) {
+  const blockId = getCurrentBoundaryBlockId();
+  const signalKey = `${symbol}:${root_tf}`;
+  const fullKey = `${blockId}:${signalKey}`;
+  lastSignalPerBoundary.set(fullKey, true);
+
+  // Clean up old block entries (older than 30 min) to prevent memory leak
+  const now = new Date();
+  const cutoff = now.getTime() - 30 * 60 * 1000;
+  for (const [key] of lastSignalPerBoundary) {
+    try {
+      const blockPart = key.split(':')[0]; // e.g., "2026-09-10_14:35:00"
+      const [datePart, timePart] = blockPart.split('_');
+      const [year, month, day] = datePart.split('-').map(Number);
+      const [hour, min] = timePart.split(':').map(Number);
+      const blockTime = new Date(Date.UTC(year, month - 1, day, hour, min, 0)).getTime();
+      
+      if (blockTime < cutoff) {
+        lastSignalPerBoundary.delete(key);
+      }
+    } catch (e) {
+      // ignore cleanup errors
+    }
+  }
+}
+
 module.exports = {
   start() {
     logger.info('SignalManager started');
@@ -139,7 +195,10 @@ module.exports = {
   setOpenTradesAllowed,
 
   /**
-   * handleRootSignal: Applies all 3 features
+   * handleRootSignal:
+   * - Applies all 3 features
+   * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
+   * - returns the persisted signal object (or null on error)
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
@@ -152,6 +211,13 @@ module.exports = {
     try {
       logger.info({ symbol, root_tf }, 'Root signal received');
 
+      // Feature 3: Deduplicate within 5-min block
+      if (isSignalDuplicateInBlock(symbol, root_tf)) {
+        logger.info({ symbol, root_tf }, 'handleRootSignal: signal already sent in this 5-min boundary, skipping');
+        return null;
+      }
+      markSignalInBlock(symbol, root_tf);
+
       // 1) Market data
       let mdata = null;
       try {
@@ -162,6 +228,7 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
+      // Normalize market data
       const normalizedMdata = (function(md) {
         const price = Number(md?.price ?? md?.last_price ?? md?.last ?? md?.close ?? 0) || 0;
         const vol24 = Number(md?.volume_24h_usdt ?? md?.volume_24h ?? md?.volumeUsd24h ?? md?.volume ?? md?.turnover24h ?? 0) || 0;
@@ -182,10 +249,10 @@ module.exports = {
         };
       })(mdata);
 
-      // 2) TV rating
+      // 2) TV rating (cached or fresh)
       let tv = { score: 0, score_pct: 0, source: 'error' };
       try {
-        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating');
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
         const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
         if (tvRes && typeof tvRes.score === 'number') {
           tv = {
@@ -203,16 +270,16 @@ module.exports = {
         tv = { score: 0, score_pct: 0, source: 'error' };
       }
 
-      // 3) Subscribe to MTF websockets
+      // 3) Subscribe to MTF websockets (best-effort)
       try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { logger.debug({ e }, 'subscribeSymbolMTF failed (non-fatal)'); }
 
-      // 4) Evaluate MTF alignment
+      // 4) Evaluate MTF alignment (MACD)
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
       const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-      // 5) Compute fallback TV-like score if needed
+      // 5) Compute fallback TV-like score if TV missing or fallback
       if ((tv.source && String(tv.source).toLowerCase().startsWith('fallback')) || tv.score === 0) {
         try {
           const macdPositiveFraction = mtfScore || 0;
@@ -258,7 +325,7 @@ module.exports = {
         boundaryBlockId: getCurrentBoundaryBlockId()
       };
 
-      // Persist signal
+      // Persist using dbModule.insertSignal if available, otherwise try a safe DB write fallback
       try {
         if (dbModule && typeof dbModule.insertSignal === 'function') {
           dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
@@ -282,11 +349,14 @@ module.exports = {
           } catch (e) {
             logger.debug({ e }, 'Fallback signals insert failed (non-fatal)');
           }
+        } else {
+          logger.debug('No DB persistence available for insertSignal');
         }
       } catch (e) {
         logger.debug({ e }, 'Signal persistence failed (non-fatal)');
       }
 
+      // Build the signal object
       const signalObj = { key, symbol, root_tf, detected_at, state: 'detected', meta };
 
       // 9) Notify (telegram)
@@ -313,7 +383,7 @@ module.exports = {
         return signalObj;
       }
 
-      // 10) Open trade if accepted
+      // 10) Open trade if accepted and allowed
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
           logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
@@ -411,6 +481,7 @@ module.exports = {
     const tfList = Object.keys(alignment);
     if (!tfList || tfList.length === 0) return { decision: 'reject', reason: 'no_mtf_data' };
 
+    // Feature 1: Evaluate with priority weighting
     const hierarchy = config.PRIORITIZE_ROOT_TFS ? evaluateTimeframeHierarchy(alignment) : {};
     
     const allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
@@ -432,17 +503,21 @@ module.exports = {
   },
 
   /**
-   * sendStartupSummary: builds snapshot and forwards to telegram
+   * sendStartupSummary: LOOP 1 - builds snapshot and forwards to telegram sendStartupSummary()
+   * - Sends summary header + per-signal detail blocks + recommended signals
+   * - Called EXACTLY at startup after initial scan completes
+   * - Ensures snapshot filled by trying multiple retrieval methods
    */
   async sendStartupSummary() {
     try {
+      logger.info('LOOP 1 - sendStartupSummary: sending startup telegram summary');
       let snapshot = [];
       try {
         if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
           snapshot = dbModule.getLatestSignalsSnapshot() || [];
         }
       } catch (e) {
-        logger.debug({ e }, 'sendStartupSummary: primary snapshot retrieval failed');
+        logger.debug({ e }, 'LOOP 1 - sendStartupSummary: primary snapshot retrieval failed');
       }
 
       if (!Array.isArray(snapshot) || snapshot.length === 0) {
@@ -451,20 +526,28 @@ module.exports = {
 
       const telegramSvc = require('./telegram');
       await telegramSvc.sendStartupSummary({ snapshot });
+      logger.info('LOOP 1 - sendStartupSummary: completed');
     } catch (e) {
-      logger.debug({ e }, 'sendStartupSummary failed');
+      logger.debug({ e }, 'LOOP 1 - sendStartupSummary: failed');
     }
   },
 
+  /**
+   * handleNewRootCandle: LOOP 3 - sends summary when new root TF candles open
+   * - Sends summary header + per-signal detail blocks + recommended signals
+   * - Called EXACTLY when new root timeframes open (240-min, 1D, etc.)
+   * - Provides full summary update for the newly opened candle period
+   */
   async handleNewRootCandle(newRootTfs = []) {
     try {
+      logger.info({ newRootTfs }, 'LOOP 3 - handleNewRootCandle: sending new root candle summary');
       let snapshot = [];
       try {
         if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
           snapshot = dbModule.getLatestSignalsSnapshot() || [];
         }
       } catch (e) {
-        logger.debug({ e }, 'handleNewRootCandle: primary snapshot retrieval failed');
+        logger.debug({ e }, 'LOOP 3 - handleNewRootCandle: primary snapshot retrieval failed');
       }
 
       if (!Array.isArray(snapshot) || snapshot.length === 0) {
@@ -473,8 +556,9 @@ module.exports = {
 
       const telegramSvc = require('./telegram');
       await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
+      logger.info('LOOP 3 - handleNewRootCandle: completed');
     } catch (e) {
-      logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
+      logger.debug({ e, newRootTfs }, 'LOOP 3 - handleNewRootCandle: failed');
     }
   },
 
@@ -484,7 +568,7 @@ module.exports = {
    */
   async checkAlignmentConfirmation(symbol) {
     if (!config.ALIGNMENT_CONFIRMATION_ALERT) {
-      return;
+      return; // Feature disabled
     }
 
     try {
@@ -494,16 +578,16 @@ module.exports = {
       if (mtfTfs.length === 0) return;
 
       const allPositive = mtfTfs.every(tf => alignment[tf] && alignment[tf].positive);
-      if (!allPositive) return;
+      if (!allPositive) return; // Not all aligned
 
+      // Check if we already sent this confirmation in current block
       const blockId = getCurrentBoundaryBlockId();
-      const confirmKey = `${blockId}:${symbol}`;
-
-      if (alignmentAlertsSent.has(confirmKey)) {
-        return;
+      const confirmKey = `confirm:${blockId}:${symbol}`;
+      if (lastSignalPerBoundary.has(confirmKey)) {
+        return; // Already sent
       }
 
-      alignmentAlertsSent.set(confirmKey, true);
+      lastSignalPerBoundary.set(confirmKey, true);
 
       const telegramSvc = require('./telegram');
       await telegramSvc.sendAlignmentConfirmation({
@@ -513,25 +597,6 @@ module.exports = {
       });
 
       logger.info({ symbol, blockId }, 'Alignment confirmation sent');
-
-      // Cleanup old entries (older than 30 min)
-      const now = new Date();
-      const cutoff = now.getTime() - 30 * 60 * 1000;
-      for (const [key] of alignmentAlertsSent) {
-        try {
-          const blockPart = key.split(':')[0];
-          const [datePart, timePart] = blockPart.split('_');
-          const [year, month, day] = datePart.split('-').map(Number);
-          const [hour, min] = timePart.split(':').map(Number);
-          const blockTime = new Date(Date.UTC(year, month - 1, day, hour, min, 0)).getTime();
-          
-          if (blockTime < cutoff) {
-            alignmentAlertsSent.delete(key);
-          }
-        } catch (e) {
-          // ignore cleanup errors
-        }
-      }
     } catch (e) {
       logger.debug({ e, symbol }, 'checkAlignmentConfirmation error');
     }
