@@ -48,11 +48,13 @@ module.exports = {
   },
 
   formatMarketData(md = {}) {
+    // Accept either normalized keys or provider keys
     const price = (typeof md.price === 'number') ? md.price : (md.price ? Number(md.price) : null);
     const vol24 = (typeof md.volume_24h_usdt === 'number') ? md.volume_24h_usdt : (md.volume_24h_usdt ? Number(md.volume_24h_usdt) : null);
     const volChange = (typeof md.volume_change_pct === 'number') ? md.volume_change_pct : (md.volume_change_pct ? Number(md.volume_change_pct) : null);
     const marketCap = (typeof md.market_cap === 'number') ? md.market_cap : (md.market_cap ? Number(md.market_cap) : null);
 
+    // Also accept camelCase aliases
     const priceAlt = (typeof md.last === 'number') ? md.last : (md.last ? Number(md.last) : null);
     const vol24Alt = (typeof md.volume24h === 'number') ? md.volume24h : (md.volume24h ? Number(md.volume24h) : null);
     const volChangeAlt = (typeof md.volumeChangePct === 'number') ? md.volumeChangePct : (md.volumeChangePct ? Number(md.volumeChangePct) : null);
@@ -77,6 +79,7 @@ module.exports = {
     const timeStr = detected_at ? new Date(detected_at).toISOString() : new Date().toISOString();
     const alignment = meta.alignment || {};
 
+    // Prefer explicit percent field (tvScorePct) if present, else compute from raw tvScore safely
     const tvScoreRaw = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
     const tvScorePctFromMeta = (typeof meta.tvScorePct === 'number' && !isNaN(meta.tvScorePct)) ? meta.tvScorePct : null;
     const tvPercent = tvScorePctFromMeta !== null ? tvScorePctFromMeta : Math.round((tvScoreRaw || 0) * 100);
@@ -110,14 +113,18 @@ module.exports = {
     return msgParts.join('\n');
   },
 
+  /**
+   * LOOP 2: Send individual signal blocks for new signals detected at 5-min boundary
+   * Keeps the ORIGINAL detailed per-block layout with full alignment, scoring, market data
+   */
   async sendNewSignalSingleBlock(signal, _label = null) {
     if (!bot) return;
     try {
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'LOOP 2 - Telegram new signal block sent (detail per-block layout)');
     } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram new-signal block');
+      logger.warn({ err }, 'LOOP 2 - Failed to send telegram signal block');
     }
   },
 
@@ -133,8 +140,11 @@ module.exports = {
     }).join('\n');
 
     const decision = accept && accept.decision ? accept.decision : 'monitor';
+
+    // prefer explicit percentage if provided
     const tvPercent = (typeof tvScorePct === 'number' && !isNaN(tvScorePct)) ? tvScorePct : Math.round((tvScore || 0) * 100);
     const mtfPercent = Math.round((mtfScore || 0) * 100);
+
     const marketLines = this.formatMarketData(marketData || {});
 
     const msg = [
@@ -161,6 +171,19 @@ module.exports = {
     }
   },
 
+  /**
+   * LOOP 1 & LOOP 3: sendStartupSummary
+   * - Summary header with counts per root TF + vertical symbol list
+   * - Per-signal detailed blocks (ORIGINAL layout - full alignment, scoring, market data)
+   * - Recommended block with highest-scoring signals
+   *
+   * This version is defensive: it will still show recommended lines even when no signals have decision === 'accept'
+   * by falling back to top non-rejected signals.
+   * 
+   * Used by:
+   * - LOOP 1: Initial deploy startup summary (all signals detected during startup scan)
+   * - LOOP 3: New root candle summary (all signals + recommended for new candle period)
+   */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
     try {
@@ -171,6 +194,7 @@ module.exports = {
         signals = dbModule.getLatestSignalsSnapshot() || [];
       }
 
+      // If still empty, try reading signals table as fallback
       if (!Array.isArray(signals) || signals.length === 0) {
         try {
           if (db && db.prepare) {
@@ -197,6 +221,7 @@ module.exports = {
         }
       }
 
+      // Build counts per root_tf and symbol set
       const tfCounts = {};
       const symbolSet = new Set();
       for (const s of signals) {
@@ -213,6 +238,8 @@ module.exports = {
       }
 
       const summaryParts = orderedRootTfs.map(tf => `${tf}: ${tfCounts[tf] || 0}`);
+
+      // vertical symbol list (one symbol per line, sorted)
       const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
       const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
 
@@ -221,6 +248,7 @@ module.exports = {
       logger.info('Sent startup summary header');
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
+      // Per-signal detail blocks (sorted by symbol, then root_tf)
       signals.sort((a, b) => {
         const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
         if (s !== 0) return s;
@@ -236,6 +264,7 @@ module.exports = {
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
 
+      // Recommended block (sorted by TV score desc, then MTF score desc)
       let openCount = 0;
       try {
         const row = db.prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
@@ -249,8 +278,10 @@ module.exports = {
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
+      // Build normalized candidate objects defensively
       const normalizedCandidates = signals.map(s => {
         const meta = s.meta || {};
+        // Accept various possible shapes for the decision
         const dec = (meta && meta.decision) || (meta && meta.accept && meta.accept.decision) || (meta && meta.acceptDecision) || 'monitor';
         const tvPct = (typeof meta.tvScorePct === 'number') ? meta.tvScorePct : (typeof meta.tvScore === 'number' ? Math.round(meta.tvScore * 100) : 0);
         const mtf = (typeof meta.mtfScore === 'number') ? meta.mtfScore : 0;
@@ -266,12 +297,15 @@ module.exports = {
         };
       });
 
+      // First try explicitly accepted signals
       let candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() === 'accept');
 
+      // If none accepted, fall back to top non-rejected signals (so we still show recommended lines)
       if (candidates.length === 0) {
         candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() !== 'reject');
       }
 
+      // Sort candidates by tvScorePct desc then mtfScore desc
       candidates.sort((a, b) => {
         if (b.tvScorePct !== a.tvScorePct) return b.tvScorePct - a.tvScorePct;
         return b.mtfScore - a.mtfScore;
@@ -280,6 +314,7 @@ module.exports = {
       const recommended = candidates.slice(0, maxSlots);
 
       if (!recommended || recommended.length === 0) {
+        // If there truly are no candidates (e.g., no signals), still send the default note
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
       } else {
         for (let i = 0; i < recommended.length; i++) {
@@ -300,45 +335,34 @@ module.exports = {
     }
   },
 
+  /**
+   * LOOP 3: sendRootCandleUpdate
+   * - Sends full summary (header + per-signal blocks + recommended) when new root candles open
+   * - Not a simple notification, but a complete summary update for new candle period
+   * - Called exactly when new root TF candles open (e.g., 240-min, 1D)
+   */
   async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
     if (!bot) return;
+    if (!Array.isArray(newRootTfs) || newRootTfs.length === 0) {
+      logger.debug('LOOP 3 - sendRootCandleUpdate: no new root TFs to notify');
+      return;
+    }
+
     try {
+      logger.info({ newRootTfs }, 'LOOP 3 - sendRootCandleUpdate: sending full summary for new root candles');
+      
+      // Use the snapshot passed in (all signals)
       let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals && typeof dbModule.getLatestSignalsSnapshot === 'function') {
+      if (!signals.length && typeof dbModule.getLatestSignalsSnapshot === 'function') {
         signals = dbModule.getLatestSignalsSnapshot() || [];
       }
 
-      const filtered = (newRootTfs && newRootTfs.length)
-        ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
-        : signals;
-
-      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending for new root candles');
-      await this.sendStartupSummary({ snapshot: filtered });
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send root candle update');
-    }
-  },
-
-  async sendAlignmentConfirmation({ symbol, alignment, blockId }) {
-    if (!bot) return;
-    try {
-      const { lines: alignmentLines, mtfScore, positiveCount, total } = this.buildAlignmentLines(alignment);
-      const mtfPercent = Math.round((mtfScore || 0) * 100);
+      // Send full startup-style summary (not individual blocks)
+      await this.sendStartupSummary({ snapshot: signals });
       
-      const msg = [
-        `✅ ALL MTF ALIGNED: ${symbol}`,
-        `⏰ Block: ${blockId}`,
-        ``,
-        `🛰️ MTF Status (${positiveCount}/${total}):`,
-        alignmentLines,
-        ``,
-        `📊 Overall Score: ${mtfPercent}%`
-      ].join('\n');
-
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol, blockId }, 'Telegram alignment confirmation sent');
+      logger.info('LOOP 3 - sendRootCandleUpdate: completed');
     } catch (err) {
-      logger.warn({ err, symbol }, 'Failed to send alignment confirmation');
+      logger.warn({ err }, 'LOOP 3 - Failed to send root candle update');
     }
   }
 };
