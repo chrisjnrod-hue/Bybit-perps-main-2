@@ -74,33 +74,19 @@ module.exports = {
   EXCLUDE_STABLES: parseList(process.env.EXCLUDE_STABLES || 'USDT,USDC,TUSD,DAI'),
   PORT: Number(process.env.PORT || 3000),
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
-  TELEGRAM_SEND_DELAY_MS: Number(process.env.TELEGRAM_SEND_DELAY_MS || 100)
+  TELEGRAM_SEND_DELAY_MS: Number(process.env.TELEGRAM_SEND_DELAY_MS || 100),
+
+  // ========== NEW FEATURES (v0.4.0) ==========
+  
+  // Feature 1: Prioritize root TFS (240, 1D, 60 weighted higher)
+  PRIORITIZE_ROOT_TFS: envBool('PRIORITIZE_ROOT_TFS', true),
+  ROOT_TFS_PRIORITY: parseList(process.env.ROOT_TFS_PRIORITY || '240,D,60'),
+  
+  // Feature 2: Enforce MTF flip requirement for 1D signals
+  ENFORCE_MTF_FLIP_1D: envBool('ENFORCE_MTF_FLIP_1D', false),
+  MTF_FLIP_REQUIREMENT_1D: process.env.MTF_FLIP_REQUIREMENT_1D || '1h,4h,1d',
+  
+  // Feature 3: 5-min boundary scan for root signals + MTF alignment confirmation
+  ROOT_SCAN_5MIN_BOUNDARY: envBool('ROOT_SCAN_5MIN_BOUNDARY', true),
+  ALIGNMENT_CONFIRMATION_ALERT: envBool('ALIGNMENT_CONFIRMATION_ALERT', true)
 };
-
-  # ========== NEW FEATURES (v0.4.0) ==========
-
-# Feature 1: Prioritize root TFS (240, 1D, 60 weighted higher)
-# Enable/disable timeframe hierarchy weighting in signal decisions
-PRIORITIZE_ROOT_TFS=true
-
-# Define priority order for root timeframes (higher priority = higher weight in decisions)
-# Format: comma-separated list, e.g., "240,D,60" means 240min=highest, Daily=medium, 60min=lowest
-ROOT_TFS_PRIORITY=240,D,60
-
-# Feature 2: Enforce MTF flip requirement for 1D signals
-# When enabled, 1D signals require 1H (60), 4H (240), AND 1D (D) all to flip together
-# Prevents false 1D signals triggered by 5m/15m noise
-ENFORCE_MTF_FLIP_1D=false
-
-# MTF timeframes required to flip together for 1D signal acceptance
-# Format: comma-separated, e.g., "1h,4h,1d" or "60,240,D"
-MTF_FLIP_REQUIREMENT_1D=1h,4h,1d
-
-# Feature 3: 5-min boundary scan for root signals + MTF alignment confirmation
-# Enable active scanning at every 5-minute boundary (00, 05, 10, 15, etc.)
-# Scans all ROOT_TFS for NEW flips and monitors MTF alignment status
-ROOT_SCAN_5MIN_BOUNDARY=true
-
-# Send Telegram alert when ALL MTF timeframes align for a symbol
-# Only triggers when alignment changes from partial → full (all positive)
-ALIGNMENT_CONFIRMATION_ALERT=true
