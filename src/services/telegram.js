@@ -113,18 +113,14 @@ module.exports = {
     return msgParts.join('\n');
   },
 
-  /**
-   * LOOP 2: Send individual signal blocks for new signals detected at 5-min boundary
-   * Keeps the ORIGINAL detailed per-block layout with full alignment, scoring, market data
-   */
   async sendNewSignalSingleBlock(signal, _label = null) {
     if (!bot) return;
     try {
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'LOOP 2 - Telegram new signal block sent (detail per-block layout)');
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
     } catch (err) {
-      logger.warn({ err }, 'LOOP 2 - Failed to send telegram signal block');
+      logger.warn({ err }, 'Failed to send telegram new-signal block');
     }
   },
 
@@ -172,17 +168,13 @@ module.exports = {
   },
 
   /**
-   * LOOP 1 & LOOP 3: sendStartupSummary
+   * sendStartupSummary:
    * - Summary header with counts per root TF + vertical symbol list
-   * - Per-signal detailed blocks (ORIGINAL layout - full alignment, scoring, market data)
+   * - Per-signal detailed blocks (no alphabetical labels)
    * - Recommended block with highest-scoring signals
    *
    * This version is defensive: it will still show recommended lines even when no signals have decision === 'accept'
    * by falling back to top non-rejected signals.
-   * 
-   * Used by:
-   * - LOOP 1: Initial deploy startup summary (all signals detected during startup scan)
-   * - LOOP 3: New root candle summary (all signals + recommended for new candle period)
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -335,34 +327,22 @@ module.exports = {
     }
   },
 
-  /**
-   * LOOP 3: sendRootCandleUpdate
-   * - Sends full summary (header + per-signal blocks + recommended) when new root candles open
-   * - Not a simple notification, but a complete summary update for new candle period
-   * - Called exactly when new root TF candles open (e.g., 240-min, 1D)
-   */
   async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
     if (!bot) return;
-    if (!Array.isArray(newRootTfs) || newRootTfs.length === 0) {
-      logger.debug('LOOP 3 - sendRootCandleUpdate: no new root TFs to notify');
-      return;
-    }
-
     try {
-      logger.info({ newRootTfs }, 'LOOP 3 - sendRootCandleUpdate: sending full summary for new root candles');
-      
-      // Use the snapshot passed in (all signals)
       let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals.length && typeof dbModule.getLatestSignalsSnapshot === 'function') {
+      if (!signals && typeof dbModule.getLatestSignalsSnapshot === 'function') {
         signals = dbModule.getLatestSignalsSnapshot() || [];
       }
 
-      // Send full startup-style summary (not individual blocks)
-      await this.sendStartupSummary({ snapshot: signals });
-      
-      logger.info('LOOP 3 - sendRootCandleUpdate: completed');
+      const filtered = (newRootTfs && newRootTfs.length)
+        ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
+        : signals;
+
+      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending for new root candles');
+      await this.sendStartupSummary({ snapshot: filtered });
     } catch (err) {
-      logger.warn({ err }, 'LOOP 3 - Failed to send root candle update');
+      logger.warn({ err }, 'Failed to send root candle update');
     }
   }
 };
