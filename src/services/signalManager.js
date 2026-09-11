@@ -167,7 +167,6 @@ async function validateSignalFlipAtOpen(symbol, root_tf, tolerance_pct = 0.5) {
     }
 
     const current = klines[0]; // Latest candle
-    const previous = klines[1]; // Previous candle
     const openPrice = Number(current.open) || 0;
     const closePrice = Number(current.close) || 0;
     const tolerance = (openPrice * tolerance_pct) / 100;
@@ -249,7 +248,7 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - Applies all features including open price validation
+   * - Applies all 3 features
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
    * - isBoundaryScan: if true, applies Feature 4 validation (open price check)
    * - returns the persisted signal object (or null on error)
