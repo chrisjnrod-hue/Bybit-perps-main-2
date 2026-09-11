@@ -88,5 +88,15 @@ module.exports = {
   
   // Feature 3: 5-min boundary scan for root signals + MTF alignment confirmation
   ROOT_SCAN_5MIN_BOUNDARY: envBool('ROOT_SCAN_5MIN_BOUNDARY', true),
-  ALIGNMENT_CONFIRMATION_ALERT: envBool('ALIGNMENT_CONFIRMATION_ALERT', true)
+  ALIGNMENT_CONFIRMATION_ALERT: envBool('ALIGNMENT_CONFIRMATION_ALERT', true),
+
+  // ========== NEW FEATURES (v0.5.0) - SIGNAL FLIP VALIDATION ==========
+  
+  // NEW Feature 4: Validate signal flip occurs near open price
+  VALIDATE_SIGNAL_FLIP_AT_OPEN: envBool('VALIDATE_SIGNAL_FLIP_AT_OPEN', false),
+  SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT: Number(process.env.SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT || 0.5),
+  
+  // NEW Feature 5: Root candle open scan (detect 2nd candle flips)
+  ROOT_CANDLE_OPEN_SCAN_ENABLED: envBool('ROOT_CANDLE_OPEN_SCAN_ENABLED', true),
+  ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS: Number(process.env.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS || 60)
 };
