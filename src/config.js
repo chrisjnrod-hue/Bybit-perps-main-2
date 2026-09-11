@@ -92,11 +92,11 @@ module.exports = {
 
   // ========== NEW FEATURES (v0.5.0) - SIGNAL FLIP VALIDATION ==========
   
-  // NEW Feature 4: Validate signal flip occurs near open price
+  // NEW Feature 4: Validate signal flip occurs at open price (5-min boundary only)
   VALIDATE_SIGNAL_FLIP_AT_OPEN: envBool('VALIDATE_SIGNAL_FLIP_AT_OPEN', false),
   SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT: Number(process.env.SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT || 0.5),
   
-  // NEW Feature 5: Root candle open scan (detect 2nd candle flips)
-  ROOT_CANDLE_OPEN_SCAN_ENABLED: envBool('ROOT_CANDLE_OPEN_SCAN_ENABLED', true),
+  // NEW Feature 5: Root candle open scan (detect 2nd candle flips) - DISABLED by default
+  ROOT_CANDLE_OPEN_SCAN_ENABLED: envBool('ROOT_CANDLE_OPEN_SCAN_ENABLED', false),
   ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS: Number(process.env.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS || 60)
 };
