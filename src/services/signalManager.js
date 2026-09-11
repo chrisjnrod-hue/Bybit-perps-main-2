@@ -7,10 +7,9 @@
  * - Sends Telegram blocks immediately (or returns the signal object)
  * - Computes a fallback TV-like score when TradingView is unavailable
  *
- * v0.4.0 Updates:
- * - Feature 1: Prioritizes root TFS (240, 1D, 60 weighted higher)
- * - Feature 2: Enforces MTF flip validation for 1D signals (1H, 4H, 1D flips only)
- * - Feature 3: Tracks signal state per 5-min boundary to deduplicate
+ * v0.5.0 Updates:
+ * - Feature 4: Validate signal flip at open price for 5-min boundary scans
+ * - Feature 5: Root candle open scan support (disabled by default)
  */
 
 const dbModule = require('../db');
@@ -147,6 +146,60 @@ async function validateMtfFlipEnforcement(symbol, root_tf, alignment) {
 }
 
 /**
+ * Feature 4: Validate signal flip at open price (5-min boundary scans only)
+ * If VALIDATE_SIGNAL_FLIP_AT_OPEN is true, check if flip occurred near the candle open price.
+ */
+async function validateSignalFlipAtOpen(symbol, root_tf, tolerance_pct = 0.5) {
+  if (!config.VALIDATE_SIGNAL_FLIP_AT_OPEN) {
+    return { valid: true, reason: 'Open price validation disabled' };
+  }
+
+  try {
+    const db = dbModule.get();
+    // Get last 2 candles to check flip occurred at open of the latest one
+    const klines = db.prepare(
+      'SELECT open_time, open, close, high, low FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2'
+    ).all(symbol, root_tf);
+
+    if (!klines || klines.length < 2) {
+      logger.debug({ symbol, root_tf }, 'validateSignalFlipAtOpen: insufficient klines');
+      return { valid: true, reason: 'Insufficient klines for validation' };
+    }
+
+    const current = klines[0]; // Latest candle
+    const previous = klines[1]; // Previous candle
+    const openPrice = Number(current.open) || 0;
+    const closePrice = Number(current.close) || 0;
+    const tolerance = (openPrice * tolerance_pct) / 100;
+
+    // Check: did flip happen near open (not deep into candle)?
+    // MACD flips negative->positive at candle open = valid
+    // If price moved far from open before flip = invalid (2nd candle behavior)
+    const distanceFromOpen = Math.abs(closePrice - openPrice);
+
+    if (distanceFromOpen > tolerance) {
+      logger.warn(
+        { symbol, root_tf, openPrice, closePrice, tolerance, distance: distanceFromOpen },
+        'validateSignalFlipAtOpen: flip did not occur at candle open (may be 2nd candle flip)'
+      );
+      return { 
+        valid: false, 
+        reason: `Flip away from open price (${distanceFromOpen.toFixed(6)} > ${tolerance.toFixed(6)})` 
+      };
+    }
+
+    logger.info(
+      { symbol, root_tf, openPrice, closePrice, distance: distanceFromOpen },
+      'validateSignalFlipAtOpen: flip validated at open price'
+    );
+    return { valid: true, reason: 'Flip confirmed at candle open' };
+  } catch (e) {
+    logger.debug({ e, symbol, root_tf }, 'validateSignalFlipAtOpen: error');
+    return { valid: true, reason: 'Validation check skipped (error)' };
+  }
+}
+
+/**
  * Feature 3: Check if signal already sent in current 5-min boundary
  */
 function isSignalDuplicateInBlock(symbol, root_tf) {
@@ -196,11 +249,12 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - Applies all 3 features
+   * - Applies all features including open price validation
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
+   * - isBoundaryScan: if true, applies Feature 4 validation (open price check)
    * - returns the persisted signal object (or null on error)
    */
-  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true, isBoundaryScan = false } = {}) {
     const key = `${symbol}:${root_tf}`;
     if (inProgress.has(key)) {
       logger.debug({ key }, 'handleRootSignal: already in progress');
@@ -209,7 +263,7 @@ module.exports = {
     inProgress.set(key, true);
 
     try {
-      logger.info({ symbol, root_tf }, 'Root signal received');
+      logger.info({ symbol, root_tf, isBoundaryScan }, 'Root signal received');
 
       // Feature 3: Deduplicate within 5-min block
       if (isSignalDuplicateInBlock(symbol, root_tf)) {
@@ -311,7 +365,18 @@ module.exports = {
         }
       }
 
-      // 8) Compose meta and persist
+      // 8) Feature 4: Validate signal flip at open price (for 5-min boundary scans only)
+      let openPriceValidation = { valid: true, reason: 'N/A' };
+      if (accept && accept.decision === 'accept' && isBoundaryScan) {
+        openPriceValidation = await validateSignalFlipAtOpen(symbol, root_tf, config.SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT);
+        if (!openPriceValidation.valid) {
+          accept.decision = 'reject';
+          accept.reason = openPriceValidation.reason;
+          logger.info({ symbol, root_tf, reason: openPriceValidation.reason }, 'Decision rejected due to open price validation');
+        }
+      }
+
+      // 9) Compose meta and persist
       const meta = {
         tvScore: tv.score || 0,
         tvScorePct: tv.score_pct || 0,
@@ -321,8 +386,10 @@ module.exports = {
         acceptReason: accept && accept.reason ? accept.reason : null,
         decision: accept && accept.decision ? accept.decision : 'monitor',
         mtfFlipValidation,
+        openPriceValidation,
         marketData: normalizedMdata,
-        boundaryBlockId: getCurrentBoundaryBlockId()
+        boundaryBlockId: getCurrentBoundaryBlockId(),
+        isBoundaryScan
       };
 
       // Persist using dbModule.insertSignal if available, otherwise try a safe DB write fallback
@@ -359,7 +426,7 @@ module.exports = {
       // Build the signal object
       const signalObj = { key, symbol, root_tf, detected_at, state: 'detected', meta };
 
-      // 9) Notify (telegram)
+      // 10) Notify (telegram)
       if (notifyImmediately) {
         try {
           await telegram.sendRootSignalBlock({
@@ -383,7 +450,7 @@ module.exports = {
         return signalObj;
       }
 
-      // 10) Open trade if accepted and allowed
+      // 11) Open trade if accepted and allowed
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
           logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
