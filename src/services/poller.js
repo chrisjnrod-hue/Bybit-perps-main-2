@@ -210,32 +210,53 @@ module.exports = {
   },
 
   /**
-   * Feature 3: scanOnce at 5-min boundary
-   * - Scans all ROOT_TFS for new flips
-   * - Checks alignment confirmation for each symbol
-   * - Sends individual signal blocks per new flip detected
+   * FIXED: scanOnce at 5-min boundary
+   * - Properly detects NEW signals vs cached ones
+   * - Passes isBoundaryScan=true to enable Feature 4 validation
+   * - Enhanced logging for debugging
    */
-  async scanOnce({ notifyNewSignals = true } = {}) {
+  async scanOnce({ notifyNewSignals = true, isBoundaryScan = false } = {}) {
     try {
+      logger.info({ notifyNewSignals, isBoundaryScan }, 'scanOnce: starting scan');
+
       const db = dbModule;
-      const prev = db.getLatestSignalsSnapshot();
+      const prev = db.getLatestSignalsSnapshot ? db.getLatestSignalsSnapshot() : [];
       const prevKeys = new Set(prev.map(r => r.key));
+
+      logger.info({ previousSignals: prevKeys.size }, 'scanOnce: loaded previous signal snapshot');
 
       const scanStart = Date.now();
 
       const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      logger.info({ totalSymbols: rows.length }, 'scanOnce: starting symbol iteration');
+
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
+        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { 
+          notifyImmediately: false, 
+          detected_ts: scanStart,
+          isBoundaryScan 
+        }));
         try {
           await Promise.all(tasks);
         } catch (e) {
-          logger.debug({ e }, 'scanOnce: page tasks error (continuing)');
+          logger.debug({ e, page: Math.floor(i / config.PAGE_SIZE) }, 'scanOnce: page tasks error (continuing)');
         }
       }
 
-      const after = db.getLatestSignalsSnapshot();
-      const newSignals = after.filter(r => !prevKeys.has(r.key) && r.detected_at >= scanStart);
+      const after = db.getLatestSignalsSnapshot ? db.getLatestSignalsSnapshot() : [];
+      const newSignals = after.filter(r => {
+        const isNew = !prevKeys.has(r.key);
+        const isRecent = r.detected_at >= scanStart;
+        return isNew && isRecent;
+      });
+
+      logger.info({ 
+        previousCount: prev.length, 
+        currentCount: after.length, 
+        newSignals: newSignals.length, 
+        notifyNewSignals 
+      }, 'scanOnce: scan iteration complete');
 
       if (newSignals.length > 0) {
         logger.info({ newSignals: newSignals.length, notifyNewSignals }, 'scanOnce: new signals found this boundary');
@@ -301,7 +322,11 @@ module.exports = {
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
+        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { 
+          notifyImmediately: false, 
+          detected_ts: Date.now(),
+          isBoundaryScan: false 
+        }));
         try {
           await Promise.all(tasks);
         } catch (e) {
@@ -314,7 +339,12 @@ module.exports = {
     }
   },
 
-  async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
+  /**
+   * FIXED: scanSymbolRoots
+   * - Tracks candle open_time to prevent duplicate flip detections
+   * - Passes isBoundaryScan flag to enable Feature 4 validation
+   */
+  async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null, isBoundaryScan = false } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
     for (const tf of tfList) {
@@ -337,7 +367,7 @@ module.exports = {
 
         // Track last root candle open_time to prevent duplicate flip detections
         const stateKey = `${symbol}:${tf}`;
-        const latestCandleTime = rows[rows.length - 1].open_time; // oldest in DESC = latest candle
+        const latestCandleTime = rows[0].open_time; // Most recent candle (DESC order)
         
         if (lastRootCandleState[stateKey] === latestCandleTime) {
           logger.debug({ symbol, tf, candleTime: latestCandleTime }, 'scanSymbolRoots: already processed this candle, skipping flip detection');
@@ -345,14 +375,17 @@ module.exports = {
         }
         
         lastRootCandleState[stateKey] = latestCandleTime;
+        logger.debug({ symbol, tf, candleTime: latestCandleTime }, 'scanSymbolRoots: new candle detected, checking for flip');
 
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
+          logger.info({ symbol, tf }, 'scanSymbolRoots: flip detected, handling signal');
           const sig = await signalManager.handleRootSignal({
             symbol,
             root_tf: tf,
             detected_at: detected_ts || Date.now(),
-            notifyImmediately
+            notifyImmediately,
+            isBoundaryScan
           });
           if (sig) results.push(sig);
         }
@@ -363,6 +396,12 @@ module.exports = {
     return results;
   },
 
+  /**
+   * FIXED: scheduleAlignedTo5m
+   * - Properly triggers scanOnce with notifyNewSignals=true at 5-min boundary
+   * - Enhanced logging for debugging boundary execution
+   * - Correctly passes isBoundaryScan=true to enable open price validation
+   */
   scheduleAlignedTo5m() {
     const msToNext5 = () => {
       const d = new Date();
@@ -372,18 +411,26 @@ module.exports = {
       next.setUTCMinutes(m + deltaM);
       next.setUTCSeconds(0);
       next.setUTCMilliseconds(500);
-      return next - d;
+      const ms = next - d;
+      return ms;
     };
 
     let firstBoundaryPassed = false;
 
     const schedule = async () => {
       const wait = msToNext5();
-      logger.info({ wait }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
+      const nextBoundaryTime = new Date(Date.now() + wait).toISOString();
+      logger.info({ wait, nextBoundaryTime }, 'scheduleAlignedTo5m: waiting ms until next 5m boundary');
+      
       setTimeout(async () => {
         try {
-          // Feature 3: Run scan with notifications enabled at 5-min boundary
-          await this.scanOnce({ notifyNewSignals: true });
+          const boundaryTime = new Date().toISOString();
+          logger.info({ boundaryTime }, 'scheduleAlignedTo5m: 5-minute boundary triggered');
+          
+          // FIXED: Feature 3 - Run scan with notifications enabled at 5-min boundary
+          // Also pass isBoundaryScan=true to enable Feature 4 validation
+          await this.scanOnce({ notifyNewSignals: true, isBoundaryScan: true });
+          logger.info({ boundaryTime }, 'scheduleAlignedTo5m: scanOnce completed');
 
           const now = new Date();
           const minute = now.getUTCMinutes();
@@ -399,6 +446,10 @@ module.exports = {
                 if (minutesSinceEpoch % tfNum === 0) newRootTfs.push(String(tf));
               }
             }
+          }
+
+          if (newRootTfs.length > 0) {
+            logger.info({ newRootTfs }, 'scheduleAlignedTo5m: new root candles detected');
           }
 
           // Close least profitable trade if enabled and max trades filled
