@@ -34,16 +34,33 @@ module.exports = {
     }
   },
 
+  /**
+   * FIXED: isMacdFlip - Only detect FIRST candle flips (negative->positive)
+   * 
+   * Prevents false positives from 2nd+ candle behavior.
+   * Returns true ONLY if:
+   *   - Previous candle histogram was negative (< 0)
+   *   - Current candle histogram is positive (> 0)
+   *   - This is a 1st candle flip (clean transition)
+   */
   async isMacdFlip(symbol, timeframe) {
     try {
       const hist = await this.computeMacdHistogram(symbol, timeframe);
       if (!hist || hist.length < 2) return false;
-      const last = hist[hist.length - 1];
-      const prev = hist[hist.length - 2];
+
+      const last = hist[hist.length - 1];      // Current candle (most recent)
+      const prev = hist[hist.length - 2];      // Previous candle
+
+      // STRICT: negative -> positive (first candle flip only)
+      // Prevents 2nd candle noise from triggering signals
       if (prev.histogram < 0 && last.histogram > 0) {
-        logger.info({ symbol, timeframe, prev: prev.histogram, last: last.histogram }, 'MACD flip detected');
+        logger.info(
+          { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
+          'MACD flip detected (1st candle: negative->positive)'
+        );
         return true;
       }
+
       return false;
     } catch (err) {
       logger.debug({ err, symbol, timeframe }, 'isMacdFlip error');
