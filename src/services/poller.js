@@ -1,471 +1,295 @@
-// src/services/poller.js
 const dbModule = require('../db');
-const bybit = require('./bybitRest');
+const wsManager = require('./bybitWs');
+const macd = require('./macd');
+const telegram = require('./telegram');
+const tradeManager = require('./tradeManager');
+const marketData = require('./marketData');
+const tradingview = require('./tradingview');
 const config = require('../config');
 const logger = require('pino')();
-const Bottleneck = require('bottleneck');
-const macdUtil = require('./macd');
-const signalManager = require('./signalManager');
-const tradeManager = require('./tradeManager');
 
-const limiter = new Bottleneck({ minTime: 50 });
-const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
+let openTradesAllowed = true;
 
-let isRunning = false;
-let lastRootCandleState = {}; // Track last root candle to prevent duplicate flips
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms || 0));
+function setOpenTradesAllowed(v) {
+  openTradesAllowed = !!v;
+  logger.info({ openTradesAllowed }, 'signalManager: openTradesAllowed set');
 }
+
+const inProgress = new Map();
 
 module.exports = {
   start() {
-    if (isRunning) return;
-    isRunning = true;
+    logger.info('SignalManager started');
+  },
 
-    try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
+  setOpenTradesAllowed,
 
-    // === LOOP 1: INITIAL/DEPLOY SCAN ===
-    (async () => {
+  /**
+   * handleRootSignal:
+   * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
+   * - returns the persisted signal object
+   * - ALWAYS fetches fresh market data and TV rating for complete signal block
+   * - NEW: Sends separate MTF confirmation alert if score meets threshold
+   */
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+    const key = `${symbol}:${root_tf}`;
+    if (inProgress.has(key)) {
+      logger.debug({ key }, 'handleRootSignal: already in progress');
+      return null;
+    }
+    inProgress.set(key, true);
+    try {
+      logger.info({ symbol, root_tf }, 'Root signal received');
+
+      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
+      let mdata = null;
       try {
-        logger.info('poller: [LOOP 1] INITIAL SCAN - starting');
-        await this.initialScan();
-        logger.info('poller: [LOOP 1] INITIAL SCAN - completed');
-        
-        try {
-          await this.scanAllForStartup();
-          logger.info('poller: [LOOP 1] STARTUP FULL SCAN - completed');
-        } catch (err) {
-          logger.error({ err }, 'poller: [LOOP 1] scanAllForStartup error');
+        mdata = await marketData.updateSymbolMarketData(symbol);
+        if (!mdata) {
+          mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
         }
       } catch (err) {
-        logger.error({ err }, 'poller: [LOOP 1] initialScan failed');
+        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using zeros');
+        mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
-    })();
 
-    // === LOOP 2: 5-MINUTE BOUNDARY SCAN (ALWAYS ENABLED) ===
-    this.scheduleAlignedTo5m();
-
-    // === LOOP 3: NEW ROOT CANDLE OPEN SCAN (if enabled) ===
-    if (config.ROOT_CANDLE_OPEN_SCAN_ENABLED) {
-      logger.info({ interval: config.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS }, 'poller: [LOOP 3] ROOT CANDLE OPEN SCAN - enabled');
-      setInterval(() => this.scanRootCandleOpen(), config.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS * 1000);
-    } else {
-      logger.info('poller: [LOOP 3] ROOT CANDLE OPEN SCAN - disabled');
-    }
-  },
-
-  // ============================================
-  // LOOP 1: INITIAL SCAN & STARTUP
-  // ============================================
-  
-  async initialScan() {
-    logger.info('poller.initialScan: starting');
-
-    let allSymbols = [];
-    const useWs = !!config.USE_WS;
-
-    if (useWs) {
+      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
+      let tv = { score: 0, source: 'error' };
       try {
-        const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
-        logger.info({ timeoutMs: wsTimeoutMs }, 'poller: attempting WS initial scan');
-        allSymbols = await Promise.race([
-          this.performWsInitialScan(),
-          new Promise((_, reject) => setTimeout(() => reject(new Error('WS scan timeout')), wsTimeoutMs))
-        ]);
-        if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
-          logger.warn('poller: WS initial scan returned no symbols; will fallback to REST');
-          allSymbols = [];
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
+        const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
+        if (tvRes && typeof tvRes.score === 'number') {
+          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
+          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
         } else {
-          logger.info({ count: allSymbols.length }, 'poller: WS initial scan provided symbols');
+          logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
+          tv = { score: 0, source: 'error' };
         }
-      } catch (e) {
-        logger.debug({ e }, 'poller: WS initial scan failed or timed out; fallback to REST');
-        allSymbols = [];
+      } catch (err) {
+        logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
+        tv = { score: 0, source: 'error' };
       }
-    }
 
-    if (!allSymbols || allSymbols.length === 0) {
-      logger.info('poller: fetching symbols via REST (cursor pagination)');
-      allSymbols = await bybit.fetchAllSymbols();
-    }
+      // Subscribe to MTF websockets (for alignment updates)
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
-    if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
-      logger.warn('poller.initialScan: no symbols discovered');
-      return;
-    }
+      // Evaluate MTF alignment
+      const alignment = await this.evaluateMtfAlignment(symbol);
+      const mtfTfs = Object.keys(alignment || {});
+      const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
+      const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-    const db = dbModule.get();
-    const insert = db.prepare('INSERT OR REPLACE INTO symbols (symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)');
-    const now = Date.now();
-    const insertMany = db.transaction((rows) => {
-      for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT[Pp]?$/i, ''), s.quote || 'USDT', now);
-      }
-    });
-    insertMany(allSymbols.filter(s => s && s.symbol));
-    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted');
+      // Apply decision rules
+      const accept = await this.applyDecision(alignment);
 
-    const seedSymbols = bybit.getSeedSymbols(allSymbols);
-    if (seedSymbols && seedSymbols.length) {
-      setImmediate(() => this.backgroundSeedKlines(seedSymbols));
-    } else {
-      logger.info('poller.initialScan: no seed symbols to process (SYMBOL_SEED_ALL disabled or none)');
-    }
-  },
-
-  async performWsInitialScan() {
-    try {
-      const wsManager = require('./bybitWs');
-      if (wsManager && typeof wsManager.performInitialScan === 'function') {
-        const res = await wsManager.performInitialScan();
-        return Array.isArray(res) ? res : [];
-      }
-    } catch (e) {
-      logger.debug({ e }, 'performWsInitialScan failed');
-    }
-    return [];
-  },
-
-  async backgroundSeedKlines(symbols = []) {
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      logger.info('backgroundSeedKlines: nothing to seed');
-      return;
-    }
-    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting');
-
-    for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
-      const batch = symbols.slice(i, i + SEED_CONCURRENCY);
-      const jobs = batch.map(s => limiter.schedule(() => this.seedKlinesForSymbol(s.symbol)));
-      try {
-        await Promise.all(jobs);
-      } catch (e) {
-        logger.debug({ e }, 'backgroundSeedKlines: batch failed (continuing)');
-      }
-    }
-    logger.info('backgroundSeedKlines: completed');
-  },
-
-  async seedKlinesForSymbol(symbol, timeframe = null) {
-    try {
-      const rootTfs = timeframe ? [String(timeframe)] : (config.ROOT_TFS || []);
-      const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
-      const tfsSet = new Set([...(rootTfs || []), ...(mtfTfs || [])]);
-      const tfs = Array.from(tfsSet);
-
-      for (const tf of tfs) {
-        const interval = String(tf) === 'D' ? 'D' : String(tf);
+      // ========== NEW: Send MTF Confirmation Alert ==========
+      if (config.ALIGNMENT_CONFIRMATION_ALERT && mtfScore >= config.MTF_ALIGNMENT_RATING) {
         try {
-          const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
-          if (!klines || klines.length === 0) {
-            logger.debug({ symbol, tf }, 'seedKlinesForSymbol: no klines returned from API');
-            continue;
-          }
-
-          const db = dbModule.get();
-          const insert = db.prepare('INSERT OR IGNORE INTO klines (symbol, timeframe, open_time, open, high, low, close, volume) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-          const insertMany = db.transaction((rows) => {
-            for (const k of rows) {
-              insert.run(symbol, tf, k.open_time, k.open, k.high, k.low, k.close, k.volume);
-            }
+          logger.info({ symbol, root_tf, mtfScore }, 'MTF score meets threshold, sending confirmation alert');
+          await telegram.sendMtfConfirmationAlert({
+            symbol,
+            root_tf,
+            mtfScore,
+            alignment,
+            decision: accept && accept.decision ? accept.decision : 'unknown',
+            marketData: mdata || {},
+            tvScore: tv.score || 0
           });
-          insertMany(klines);
-          logger.debug({ symbol, tf, count: klines.length }, 'seedKlinesForSymbol: klines persisted');
-
-          try {
-            if (typeof macdUtil.computeAndStoreMacd === 'function') {
-              await macdUtil.computeAndStoreMacd(symbol, tf);
-            } else if (typeof macdUtil.computeMacdHistogram === 'function') {
-              await macdUtil.computeMacdHistogram(symbol, tf);
-            }
-          } catch (err) {
-            logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: macd warm-up failed (continuing)');
-          }
         } catch (err) {
-          logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: fetch failed (skipping tf)');
+          logger.warn({ err, symbol }, 'handleRootSignal: failed to send MTF confirmation alert');
         }
       }
-    } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'seedKlinesForSymbol: unexpected error');
-    }
-  },
+      // ========== END: MTF Confirmation Alert ==========
 
-  async scanAllForStartup() {
-    try {
-      logger.info('[LOOP 1] scanAllForStartup: starting full startup pass (silent)');
-      const db = dbModule.get();
-      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
+      // Compose meta and persist signal to DB
+      const meta = {
+        tvScore: tv.score || 0,
+        tvSource: tv.source || 'error',
+        mtfScore,
+        alignment,
+        acceptReason: accept && accept.reason ? accept.reason : null,
+        decision: accept && accept.decision ? accept.decision : 'monitor',
+        marketData: mdata || {}
+      };
+
+      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+
+      const signalObj = {
+        key,
+        symbol,
+        root_tf,
+        detected_at,
+        state: 'detected',
+        meta
+      };
+
+      if (notifyImmediately) {
+        // send telegram block immediately with all metrics
         try {
-          await Promise.all(tasks);
-        } catch (e) {
-          logger.debug({ e }, '[LOOP 1] scanAllForStartup: page tasks error (continuing)');
+          await telegram.sendRootSignalBlock({
+            symbol,
+            root_tf,
+            alignment,
+            detected_at,
+            accept,
+            marketData: mdata || {},
+            tvScore: tv.score || 0,
+            tvSource: tv.source || 'error',
+            mtfScore
+          });
+          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
+        } catch (err) {
+          logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
+      } else {
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
+        return signalObj;
       }
-      logger.info('[LOOP 1] scanAllForStartup: completed full startup pass');
-    } catch (err) {
-      logger.error({ err }, '[LOOP 1] scanAllForStartup: unexpected error');
-    }
-  },
 
-  // ============================================
-  // LOOP 2: 5-MINUTE BOUNDARY SCAN
-  // ============================================
-
-  scheduleAlignedTo5m() {
-    const msToNext5 = () => {
-      const d = new Date();
-      const m = d.getUTCMinutes();
-      const next = new Date(d);
-      const deltaM = 5 - (m % 5);
-      next.setUTCMinutes(m + deltaM);
-      next.setUTCSeconds(0);
-      next.setUTCMilliseconds(500);
-      return next - d;
-    };
-
-    let firstBoundaryPassed = false;
-
-    const schedule = async () => {
-      const wait = msToNext5();
-      logger.info({ wait, nextBoundaryIn: `${Math.round(wait / 1000)}s` }, '[LOOP 2] 5M BOUNDARY - waiting until next boundary');
-      
-      setTimeout(async () => {
-        try {
-          logger.info('[LOOP 2] 5M BOUNDARY - scan started');
-          
-          // === 5M BOUNDARY SCAN WITH TELEGRAM NOTIFICATION ===
-          await this.scan5mBoundary();
-
-          logger.info('[LOOP 2] 5M BOUNDARY - scan completed');
-
-          // === HANDLE LEAST PROFITABLE TRADE CLOSURE ===
-          if (config.CLOSE_LEAST_PROFITABLE_ENABLED) {
-            const openCount = dbModule.get().prepare('SELECT COUNT(*) as c FROM trades WHERE status = ?').get('open').c || 0;
-            if (openCount >= config.MAX_OPEN_TRADES) {
-              const minutesSinceHour = new Date().getUTCMinutes();
-              const closeMins = config.CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY || 5;
-              if (minutesSinceHour >= (60 - closeMins)) {
-                logger.info({ openCount, closeMins }, '[LOOP 2] Closing least profitable trade before boundary');
-                try {
-                  await tradeManager.closeLeastProfitableTrade();
-                } catch (err) {
-                  logger.error({ err }, '[LOOP 2] Error closing least profitable trade');
-                }
+      // Only when decision is 'accept' do we attempt to open a trade
+      if (accept && accept.decision === 'accept') {
+        if (!config.OPENTRADE) {
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
+        } else if (!openTradesAllowed) {
+          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
+        } else {
+          // Apply market-level filters
+          let passFilters = true;
+          if (config.MIN_MARKET_CAP > 0) {
+            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
+              passFilters = false;
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
+            }
+          }
+          if (config.MIN_24H_USDT_VOLUME > 0) {
+            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+              passFilters = false;
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
+            }
+          }
+          if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
+            const change = mdata?.volume_change_pct;
+            if (change === null || change === undefined) {
+              if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
+                passFilters = false;
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
+            } else {
+              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+                passFilters = false;
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
               }
             }
           }
 
-          // === HANDLE NEW ROOT CANDLE NOTIFICATION ===
-          try {
-            const now = new Date();
-            const minute = now.getUTCMinutes();
-            const hour = now.getUTCHours();
-            const newRootTfs = [];
-            
-            for (const tf of config.ROOT_TFS) {
-              if (String(tf).toUpperCase() === 'D') {
-                if (hour === 0 && minute === 0) newRootTfs.push('D');
-              } else {
-                const tfNum = Number(tf);
-                if (!isNaN(tfNum)) {
-                  const minutesSinceEpoch = Math.floor(now.getTime() / 60000);
-                  if (minutesSinceEpoch % tfNum === 0) newRootTfs.push(String(tf));
-                }
-              }
-            }
-
-            if (newRootTfs.length && config.NEW_ROOT_CANDLE_NOTIFY) {
-              logger.info({ timeframes: newRootTfs }, '[LOOP 2] New root candle(s) detected');
-              await signalManager.handleNewRootCandle(newRootTfs);
-            }
-          } catch (e) {
-            logger.debug({ e }, '[LOOP 2] handleNewRootCandle failed');
-          }
-
-          // === ENABLE OPEN TRADES AFTER FIRST BOUNDARY ===
-          if (!firstBoundaryPassed) {
-            firstBoundaryPassed = true;
+          if (passFilters) {
             try {
-              signalManager.setOpenTradesAllowed(true);
-              logger.info('[LOOP 2] Open trades enabled after first boundary');
-            } catch (e) {
-              logger.debug({ e }, '[LOOP 2] Failed to set open trades allowed');
+              await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
+              logger.info({ symbol }, 'handleRootSignal: trade opening initiated');
+            } catch (err) {
+              logger.error({ err, symbol }, 'handleRootSignal: openTrade error');
             }
+          } else {
+            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
           }
-
-        } catch (err) {
-          logger.error({ err }, '[LOOP 2] 5M BOUNDARY - task failed');
-        } finally {
-          schedule(); // Reschedule next boundary
-        }
-      }, wait);
-    };
-
-    schedule();
-  },
-
-  async scan5mBoundary() {
-    try {
-      const db = dbModule;
-      const prev = db.getLatestSignalsSnapshot();
-      const prevKeys = new Set(prev.map(r => r.key));
-
-      const scanStart = Date.now();
-
-      const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
-        try {
-          await Promise.all(tasks);
-        } catch (e) {
-          logger.debug({ e }, '[LOOP 2] 5m boundary: page tasks error (continuing)');
         }
       }
 
-      const after = db.getLatestSignalsSnapshot();
-      const newSignals = after.filter(r => !prevKeys.has(r.key) && r.detected_at >= scanStart);
-
-      if (newSignals.length > 0) {
-        logger.info({ count: newSignals.length }, '[LOOP 2] 5M BOUNDARY - new signals found, pushing to Telegram');
-
-        // === ALWAYS SEND TELEGRAM AT 5M BOUNDARY ===
-        const telegram = require('./telegram');
-        for (let i = 0; i < newSignals.length; i++) {
-          const s = newSignals[i];
-          try {
-            await telegram.sendNewSignalSingleBlock(s);
-            logger.info({ symbol: s.symbol, tf: s.root_tf }, '[LOOP 2] Signal sent to Telegram');
-          } catch (e) {
-            logger.error({ e, s }, '[LOOP 2] Failed to send Telegram signal');
-          }
-          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-        }
-      } else {
-        logger.info('[LOOP 2] 5M BOUNDARY - no new signals found');
-      }
-
-      try {
-        db.setState('lastScanAt', scanStart);
-        db.setState('lastScanSignals', after.map(r => r.key));
-      } catch (e) {
-        logger.debug({ e }, '[LOOP 2] Failed to persist scan state');
-      }
+      return signalObj;
     } catch (err) {
-      logger.error({ err }, '[LOOP 2] scan5mBoundary: unexpected error');
+      logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
+      return null;
+    } finally {
+      setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
     }
   },
 
-  // ============================================
-  // LOOP 3: ROOT CANDLE OPEN SCAN (Optional)
-  // ============================================
-
-  async scanRootCandleOpen() {
-    try {
-      logger.info('[LOOP 3] ROOT CANDLE OPEN - scan started');
-
-      const db = dbModule;
-      const prev = db.getLatestSignalsSnapshot();
-      const prevKeys = new Set(prev.map(r => r.key));
-
-      const scanStart = Date.now();
-
-      const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
-        try {
-          await Promise.all(tasks);
-        } catch (e) {
-          logger.debug({ e }, '[LOOP 3] page tasks error (continuing)');
-        }
-      }
-
-      const after = db.getLatestSignalsSnapshot();
-      const newSignals = after.filter(r => !prevKeys.has(r.key) && r.detected_at >= scanStart);
-
-      if (newSignals.length > 0) {
-        logger.info({ count: newSignals.length }, '[LOOP 3] ROOT CANDLE OPEN - new signals found, pushing to Telegram');
-
-        const telegram = require('./telegram');
-        for (let i = 0; i < newSignals.length; i++) {
-          const s = newSignals[i];
-          try {
-            await telegram.sendNewSignalSingleBlock(s);
-            logger.info({ symbol: s.symbol, tf: s.root_tf }, '[LOOP 3] Signal sent to Telegram');
-          } catch (e) {
-            logger.error({ e, s }, '[LOOP 3] Failed to send Telegram signal');
-          }
-          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-        }
-      } else {
-        logger.debug('[LOOP 3] ROOT CANDLE OPEN - no new signals found');
-      }
-
+  /**
+   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
+   */
+  async evaluateMtfAlignment(symbol) {
+    const result = {};
+    for (const tf of config.MTF_TFS) {
       try {
-        db.setState('lastRootCandleOpenScanAt', scanStart);
-      } catch (e) {
-        logger.debug({ e }, '[LOOP 3] Failed to persist scan state');
-      }
-    } catch (err) {
-      logger.error({ err }, '[LOOP 3] scanRootCandleOpen: unexpected error');
-    }
-  },
-
-  // ============================================
-  // SHARED UTILITY: SYMBOL ROOT SCAN
-  // ============================================
-
-  async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
-    const tfList = config.ROOT_TFS || [];
-    const results = [];
-    
-    for (const tf of tfList) {
-      try {
-        const db = dbModule.get();
-        const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2');
-        let rows = selectStmt.all(symbol, tf);
-        
-        if (!rows || rows.length < 2) {
-          logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now');
-          await this.seedKlinesForSymbol(symbol, tf);
-
-          rows = selectStmt.all(symbol, tf);
-          if (!rows || rows.length < 2) {
-            logger.debug({ symbol, tf }, 'scanSymbolRoots: still insufficient klines after seeding, skipping');
-            continue;
-          }
-        }
-
-        // Prevent duplicate flip detections for same candle
-        const stateKey = `${symbol}:${tf}`;
-        const latestCandleTime = rows[rows.length - 1].open_time;
-        
-        if (lastRootCandleState[stateKey] === latestCandleTime) {
-          logger.debug({ symbol, tf, candleTime: latestCandleTime }, 'scanSymbolRoots: candle already processed, skipping');
+        const hist = await macd.computeMacdHistogram(symbol, tf);
+        if (!hist || hist.length === 0) {
+          result[tf] = { ok: false, positive: false };
           continue;
         }
-        
-        lastRootCandleState[stateKey] = latestCandleTime;
-
-        // Check for MACD flip
-        const flip = await require('./macd').isMacdFlip(symbol, tf);
-        if (flip) {
-          const sig = await signalManager.handleRootSignal({
-            symbol,
-            root_tf: tf,
-            detected_at: detected_ts || Date.now(),
-            notifyImmediately
-          });
-          if (sig) results.push(sig);
-        }
+        const last = hist[hist.length - 1];
+        const prev = hist[hist.length - 2] || last;
+        result[tf] = {
+          histogram: last.histogram,
+          macd: last.MACD,
+          signal: last.signal,
+          rising: last.histogram > prev.histogram,
+          positive: last.histogram > 0,
+          ok: true
+        };
       } catch (err) {
-        logger.debug({ err, symbol, tf }, 'scanSymbolRoots: error checking flip');
+        logger.debug({ err, symbol, tf }, 'evaluateMtfAlignment error for timeframe');
+        result[tf] = { ok: false, positive: false };
       }
     }
-    return results;
+    return result;
+  },
+
+  /**
+   * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
+   */
+  async applyDecision(alignment) {
+    const tfList = Object.keys(alignment);
+    if (!tfList || tfList.length === 0) {
+      return { decision: 'reject', reason: 'no_mtf_data' };
+    }
+
+    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    if (allPositive) return { decision: 'accept', reason: 'all_positive' };
+
+    const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
+    if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
+      const d = alignment['D'];
+      if (d && d.rising) return { decision: 'accept', reason: 'daily_rising' };
+      return { decision: 'monitor', reason: 'daily_not_rising' };
+    }
+
+    if (negatives.length >= 1) {
+      return { decision: 'monitor', reason: 'some_negative' };
+    }
+
+    return { decision: 'reject', reason: 'unknown' };
+  },
+
+  /**
+   * sendStartupSummary: builds a snapshot of latest root signals and sends initial telegram message
+   */
+  async sendStartupSummary() {
+    try {
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
+      const telegramSvc = require('./telegram');
+
+      await telegramSvc.sendStartupSummary({ snapshot });
+    } catch (e) {
+      logger.debug({ e }, 'sendStartupSummary failed');
+    }
+  },
+
+  /**
+   * handleNewRootCandle: Called when new root candle opens
+   */
+  async handleNewRootCandle(newRootTfs = []) {
+    try {
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
+      const telegramSvc = require('./telegram');
+      await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
+    } catch (e) {
+      logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
+    }
   }
 };
