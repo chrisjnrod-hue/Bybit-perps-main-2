@@ -11,12 +11,7 @@ module.exports = {
       logger.warn('Telegram token not configured; telegram disabled');
       return;
     }
-    if (!config.TELEGRAM_CHAT_ID) {
-      logger.warn('Telegram chat ID not configured; telegram disabled');
-      return;
-    }
     if (!bot) bot = new TelegramBot(config.TELEGRAM_BOT_TOKEN, { polling: false });
-    logger.info('Telegram bot initialized');
   },
 
   getLabel(index, { lowercase = true } = {}) {
@@ -103,79 +98,24 @@ module.exports = {
   },
 
   async sendNewSignalSingleBlock(signal, _label = null) {
-    if (!bot) {
-      logger.debug('Telegram bot not initialized, skipping sendNewSignalSingleBlock');
-      return;
-    }
+    if (!bot) return;
     try {
-      if (!signal || !signal.symbol) {
-        logger.warn('sendNewSignalSingleBlock: invalid signal object');
-        return;
-      }
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal single block sent');
     } catch (err) {
-      logger.warn({ err, symbol: signal?.symbol }, 'Failed to send telegram new-signal block');
-    }
-  },
-
-  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvSource = 'error', mtfScore = 0 }) {
-    if (!bot) {
-      logger.debug('Telegram bot not initialized, skipping sendRootSignalBlock');
-      return;
-    }
-    try {
-      const timeStr = new Date(detected_at).toISOString();
-      
-      let alignmentLines = Object.entries(alignment || {}).map(([tf, info]) => {
-        if (!info || !info.hasOwnProperty('histogram')) return `${tf}: ⚪ unknown`;
-        const posSym = info.positive ? '🟢' : '🔴';
-        const rise = info.rising ? '↑' : '↓';
-        return `${tf}: ${posSym} ${info.positive ? 'POS' : 'NEG'} hist=${Number(info.histogram).toFixed(6)} ${rise}`;
-      }).join('\n');
-
-      const decision = accept && accept.decision ? accept.decision : 'monitor';
-      const tvPercent = Math.round((tvScore || 0) * 100);
-      const mtfPercent = Math.round((mtfScore || 0) * 100);
-
-      const marketLines = this.formatMarketData(marketData || {});
-
-      const msg = [
-        `🎯 Root signal: ${symbol} (${root_tf})`,
-        `⏰ Time: ${timeStr}`,
-        `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision}`,
-        '',
-        `📊 Scoring: TV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`,
-        '',
-        `🛰️ MTF Status:`,
-        alignmentLines || 'No MTF data',
-        '',
-        `💱 Market Data:`,
-        marketLines,
-        '',
-        `Reason: ${accept?.reason || 'n/a'}`
-      ].join('\n');
-
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol, root_tf }, 'Telegram root signal message sent with market data & TV rating');
-    } catch (err) {
-      logger.warn({ err, symbol }, 'Failed to send telegram root signal block');
+      logger.warn({ err }, 'Failed to send telegram new-signal block');
     }
   },
 
   /**
    * sendStartupSummary:
-   * LOOP 1 (Initial Deploy)
-   * - Summary header with counts per root TF + vertical symbol list
-   * - Per-signal detailed blocks (sorted by symbol, root_tf)
-   * - Recommended block with highest-scoring signals
+   * - LOOP 1 initial startup method
+   * - Sends: header with counts + per-signal detail blocks + recommended section
+   * - This is used ONLY at initial deploy/startup
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
-    if (!bot) {
-      logger.debug('Telegram bot not initialized, skipping sendStartupSummary');
-      return;
-    }
+    if (!bot) return;
     try {
       const db = dbModule.get();
 
@@ -191,6 +131,8 @@ module.exports = {
           try { 
             if (typeof poller.scanAllForStartup === 'function') {
               await poller.scanAllForStartup();
+            } else if (typeof poller.scanOnce === 'function') {
+              await poller.scanOnce({ notifyNewSignals: false });
             }
           } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed'); }
         } catch (e) {
@@ -250,7 +192,7 @@ module.exports = {
         try {
           await this.sendNewSignalSingleBlock(signals[i], null);
         } catch (e) {
-          logger.debug({ e, i, symbol: signals[i]?.symbol }, 'sendStartupSummary: failed to send per-signal block');
+          logger.debug({ e, i }, 'sendStartupSummary: failed to send per-signal block');
         }
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
@@ -310,15 +252,12 @@ module.exports = {
 
   /**
    * sendRootCandleUpdate:
-   * LOOP 3 (New Root Candle Open)
-   * - Filtered snapshot for newly opened root TFs
-   * - Sends summary header + per-signal blocks + recommended
+   * - LOOP 3: Called when new root candles open
+   * - Sends per-signal detail blocks for the new candles
+   * - NO summary header, NO recommended section
    */
   async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
-    if (!bot) {
-      logger.debug('Telegram bot not initialized, skipping sendRootCandleUpdate');
-      return;
-    }
+    if (!bot) return;
     try {
       let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
       if (!signals && typeof dbModule.getLatestSignalsSnapshot === 'function') {
@@ -329,64 +268,32 @@ module.exports = {
         ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
         : signals;
 
-      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending for new root candles');
-      await this.sendStartupSummary({ snapshot: filtered });
+      if (filtered.length === 0) {
+        logger.info({ newRootTfs }, 'sendRootCandleUpdate: no signals to send for new candles');
+        return;
+      }
+
+      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending per-signal blocks for new root candles');
+
+      // Send ONLY per-signal blocks (no summary header, no recommended)
+      filtered.sort((a, b) => {
+        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
+        if (s !== 0) return s;
+        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
+      });
+
+      for (let i = 0; i < filtered.length; i++) {
+        try {
+          await this.sendNewSignalSingleBlock(filtered[i], null);
+        } catch (e) {
+          logger.debug({ e, i }, 'sendRootCandleUpdate: failed to send per-signal block');
+        }
+        await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+      }
+
+      logger.info({ count: filtered.length }, 'sendRootCandleUpdate: completed (per-signal blocks sent)');
     } catch (err) {
       logger.warn({ err }, 'Failed to send root candle update');
-    }
-  },
-
-  /**
-   * sendMtfAlignmentAlert:
-   * LOOP 2 (5m Boundary Scan)
-   * - Alerts for monitored signals when MTF alignment changes
-   * - Bug #7 fix: validates alignment objects before sending
-   * - Bug #8 fix: checks TELEGRAM_CHAT_ID at init time
-   */
-  async sendMtfAlignmentAlert({ symbol, root_tf, prevAlignment = {}, currentAlignment = {} }) {
-    if (!bot) {
-      logger.debug('Telegram bot not initialized, skipping sendMtfAlignmentAlert');
-      return;
-    }
-    try {
-      // Bug #7 fix: Validate we actually have alignments to compare
-      if (!prevAlignment || Object.keys(prevAlignment).length === 0) {
-        logger.debug({ symbol, root_tf }, 'sendMtfAlignmentAlert: empty prevAlignment, skipping alert');
-        return;
-      }
-      if (!currentAlignment || Object.keys(currentAlignment).length === 0) {
-        logger.debug({ symbol, root_tf }, 'sendMtfAlignmentAlert: empty currentAlignment, skipping alert');
-        return;
-      }
-
-      const { lines: prevLines } = this.buildAlignmentLines(prevAlignment);
-      const { lines: currLines } = this.buildAlignmentLines(currentAlignment);
-
-      // Validate we actually have data to show
-      if (!prevLines || prevLines.trim() === '') {
-        logger.debug({ symbol, root_tf }, 'sendMtfAlignmentAlert: prevLines empty after build');
-        return;
-      }
-      if (!currLines || currLines.trim() === '') {
-        logger.debug({ symbol, root_tf }, 'sendMtfAlignmentAlert: currLines empty after build');
-        return;
-      }
-
-      const msg = [
-        `🔔 MTF Alignment Alert: ${symbol} (${root_tf})`,
-        `⏰ Time: ${new Date().toISOString()}`,
-        '',
-        `Previous:`,
-        prevLines || 'No data',
-        '',
-        `Current:`,
-        currLines || 'No data'
-      ].join('\n');
-
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol, root_tf }, 'Telegram MTF alignment alert sent');
-    } catch (err) {
-      logger.warn({ err, symbol }, 'Failed to send MTF alignment alert');
     }
   }
 };
