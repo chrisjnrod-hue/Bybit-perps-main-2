@@ -247,7 +247,7 @@ module.exports = {
           }
         }
 
-        // Check for MACD flip WITHOUT using lastRootCandleState
+        // Check for MACD flip
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
           const sig = await signalManager.handleRootSignal({
@@ -269,7 +269,7 @@ module.exports = {
    * LOOP 2: 5m Boundary Scan
    * - Runs every 5 minutes aligned to UTC boundaries (0, 5, 10, 15, ... 55 minutes)
    * - Scans all symbols for root signals
-   * - Sends one telegram per NEW signal detected since last boundary using the per-signal block
+   * - Sends telegram for signals newly detected during this scan boundary
    * - Sends MTF alignment/confirmation alerts for monitored root signals
    */
   schedule5mBoundaryScan() {
@@ -279,27 +279,26 @@ module.exports = {
       const next = new Date(d);
       const deltaM = 5 - (m % 5);
       next.setUTCMinutes(m + deltaM);
-      // precise alignment at second 0, small offset for scheduling (100ms)
       next.setUTCSeconds(0);
       next.setUTCMilliseconds(100);
       return next - d;
     };
 
     let firstBoundaryPassed = false;
-    let lastBoundarySignalKeys = new Set(); // Track signals from LAST boundary
+    let lastBoundaryTimestamp = Date.now();
 
     const schedule = async () => {
       const wait = msToNext5();
       logger.info({ wait, loopName: 'LOOP_2_5m_boundary_scan', nextBoundary: new Date(Date.now() + wait).toISOString() }, 'Waiting ms until next 5m boundary');
       
       setTimeout(async () => {
+        const scanStart = Date.now();
         try {
-          // execute exact-boundary scan
-          await this.scan5mBoundary(lastBoundarySignalKeys);
+          // Execute exact-boundary scan passing last boundary timestamp context
+          await this.scan5mBoundary(lastBoundaryTimestamp);
           
-          // Update lastBoundarySignalKeys for next iteration
-          const currentSignals = dbModule.getLatestSignalsSnapshot();
-          lastBoundarySignalKeys = new Set(currentSignals.map(s => s.key));
+          // Update lastBoundaryTimestamp for next iteration
+          lastBoundaryTimestamp = scanStart;
 
           // Close least profitable trade if enabled
           if (config.CLOSE_LEAST_PROFITABLE_ENABLED) {
@@ -341,16 +340,15 @@ module.exports = {
   /**
    * scan5mBoundary:
    * - Actively SCANS all symbols for root signals at the boundary
-   * - Compares newly detected signals against previous boundary
-   * - Sends telegram ONLY for signals new since last boundary (one block per signal)
+   * - Identifies newly detected signals by checking timestamps generated during the scan
+   * - Sends telegram blocks for new signals
    * - Sends MTF alignment alerts for monitored root signals
    */
-  async scan5mBoundary(lastBoundarySignalKeys = new Set()) {
+  async scan5mBoundary(lastBoundaryTimestamp = 0) {
     try {
       const scanStart = Date.now();
-      logger.info({ scanStart: new Date(scanStart).toISOString() }, 'LOOP 2: Starting 5m boundary scan');
+      logger.info({ scanStart: new Date(scanStart).toISOString(), lastBoundaryTimestamp }, 'LOOP 2: Starting 5m boundary scan');
 
-      // ACTIVELY SCAN all symbols for root signals (seed if needed, compute macd, etc)
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
@@ -366,16 +364,12 @@ module.exports = {
         }
       }
 
-      // Get current signals and identify NEW ones (not present in last boundary)
+      // Get current signals and identify NEW ones detected during this scan pass
       const currentSignals = dbModule.getLatestSignalsSnapshot();
-      const currentKeys = new Set(currentSignals.map(s => s.key));
-      const newSignals = currentSignals.filter(s => 
-        !lastBoundarySignalKeys.has(s.key) && s.detected_at >= scanStart
-      );
+      const newSignals = currentSignals.filter(s => s.detected_at >= scanStart);
 
       logger.info({ 
         totalSignals: currentSignals.length, 
-        previousBoundary: lastBoundarySignalKeys.size, 
         newCount: newSignals.length 
       }, 'LOOP 2: Scan complete');
 
@@ -383,15 +377,12 @@ module.exports = {
 
       if (newSignals.length > 0) {
         logger.info({ newCount: newSignals.length }, 'LOOP 2: New signals found, sending telegram blocks');
-        // Send exactly one per-signal block for each new signal
         for (let i = 0; i < newSignals.length; i++) {
           const s = newSignals[i];
           try {
-            // Use per-signal block function exactly
             if (typeof telegram.sendNewSignalSingleBlock === 'function') {
               await telegram.sendNewSignalSingleBlock(s);
             } else if (typeof telegram.sendSignalBlock === 'function') {
-              // fallback older naming if exists
               await telegram.sendSignalBlock(s);
             } else {
               logger.warn({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 2: No telegram per-signal function found - skipping send');
@@ -410,7 +401,6 @@ module.exports = {
       try {
         const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
         if (mtfTfs.length > 0 && currentSignals && currentSignals.length > 0) {
-          // find monitored signals (support multiple possible property names)
           const monitoredSignals = currentSignals.filter(s => s && (s.monitored === 1 || s.monitored === true || s.is_monitored === 1 || s.is_monitored === true || s.monitor === 1 || s.monitor === true));
           for (const msig of monitoredSignals) {
             try {
@@ -418,11 +408,9 @@ module.exports = {
                 o && o.symbol === msig.symbol && mtfTfs.includes(String(o.root_tf))
               );
               for (const other of sameSymbolMtf) {
-                // check if the signal direction matches (support property names)
                 const msigSide = msig.side || msig.direction || msig.type || msig.signal;
                 const otherSide = other.side || other.direction || other.type || other.signal;
                 if (msigSide && otherSide && String(msigSide) === String(otherSide)) {
-                  // we have an MTF confirmation/alignment
                   try {
                     if (typeof telegram.sendMtfAlignmentSingleBlock === 'function') {
                       await telegram.sendMtfAlignmentSingleBlock({
@@ -430,7 +418,6 @@ module.exports = {
                         alignedSignal: other
                       });
                     } else if (typeof telegram.sendNewSignalSingleBlock === 'function') {
-                      // fallback: send as per-signal block with an mtf_alignment annotation
                       await telegram.sendNewSignalSingleBlock(Object.assign({}, msig, { mtf_alignment: { aligned_tf: other.root_tf, aligned_with: other.key || other.root_tf } }));
                     } else {
                       logger.warn('LOOP 2: No telegram MTF/per-signal function found - skipping alignment send');
@@ -459,9 +446,6 @@ module.exports = {
    * LOOP 3: New Root Candle Open Scan
    * - Runs at PRECISE root timeframe candle opens
    * - ACTIVELY SCANS for new signals AT candle open time
-   * - Uses same notification format as LOOP 1:
-   *   - per-signal immediate sends during scan (via notifyImmediately=true)
-   *   - then a summary-style update for the relevant candle-open root TF signals (startup-style summary)
    */
   scheduleNewRootCandleScan() {
     const schedule = async () => {
@@ -478,7 +462,6 @@ module.exports = {
         
         await sleep(waitMs);
         
-        // Execute scan at candle open
         const detectedTfs = this.detectCurrentCandleOpens();
         if (detectedTfs && detectedTfs.length > 0) {
           logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Candle(s) detected as open');
@@ -489,7 +472,6 @@ module.exports = {
       } catch (err) {
         logger.error({ err }, 'LOOP 3: Unexpected error');
       } finally {
-        // Reschedule immediately
         schedule();
       }
     };
@@ -500,10 +482,7 @@ module.exports = {
   /**
    * scanAndNotifyNewCandles:
    * - ACTIVELY SCANS all symbols for root signals on newly opened TFs
-   * - Uses the same notification pattern as LOOP 1:
-   *   - during scan: per-signal immediate sends via signalManager.handleRootSignal (notifyImmediately=true)
-   *   - after scan: sends a summary-style update for the relevant candle-open root TF signals
-   * - Also sends MTF alignment alerts for monitored signals
+   * - Sends immediate per-signal blocks and summary updates
    */
   async scanAndNotifyNewCandles(detectedTfs = []) {
     try {
@@ -515,8 +494,6 @@ module.exports = {
       logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Starting active scan for new candle signals');
       const scanStart = Date.now();
 
-      // ACTIVELY SCAN all symbols for signals on the newly opened TFs
-      // NOTE: For Loop 3 we run notifyImmediately=true so signalManager will send per-signal blocks during scanning (same as Loop 1)
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
@@ -532,7 +509,6 @@ module.exports = {
         }
       }
 
-      // After per-symbol immediate sends, build a snapshot of relevant signals for these TFs and send a summary (same format as Loop 1 startup summary)
       try {
         const allSignals = dbModule.getLatestSignalsSnapshot();
         const candleSignals = allSignals.filter(s => 
@@ -547,12 +523,10 @@ module.exports = {
         if (candleSignals.length > 0) {
           try {
             const telegram = require('./telegram');
-            // sendStartupSummary expects a snapshot; we provide the filtered snapshot for these candle opens
             if (typeof telegram.sendStartupSummary === 'function') {
               await telegram.sendStartupSummary({ snapshot: candleSignals });
               logger.info({ count: candleSignals.length }, 'LOOP 3: Sent summary-style update for candle-open signals');
             } else {
-              // Fallback: send per-signal blocks again if summary function is not available
               for (const s of candleSignals) {
                 try {
                   if (typeof telegram.sendNewSignalSingleBlock === 'function') {
@@ -573,7 +547,7 @@ module.exports = {
           logger.info({ detectedTfs }, 'LOOP 3: No signals detected on these candle opens');
         }
 
-        // Also detect MTF alignments like LOOP 2 (for monitored signals)
+        // MTF alignment checks
         try {
           const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
           if (mtfTfs.length > 0 && allSignals && allSignals.length > 0) {
@@ -623,9 +597,6 @@ module.exports = {
     }
   },
 
-  /**
-   * Helper: Convert timeframe string to milliseconds
-   */
   timeframeToMs(tf) {
     if (!tf) return -1;
     const tfStr = String(tf).toUpperCase();
@@ -643,11 +614,6 @@ module.exports = {
     }
   },
 
-  /**
-   * calculateNextCandleEvent:
-   * - Calculate NEXT candle open time across ALL root TFs
-   * - Factor in 100ms buffer for system latency
-   */
   calculateNextCandleEvent() {
     const nowMs = Date.now();
     let nextOpenMs = Infinity;
@@ -684,10 +650,6 @@ module.exports = {
     };
   },
 
-  /**
-   * detectCurrentCandleOpens:
-   * - Check which root TFs are currently opening (within ±2 second window)
-   */
   detectCurrentCandleOpens() {
     const nowMs = Date.now();
     const detectedTfs = [];
