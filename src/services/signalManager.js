@@ -29,7 +29,6 @@ module.exports = {
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
    * - returns the persisted signal object
    * - ALWAYS fetches fresh market data and TV rating for complete signal block
-   * - NEW: Sends separate MTF confirmation alert if score meets threshold
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
@@ -81,25 +80,6 @@ module.exports = {
 
       // Apply decision rules
       const accept = await this.applyDecision(alignment);
-
-      // ========== NEW: Send MTF Confirmation Alert ==========
-      if (config.ALIGNMENT_CONFIRMATION_ALERT && mtfScore >= config.MTF_ALIGNMENT_RATING) {
-        try {
-          logger.info({ symbol, root_tf, mtfScore }, 'MTF score meets threshold, sending confirmation alert');
-          await telegram.sendMtfConfirmationAlert({
-            symbol,
-            root_tf,
-            mtfScore,
-            alignment,
-            decision: accept && accept.decision ? accept.decision : 'unknown',
-            marketData: mdata || {},
-            tvScore: tv.score || 0
-          });
-        } catch (err) {
-          logger.warn({ err, symbol }, 'handleRootSignal: failed to send MTF confirmation alert');
-        }
-      }
-      // ========== END: MTF Confirmation Alert ==========
 
       // Compose meta and persist signal to DB
       const meta = {
