@@ -48,28 +48,16 @@ module.exports = {
   },
 
   formatMarketData(md = {}) {
-    // Accept either normalized keys or provider keys
     const price = (typeof md.price === 'number') ? md.price : (md.price ? Number(md.price) : null);
     const vol24 = (typeof md.volume_24h_usdt === 'number') ? md.volume_24h_usdt : (md.volume_24h_usdt ? Number(md.volume_24h_usdt) : null);
     const volChange = (typeof md.volume_change_pct === 'number') ? md.volume_change_pct : (md.volume_change_pct ? Number(md.volume_change_pct) : null);
     const marketCap = (typeof md.market_cap === 'number') ? md.market_cap : (md.market_cap ? Number(md.market_cap) : null);
 
-    // Also accept camelCase aliases
-    const priceAlt = (typeof md.last === 'number') ? md.last : (md.last ? Number(md.last) : null);
-    const vol24Alt = (typeof md.volume24h === 'number') ? md.volume24h : (md.volume24h ? Number(md.volume24h) : null);
-    const volChangeAlt = (typeof md.volumeChangePct === 'number') ? md.volumeChangePct : (md.volumeChangePct ? Number(md.volumeChangePct) : null);
-    const marketCapAlt = (typeof md.marketCap === 'number') ? md.marketCap : (md.marketCap ? Number(md.marketCap) : null);
-
-    const finalPrice = price !== null ? price : (priceAlt !== null ? priceAlt : 0);
-    const finalVol24 = vol24 !== null ? vol24 : (vol24Alt !== null ? vol24Alt : 0);
-    const finalVolChange = volChange !== null ? volChange : (volChangeAlt !== null ? volChangeAlt : null);
-    const finalMarketCap = marketCap !== null ? marketCap : (marketCapAlt !== null ? marketCapAlt : null);
-
     const lines = [
-      `💰 Price: ${finalPrice !== null && finalPrice > 0 ? '$' + finalPrice.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '0'}`,
-      `💵 24h Volume: ${finalVol24 !== null && finalVol24 > 0 ? '$' + finalVol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT' : '0 USDT'}`,
-      `📈 Volume Change: ${finalVolChange !== null ? (Number(finalVolChange).toFixed(2) + '%') : 'n/a'}`,
-      `💎 Market Cap: ${finalMarketCap && finalMarketCap > 0 ? '$' + finalMarketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
+      `💰 Price: ${price !== null && price > 0 ? '$' + price.toLocaleString('en-US', { maximumFractionDigits: 8 }) : '0'}`,
+      `💵 24h Volume: ${vol24 !== null && vol24 > 0 ? '$' + vol24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT' : '0 USDT'}`,
+      `📈 Volume Change: ${volChange !== null ? volChange.toFixed(2) + '%' : 'n/a'}`,
+      `💎 Market Cap: ${marketCap && marketCap > 0 ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 }) : 'n/a'}`
     ];
     return lines.join('\n');
   },
@@ -78,12 +66,7 @@ module.exports = {
     const { symbol, root_tf, detected_at, meta = {} } = signal || {};
     const timeStr = detected_at ? new Date(detected_at).toISOString() : new Date().toISOString();
     const alignment = meta.alignment || {};
-
-    // Prefer explicit percent field (tvScorePct) if present, else compute from raw tvScore safely
-    const tvScoreRaw = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
-    const tvScorePctFromMeta = (typeof meta.tvScorePct === 'number' && !isNaN(meta.tvScorePct)) ? meta.tvScorePct : null;
-    const tvPercent = tvScorePctFromMeta !== null ? tvScorePctFromMeta : Math.round((tvScoreRaw || 0) * 100);
-
+    const tvScore = (typeof meta.tvScore === 'number') ? meta.tvScore : (meta.tvScore ? Number(meta.tvScore) : 0);
     const tvSource = meta.tvSource || 'error';
     const mtfScore = (typeof meta.mtfScore === 'number') ? meta.mtfScore : null;
     const decision = meta.decision || 'monitor';
@@ -91,8 +74,9 @@ module.exports = {
 
     const { lines: alignmentLines, mtfScore: computedMtfScore } = this.buildAlignmentLines(alignment);
     const usedMtfScore = (mtfScore !== null) ? mtfScore : computedMtfScore;
-    const mtfPercent = Math.round((usedMtfScore || 0) * 100);
 
+    const tvPercent = Math.round((tvScore || 0) * 100);
+    const mtfPercent = Math.round((usedMtfScore || 0) * 100);
     const scoringLine = `📊 Scoring:\nTV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`;
     const mtfHeader = `🛰️ MTF Status:`;
     const marketBlock = `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
@@ -124,7 +108,7 @@ module.exports = {
     }
   },
 
-  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvScorePct = null, tvSource = 'error', mtfScore = 0 }) {
+  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvSource = 'error', mtfScore = 0 }) {
     if (!bot) return;
     const timeStr = new Date(detected_at).toISOString();
     
@@ -136,9 +120,7 @@ module.exports = {
     }).join('\n');
 
     const decision = accept && accept.decision ? accept.decision : 'monitor';
-
-    // prefer explicit percentage if provided
-    const tvPercent = (typeof tvScorePct === 'number' && !isNaN(tvScorePct)) ? tvScorePct : Math.round((tvScore || 0) * 100);
+    const tvPercent = Math.round((tvScore || 0) * 100);
     const mtfPercent = Math.round((mtfScore || 0) * 100);
 
     const marketLines = this.formatMarketData(marketData || {});
@@ -172,9 +154,6 @@ module.exports = {
    * - Summary header with counts per root TF + vertical symbol list
    * - Per-signal detailed blocks (no alphabetical labels)
    * - Recommended block with highest-scoring signals
-   *
-   * This version is defensive: it will still show recommended lines even when no signals have decision === 'accept'
-   * by falling back to top non-rejected signals.
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -186,34 +165,37 @@ module.exports = {
         signals = dbModule.getLatestSignalsSnapshot() || [];
       }
 
-      // If still empty, try reading signals table as fallback
-      if (!Array.isArray(signals) || signals.length === 0) {
+      if (!signals.length) {
         try {
-          if (db && db.prepare) {
-            const rows = db.prepare('SELECT key, symbol, root_tf, detected_at, state, meta FROM signals ORDER BY detected_at DESC LIMIT ?').all(500);
-            if (rows && rows.length) {
-              signals = rows.map(r => {
-                let meta = r.meta;
-                if (typeof meta === 'string') {
-                  try { meta = JSON.parse(meta); } catch (e) { /* keep as string */ }
-                }
-                return {
-                  key: r.key,
-                  symbol: r.symbol,
-                  root_tf: r.root_tf,
-                  detected_at: r.detected_at,
-                  state: r.state,
-                  meta
-                };
-              });
+          const poller = require('./poller');
+          try { await poller.initialScan(); } catch (e) { logger.debug({ e }, 'sendStartupSummary: initialScan failed'); }
+          try { 
+            if (typeof poller.scanAllForStartup === 'function') {
+              await poller.scanAllForStartup();
+            } else if (typeof poller.scanOnce === 'function') {
+              await poller.scanOnce({ notifyNewSignals: false });
             }
-          }
+          } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed'); }
         } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: fallback DB read failed');
+          logger.debug({ e }, 'sendStartupSummary: could not require poller');
+        }
+
+        const waitMs = Number(config.STARTUP_SUMMARY_WAIT_MS || 15000);
+        const retryMs = Number(config.STARTUP_SUMMARY_RETRY_MS || 500);
+        const start = Date.now();
+        while (Date.now() - start < waitMs) {
+          try {
+            signals = dbModule.getLatestSignalsSnapshot() || [];
+          } catch (e) {
+            logger.debug({ e }, 'sendStartupSummary: error fetching snapshot');
+            signals = [];
+          }
+          if (signals && signals.length) break;
+          await this._sleep(retryMs);
         }
       }
 
-      // Build counts per root_tf and symbol set
+      // Build counts per root_tf
       const tfCounts = {};
       const symbolSet = new Set();
       for (const s of signals) {
@@ -270,49 +252,31 @@ module.exports = {
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      // Build normalized candidate objects defensively
-      const normalizedCandidates = signals.map(s => {
-        const meta = s.meta || {};
-        // Accept various possible shapes for the decision
-        const dec = (meta && meta.decision) || (meta && meta.accept && meta.accept.decision) || (meta && meta.acceptDecision) || 'monitor';
-        const tvPct = (typeof meta.tvScorePct === 'number') ? meta.tvScorePct : (typeof meta.tvScore === 'number' ? Math.round(meta.tvScore * 100) : 0);
-        const mtf = (typeof meta.mtfScore === 'number') ? meta.mtfScore : 0;
-        return {
-          key: s.key,
+      const candidates = signals
+        .map(s => ({
           symbol: s.symbol,
           root_tf: s.root_tf,
-          tvScorePct: tvPct,
-          mtfScore: mtf,
-          acceptDecision: String(dec),
-          reason: meta?.acceptReason || meta?.reason || 'n/a',
+          tvScore: s.meta?.tvScore || 0,
+          mtfScore: s.meta?.mtfScore || 0,
+          acceptDecision: s.meta?.decision || 'monitor',
+          reason: s.meta?.acceptReason || 'n/a',
           raw: s
-        };
-      });
-
-      // First try explicitly accepted signals
-      let candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() === 'accept');
-
-      // If none accepted, fall back to top non-rejected signals (so we still show recommended lines)
-      if (candidates.length === 0) {
-        candidates = normalizedCandidates.filter(c => String(c.acceptDecision).toLowerCase() !== 'reject');
-      }
-
-      // Sort candidates by tvScorePct desc then mtfScore desc
-      candidates.sort((a, b) => {
-        if (b.tvScorePct !== a.tvScorePct) return b.tvScorePct - a.tvScorePct;
-        return b.mtfScore - a.mtfScore;
-      });
+        }))
+        .filter(c => c.acceptDecision === 'accept')
+        .sort((a, b) => {
+          if (b.tvScore !== a.tvScore) return b.tvScore - a.tvScore;
+          return b.mtfScore - a.mtfScore;
+        });
 
       const recommended = candidates.slice(0, maxSlots);
 
-      if (!recommended || recommended.length === 0) {
-        // If there truly are no candidates (e.g., no signals), still send the default note
+      if (recommended.length === 0) {
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
       } else {
         for (let i = 0; i < recommended.length; i++) {
           const r = recommended[i];
           const label = this.getLabel(i, { lowercase: true });
-          const tvPercent = r.tvScorePct;
+          const tvPercent = Math.round((r.tvScore || 0) * 100);
           const mtfPercent = Math.round((r.mtfScore || 0) * 100);
           const simNote = config.OPENTRADE ? '' : ' [SIMULATED]';
           const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${tvPercent}% MTF:${mtfPercent}% - ${r.reason}${simNote}`;
