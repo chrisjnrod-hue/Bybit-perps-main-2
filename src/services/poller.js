@@ -44,9 +44,9 @@ module.exports = {
         // Full scan on startup (silent, no notifications)
         try {
           await this.scanAllForStartup();
-          logger.info('poller: startup full scan completed');
+          logger.info('poller: LOOP 1 startup full scan completed');
         } catch (err) {
-          logger.error({ err }, 'poller: scanAllForStartup error');
+          logger.error({ err }, 'poller: LOOP 1 scanAllForStartup error');
         }
 
         // Send startup summary via telegram (includes header + per-signal blocks + recommended)
@@ -54,20 +54,20 @@ module.exports = {
           const telegram = require('./telegram');
           const snapshot = dbModule.getLatestSignalsSnapshot();
           await telegram.sendStartupSummary({ snapshot });
-          logger.info('poller: Startup summary telegram sent');
+          logger.info('poller: LOOP 1 Startup summary telegram sent');
         } catch (err) {
-          logger.error({ err }, 'poller: Failed to send startup summary');
+          logger.error({ err }, 'poller: LOOP 1 Failed to send startup summary');
         }
 
       } catch (err) {
-        logger.error({ err }, 'poller: initialScan failed');
+        logger.error({ err }, 'poller: LOOP 1 initialScan failed');
       }
     })();
 
-    // LOOP 2: 5m Boundary Scan (precise 5-minute aligned scanning)
+    // LOOP 2: 5m Boundary Scan
     this.schedule5mBoundaryScan();
 
-    // LOOP 3: New Root Candle Open Scan (aligned to root TF candle opens)
+    // LOOP 3: New Root Candle Open Scan
     this.scheduleNewRootCandleScan();
   },
 
@@ -204,83 +204,96 @@ module.exports = {
 
   async scanAllForStartup() {
     try {
-      logger.info('LOOP 1: Starting full startup scan (silent)');
+      logger.info('LOOP 1: scanAllForStartup - starting full startup scan');
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      let totalScanned = 0;
       
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRootsComprehensive(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
+        const tasks = page.map(r => this.fullComprehensiveScan(r.symbol, { detected_ts: Date.now() }));
         try {
-          await Promise.all(tasks);
+          const results = await Promise.all(tasks);
+          const signalsFound = results.reduce((sum, arr) => sum + (Array.isArray(arr) ? arr.length : 0), 0);
+          totalScanned += page.length;
+          logger.debug({ pageSize: page.length, signalsFound }, 'LOOP 1: Page scanned');
         } catch (e) {
           logger.debug({ e }, 'LOOP 1: page tasks error (continuing)');
         }
       }
-      logger.info('LOOP 1: Completed full startup scan');
+      logger.info({ totalScanned }, 'LOOP 1: scanAllForStartup completed');
     } catch (err) {
       logger.error({ err }, 'LOOP 1: scanAllForStartup unexpected error');
     }
   },
 
   /**
-   * scanSymbolRootsComprehensive:
-   * Used by LOOP 1 (initial deploy scan)
-   * Full comprehensive scan: seeds klines, computes MACD, checks for flips
-   * This is the MASTER scanning function that ensures data availability
+   * fullComprehensiveScan:
+   * Complete scan process: seed klines → compute MACD → detect flips
+   * Used by LOOP 1, LOOP 2, and LOOP 3
+   * Returns array of signal objects
    */
-  async scanSymbolRootsComprehensive(symbol, { notifyImmediately = false, detected_ts = null } = {}) {
+  async fullComprehensiveScan(symbol, { detected_ts = null } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
     
     for (const tf of tfList) {
       try {
-        const db = dbModule.get();
+        logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 1 - Seeding klines');
         
-        // STEP 1: Ensure klines are seeded (fetch if missing)
-        logger.debug({ symbol, tf }, 'scanSymbolRootsComprehensive: checking klines availability');
+        // STEP 1: Seed klines for this symbol+tf
         await this.seedKlinesForSymbol(symbol, tf);
         
-        // STEP 2: Verify we have klines
-        const selectStmt = db.prepare('SELECT open_time FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 1');
-        const klineRow = selectStmt.get(symbol, tf);
+        // STEP 2: Verify klines exist in DB
+        const db = dbModule.get();
+        const klineCheck = db.prepare('SELECT COUNT(*) as cnt FROM klines WHERE symbol=? AND timeframe=?').get(symbol, tf);
+        const klineCount = klineCheck ? klineCheck.cnt : 0;
         
-        if (!klineRow) {
-          logger.debug({ symbol, tf }, 'scanSymbolRootsComprehensive: no klines available even after seeding, skipping');
+        if (klineCount === 0) {
+          logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 2 - No klines in DB after seeding, skipping');
           continue;
         }
+        logger.debug({ symbol, tf, klineCount }, 'fullComprehensiveScan: STEP 2 - Klines verified');
         
-        // STEP 3: Compute/update MACD for this symbol+tf
+        // STEP 3: Compute MACD for this symbol+tf
+        logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 3 - Computing MACD');
         try {
-          logger.debug({ symbol, tf }, 'scanSymbolRootsComprehensive: computing MACD');
           if (typeof macdUtil.computeAndStoreMacd === 'function') {
             await macdUtil.computeAndStoreMacd(symbol, tf);
+            logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 3 - MACD computed via computeAndStoreMacd');
           } else if (typeof macdUtil.computeMacdHistogram === 'function') {
             await macdUtil.computeMacdHistogram(symbol, tf);
+            logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 3 - MACD computed via computeMacdHistogram');
           }
         } catch (err) {
-          logger.debug({ err, symbol, tf }, 'scanSymbolRootsComprehensive: MACD computation failed, skipping flip check');
+          logger.debug({ err, symbol, tf }, 'fullComprehensiveScan: STEP 3 - MACD computation failed, skipping flip check');
           continue;
         }
-
+        
         // STEP 4: Check for MACD flip
+        logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 4 - Checking for MACD flip');
         try {
           const flip = await require('./macd').isMacdFlip(symbol, tf);
           if (flip) {
-            logger.info({ symbol, tf }, 'scanSymbolRootsComprehensive: MACD flip detected');
+            logger.info({ symbol, tf }, 'fullComprehensiveScan: STEP 4 - MACD FLIP DETECTED');
             const sig = await signalManager.handleRootSignal({
               symbol,
               root_tf: tf,
               detected_at: detected_ts || Date.now(),
-              notifyImmediately
+              notifyImmediately: false
             });
-            if (sig) results.push(sig);
+            if (sig) {
+              logger.info({ symbol, tf }, 'fullComprehensiveScan: Signal persisted to DB');
+              results.push(sig);
+            }
+          } else {
+            logger.debug({ symbol, tf }, 'fullComprehensiveScan: STEP 4 - No flip detected');
           }
         } catch (err) {
-          logger.debug({ err, symbol, tf }, 'scanSymbolRootsComprehensive: flip check error');
+          logger.debug({ err, symbol, tf }, 'fullComprehensiveScan: STEP 4 - Flip check error');
         }
       } catch (err) {
-        logger.debug({ err, symbol, tf }, 'scanSymbolRootsComprehensive: error processing symbol+tf');
+        logger.debug({ err, symbol, tf }, 'fullComprehensiveScan: Outer error processing symbol+tf');
       }
     }
     return results;
@@ -288,10 +301,6 @@ module.exports = {
 
   /**
    * LOOP 2: 5m Boundary Scan
-   * - Runs every 5 minutes aligned to UTC boundaries
-   * - Initiates SAME comprehensive scan as LOOP 1 (seeds, MACD, flips)
-   * - Cross-checks against previous snapshot
-   * - Sends telegram per-signal blocks ONLY for new signals
    */
   schedule5mBoundaryScan() {
     const msToNext5 = () => {
@@ -306,27 +315,25 @@ module.exports = {
     };
 
     let firstBoundaryPassed = false;
-    let previousBoundarySnapshot = new Set(); // Store keys from previous boundary
+    let previousSnapshot = new Set();
 
     const schedule = async () => {
       const wait = msToNext5();
       logger.info({ 
         wait, 
-        loopName: 'LOOP_2_5m_boundary_scan', 
         nextBoundary: new Date(Date.now() + wait).toISOString()
       }, 'LOOP 2: Waiting ms until next 5m boundary');
       
       setTimeout(async () => {
         try {
-          // Execute comprehensive scan and cross-check
-          await this.scan5mBoundary(previousBoundarySnapshot);
+          logger.info('LOOP 2: Starting 5m boundary scan');
+          await this.scan5mBoundary(previousSnapshot);
           
-          // UPDATE snapshot for next boundary
-          const currentSnapshot = dbModule.getLatestSignalsSnapshot();
-          previousBoundarySnapshot = new Set(currentSnapshot.map(s => s.key));
-          logger.info({ signalCount: previousBoundarySnapshot.size }, 'LOOP 2: Updated snapshot tracking');
+          // Update snapshot
+          const current = dbModule.getLatestSignalsSnapshot();
+          previousSnapshot = new Set(current.map(s => s.key));
+          logger.info({ snapshotSize: previousSnapshot.size }, 'LOOP 2: Snapshot updated');
 
-          // Close least profitable trade if enabled and max trades filled
           if (config.CLOSE_LEAST_PROFITABLE_ENABLED) {
             try {
               const openCount = dbModule.get().prepare('SELECT COUNT(*) as c FROM trades WHERE status = ?').get('open').c || 0;
@@ -334,7 +341,7 @@ module.exports = {
                 const minutesSinceHour = new Date().getUTCMinutes();
                 const closeMins = config.CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY || 5;
                 if (minutesSinceHour >= (60 - closeMins)) {
-                  logger.info({ openCount, closeMins }, 'LOOP 2: Closing least profitable trade');
+                  logger.info({ openCount }, 'LOOP 2: Closing least profitable trade');
                   await tradeManager.closeLeastProfitableTrade();
                 }
               }
@@ -347,7 +354,7 @@ module.exports = {
             firstBoundaryPassed = true;
             try {
               signalManager.setOpenTradesAllowed(true);
-              logger.info('LOOP 2: Open trades enabled after first boundary');
+              logger.info('LOOP 2: Open trades enabled');
             } catch (e) {
               logger.debug({ e }, 'LOOP 2: Failed to enable open trades');
             }
@@ -364,82 +371,75 @@ module.exports = {
   },
 
   /**
-   * scan5mBoundary:
-   * - Performs COMPREHENSIVE scan (same as LOOP 1): seeds, MACD, flip detection
-   * - Cross-checks signals against previousBoundarySnapshot
-   * - Sends telegram per-signal blocks ONLY for NEW signals
+   * scan5mBoundary: Full comprehensive scan with cross-check
    */
-  async scan5mBoundary(previousBoundarySnapshot = new Set()) {
+  async scan5mBoundary(previousSnapshot = new Set()) {
     try {
       const scanStart = Date.now();
       logger.info({ 
-        scanStart: new Date(scanStart).toISOString(),
-        previousSignals: previousBoundarySnapshot.size
-      }, 'LOOP 2: Starting 5m boundary comprehensive scan');
+        scanTime: new Date(scanStart).toISOString(),
+        previousSignals: previousSnapshot.size
+      }, 'LOOP 2: scan5mBoundary starting comprehensive scan');
 
-      // COMPREHENSIVE SCAN: exactly like LOOP 1
+      // FULL COMPREHENSIVE SCAN
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      let totalSymbolsProcessed = 0;
       
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => 
-          this.scanSymbolRootsComprehensive(r.symbol, { notifyImmediately: false, detected_ts: scanStart })
-        );
+        const tasks = page.map(r => this.fullComprehensiveScan(r.symbol, { detected_ts: scanStart }));
         try {
-          await Promise.all(tasks);
+          const results = await Promise.all(tasks);
+          totalSymbolsProcessed += page.length;
         } catch (e) {
           logger.debug({ e }, 'LOOP 2: Page error (continuing)');
         }
       }
 
-      // Wait for DB persistence
-      await sleep(100);
-
-      // Get current snapshot and identify NEW signals
-      const currentSnapshot = dbModule.getLatestSignalsSnapshot();
-      const currentKeys = new Set(currentSnapshot.map(s => s.key));
+      logger.info({ totalSymbolsProcessed }, 'LOOP 2: Comprehensive scan completed, waiting for DB persistence');
       
+      // Wait for DB to persist all signals
+      await sleep(200);
+
+      // Get current snapshot and cross-check
+      const currentSnapshot = dbModule.getLatestSignalsSnapshot();
       const newSignals = currentSnapshot.filter(s => 
-        !previousBoundarySnapshot.has(s.key) && s.detected_at >= scanStart
+        !previousSnapshot.has(s.key) && s.detected_at >= scanStart
       );
 
       logger.info({ 
-        totalSignals: currentSnapshot.length, 
-        previousSignals: previousBoundarySnapshot.size,
-        newSignals: newSignals.length
-      }, 'LOOP 2: Scan complete, cross-check done');
+        total: currentSnapshot.length,
+        previous: previousSnapshot.size,
+        new: newSignals.length
+      }, 'LOOP 2: Cross-check complete');
 
-      // SEND TELEGRAM ONLY FOR NEW SIGNALS
+      // Send telegram for new signals only
       if (newSignals.length > 0) {
-        logger.info({ newCount: newSignals.length }, 'LOOP 2: New signals detected, sending telegram blocks');
+        logger.info({ count: newSignals.length }, 'LOOP 2: SENDING TELEGRAM BLOCKS FOR NEW SIGNALS');
         const telegram = require('./telegram');
 
         for (let i = 0; i < newSignals.length; i++) {
           const s = newSignals[i];
           try {
-            logger.debug({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 2: Sending signal block');
+            logger.info({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 2: Sending signal block');
             await telegram.sendNewSignalSingleBlock(s);
-            logger.info({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 2: Signal block sent');
           } catch (e) {
             logger.error({ err: e, symbol: s.symbol }, 'LOOP 2: Failed to send block');
           }
           await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
         }
       } else {
-        logger.info('LOOP 2: No new signals found this boundary');
+        logger.info('LOOP 2: No new signals detected');
       }
 
     } catch (err) {
-      logger.error({ err }, 'LOOP 2: Unexpected error');
+      logger.error({ err }, 'LOOP 2: scan5mBoundary error');
     }
   },
 
   /**
    * LOOP 3: New Root Candle Open Scan
-   * - Runs at PRECISE root timeframe candle opens
-   * - Initiates SAME comprehensive scan as LOOP 1 (seeds, MACD, flips)
-   * - Sends telegram per-signal blocks for signals detected on that TF
    */
   scheduleNewRootCandleScan() {
     const schedule = async () => {
@@ -450,24 +450,21 @@ module.exports = {
         logger.info({ 
           nextTf: nextEvent.tf, 
           nextOpenTime: new Date(nextEvent.nextOpenTime).toISOString(),
-          waitMs,
-          loopName: 'LOOP_3_new_root_candle_scan' 
+          waitMs
         }, 'LOOP 3: Scheduled next candle');
         
         await sleep(waitMs);
         
-        // Execute scan at candle open
         const detectedTfs = this.detectCurrentCandleOpens();
         if (detectedTfs && detectedTfs.length > 0) {
-          logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Candle(s) detected as open');
+          logger.info({ detectedTfs }, 'LOOP 3: Candle(s) detected as open');
           await this.scanAndNotifyNewCandles(detectedTfs);
         } else {
-          logger.debug('LOOP 3: No candles detected as open this cycle');
+          logger.debug('LOOP 3: No candles detected');
         }
       } catch (err) {
         logger.error({ err }, 'LOOP 3: Unexpected error');
       } finally {
-        // Reschedule immediately
         schedule();
       }
     };
@@ -476,11 +473,72 @@ module.exports = {
   },
 
   /**
-   * calculateNextCandleEvent:
-   * - Calculate NEXT candle open time across ALL root TFs
-   * - Return which TF opens next and when in ms
-   * - Factor in 100ms buffer for system latency
+   * scanAndNotifyNewCandles: Full comprehensive scan filtered to candle TFs
    */
+  async scanAndNotifyNewCandles(detectedTfs = []) {
+    try {
+      if (!detectedTfs || detectedTfs.length === 0) {
+        logger.info('LOOP 3: No TFs to scan');
+        return;
+      }
+
+      const scanStart = Date.now();
+      logger.info({ detectedTfs }, 'LOOP 3: Starting comprehensive scan for new candle signals');
+
+      // FULL COMPREHENSIVE SCAN for all symbols
+      const db = dbModule.get();
+      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      let totalSymbolsProcessed = 0;
+      
+      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
+        const page = rows.slice(i, i + config.PAGE_SIZE);
+        const tasks = page.map(r => this.fullComprehensiveScan(r.symbol, { detected_ts: scanStart }));
+        try {
+          const results = await Promise.all(tasks);
+          totalSymbolsProcessed += page.length;
+        } catch (e) {
+          logger.debug({ e }, 'LOOP 3: Page error (continuing)');
+        }
+      }
+
+      logger.info({ totalSymbolsProcessed }, 'LOOP 3: Comprehensive scan completed, waiting for DB persistence');
+      
+      // Wait for DB to persist all signals
+      await sleep(200);
+
+      // Get signals from this scan and filter to detected TFs
+      const allSignals = dbModule.getLatestSignalsSnapshot();
+      const candleSignals = allSignals.filter(s => 
+        detectedTfs.includes(String(s.root_tf)) && s.detected_at >= scanStart
+      );
+
+      logger.info({ 
+        detectedTfs,
+        foundCount: candleSignals.length
+      }, 'LOOP 3: Filtered to candle signals');
+
+      if (candleSignals.length > 0) {
+        logger.info({ count: candleSignals.length }, 'LOOP 3: SENDING TELEGRAM BLOCKS FOR CANDLE SIGNALS');
+        const telegram = require('./telegram');
+
+        for (let i = 0; i < candleSignals.length; i++) {
+          const s = candleSignals[i];
+          try {
+            logger.info({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 3: Sending signal block');
+            await telegram.sendNewSignalSingleBlock(s);
+          } catch (e) {
+            logger.error({ err: e, symbol: s.symbol }, 'LOOP 3: Failed to send block');
+          }
+          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+        }
+      } else {
+        logger.info({ detectedTfs }, 'LOOP 3: No signals detected on these candles');
+      }
+    } catch (err) {
+      logger.error({ err }, 'LOOP 3: scanAndNotifyNewCandles error');
+    }
+  },
+
   calculateNextCandleEvent() {
     const nowMs = Date.now();
     let nextOpenMs = Infinity;
@@ -517,11 +575,6 @@ module.exports = {
     };
   },
 
-  /**
-   * detectCurrentCandleOpens:
-   * - Check which root TFs are currently opening (within ±2 second window)
-   * - Returns array of TF strings that are detected as open
-   */
   detectCurrentCandleOpens() {
     const nowMs = Date.now();
     const detectedTfs = [];
@@ -548,79 +601,6 @@ module.exports = {
     return detectedTfs;
   },
 
-  /**
-   * scanAndNotifyNewCandles:
-   * - Called when new root candles open (from LOOP 3)
-   * - Performs COMPREHENSIVE scan (same as LOOP 1): seeds, MACD, flip detection
-   * - Filters signals to only those on the newly opened TFs
-   * - Sends telegram per-signal blocks for detected signals
-   */
-  async scanAndNotifyNewCandles(detectedTfs = []) {
-    try {
-      if (!detectedTfs || detectedTfs.length === 0) {
-        logger.info('LOOP 3: No TFs to scan');
-        return;
-      }
-
-      logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Starting comprehensive scan for new candle signals');
-      const scanStart = Date.now();
-
-      // COMPREHENSIVE SCAN: exactly like LOOP 1, for ALL symbols
-      const db = dbModule.get();
-      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      
-      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => 
-          this.scanSymbolRootsComprehensive(r.symbol, { notifyImmediately: false, detected_ts: scanStart })
-        );
-        try {
-          await Promise.all(tasks);
-        } catch (e) {
-          logger.debug({ e }, 'LOOP 3: Page error (continuing)');
-        }
-      }
-
-      // Wait for DB persistence
-      await sleep(100);
-
-      // Get signals detected in this scan and filter to the opened TFs
-      const allSignals = dbModule.getLatestSignalsSnapshot();
-      const candleSignals = allSignals.filter(s => 
-        detectedTfs.includes(String(s.root_tf)) && s.detected_at >= scanStart
-      );
-
-      logger.info({ 
-        detectedTfs, 
-        foundCount: candleSignals.length
-      }, 'LOOP 3: Comprehensive scan complete');
-
-      if (candleSignals.length > 0) {
-        logger.info({ count: candleSignals.length }, 'LOOP 3: Signals detected on new candles, sending telegram blocks');
-        const telegram = require('./telegram');
-
-        for (let i = 0; i < candleSignals.length; i++) {
-          const s = candleSignals[i];
-          try {
-            logger.debug({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 3: Sending signal block');
-            await telegram.sendNewSignalSingleBlock(s);
-            logger.info({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 3: Signal block sent');
-          } catch (e) {
-            logger.error({ err: e, symbol: s.symbol }, 'LOOP 3: Failed to send block');
-          }
-          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-        }
-      } else {
-        logger.info({ detectedTfs }, 'LOOP 3: No signals detected on these candle opens');
-      }
-    } catch (err) {
-      logger.error({ err }, 'LOOP 3: scanAndNotifyNewCandles error');
-    }
-  },
-
-  /**
-   * Helper: Convert timeframe string to milliseconds
-   */
   timeframeToMs(tf) {
     if (!tf) return -1;
     const tfStr = String(tf).toUpperCase();
