@@ -245,21 +245,6 @@ module.exports = {
   },
 
   /**
-   * sendStartupSummary: builds a snapshot of latest root signals and sends initial telegram message
-   */
-  async sendStartupSummary() {
-    try {
-      const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
-      const telegramSvc = require('./telegram');
-
-      await telegramSvc.sendStartupSummary({ snapshot });
-    } catch (e) {
-      logger.debug({ e }, 'sendStartupSummary failed');
-    }
-  },
-
-  /**
    * handleNewRootCandle: Called when new root candle opens
    */
   async handleNewRootCandle(newRootTfs = []) {
