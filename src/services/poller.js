@@ -12,8 +12,6 @@ const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
-let lastRootCandleState = {}; // Track last root candle to prevent duplicate flips
-let lastScannedSignalKeys = new Set(); // Track signals from last 5m boundary scan
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
@@ -211,7 +209,7 @@ module.exports = {
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
+        const tasks = page.map(r => this.scanSymbolRootsWithoutTracking(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
         try {
           await Promise.all(tasks);
         } catch (e) {
@@ -224,38 +222,32 @@ module.exports = {
     }
   },
 
-  async scanSymbolRoots(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
+  /**
+   * scanSymbolRootsWithoutTracking:
+   * Used by LOOP 1 (initial scan) and LOOP 3 (new candle scan)
+   * Does NOT use lastRootCandleState tracking, allowing fresh detection
+   */
+  async scanSymbolRootsWithoutTracking(symbol, { notifyImmediately = true, detected_ts = null } = {}) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
+    
     for (const tf of tfList) {
       try {
         const db = dbModule.get();
         const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2');
         let rows = selectStmt.all(symbol, tf);
+        
         if (!rows || rows.length < 2) {
-          logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now (will also seed MTF TFs)');
+          logger.debug({ symbol, tf }, 'scanSymbolRootsWithoutTracking: insufficient klines, seeding');
           await this.seedKlinesForSymbol(symbol, tf);
-
           rows = selectStmt.all(symbol, tf);
           if (!rows || rows.length < 2) {
-            logger.debug({ symbol, tf }, 'scanSymbolRoots: still insufficient klines after seeding, skipping tf for now');
+            logger.debug({ symbol, tf }, 'scanSymbolRootsWithoutTracking: still insufficient after seeding, skipping');
             continue;
-          } else {
-            logger.info({ symbol, tf }, 'scanSymbolRoots: klines seeded and available, re-checking flip');
           }
         }
 
-        // Track last root candle open_time to prevent duplicate flip detections
-        const stateKey = `${symbol}:${tf}`;
-        const latestCandleTime = rows[rows.length - 1].open_time; // oldest in DESC = latest candle
-        
-        if (lastRootCandleState[stateKey] === latestCandleTime) {
-          logger.debug({ symbol, tf, candleTime: latestCandleTime }, 'scanSymbolRoots: already processed this candle, skipping flip detection');
-          continue;
-        }
-        
-        lastRootCandleState[stateKey] = latestCandleTime;
-
+        // Check for MACD flip WITHOUT using lastRootCandleState
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
           const sig = await signalManager.handleRootSignal({
@@ -267,7 +259,7 @@ module.exports = {
           if (sig) results.push(sig);
         }
       } catch (err) {
-        logger.debug({ err, symbol, tf }, 'scanSymbolRoots: error checking flip');
+        logger.debug({ err, symbol, tf }, 'scanSymbolRootsWithoutTracking: error');
       }
     }
     return results;
@@ -276,11 +268,8 @@ module.exports = {
   /**
    * LOOP 2: 5m Boundary Scan
    * - Runs every 5 minutes aligned to UTC boundaries (0, 5, 10, 15, ... 55 minutes)
-   * - Scans all symbols for NEW root signals not in last scan
-   * - Sends telegram per-signal blocks for new signals only (no summary/recommended)
-   * - Also monitors MTF alignment alerts on existing signals
-   * - Enables trading after first boundary
-   * - Closes least profitable trade if slot needed
+   * - Scans all symbols for root signals
+   * - Sends telegram per-signal blocks for NEW signals (compares against DB state)
    */
   schedule5mBoundaryScan() {
     const msToNext5 = () => {
@@ -295,26 +284,32 @@ module.exports = {
     };
 
     let firstBoundaryPassed = false;
+    let lastBoundarySignalKeys = new Set(); // Track signals from LAST boundary
 
     const schedule = async () => {
       const wait = msToNext5();
-      logger.info({ wait, loopName: '5m_boundary_scan' }, 'schedule5mBoundaryScan: waiting ms until next 5m boundary');
+      logger.info({ wait, loopName: 'LOOP_2_5m_boundary_scan', nextBoundary: new Date(Date.now() + wait).toISOString() }, 'Waiting ms until next 5m boundary');
+      
       setTimeout(async () => {
         try {
-          await this.scan5mBoundary();
+          await this.scan5mBoundary(lastBoundarySignalKeys);
+          
+          // Update lastBoundarySignalKeys for next iteration
+          const currentSignals = dbModule.getLatestSignalsSnapshot();
+          lastBoundarySignalKeys = new Set(currentSignals.map(s => s.key));
 
-          // Close least profitable trade if enabled and max trades filled
+          // Close least profitable trade if enabled
           if (config.CLOSE_LEAST_PROFITABLE_ENABLED) {
             const openCount = dbModule.get().prepare('SELECT COUNT(*) as c FROM trades WHERE status = ?').get('open').c || 0;
             if (openCount >= config.MAX_OPEN_TRADES) {
               const minutesSinceHour = new Date().getUTCMinutes();
               const closeMins = config.CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY || 5;
               if (minutesSinceHour >= (60 - closeMins)) {
-                logger.info({ openCount, closeMins }, 'Closing least profitable trade before boundary');
+                logger.info({ openCount, closeMins }, 'LOOP 2: Closing least profitable trade before boundary');
                 try {
                   await tradeManager.closeLeastProfitableTrade();
                 } catch (err) {
-                  logger.error({ err }, 'Error closing least profitable trade');
+                  logger.error({ err }, 'LOOP 2: Error closing trade');
                 }
               }
             }
@@ -324,13 +319,13 @@ module.exports = {
             firstBoundaryPassed = true;
             try {
               signalManager.setOpenTradesAllowed(true);
-              logger.info('schedule5mBoundaryScan: open trades enabled after first boundary');
+              logger.info('LOOP 2: Open trades enabled after first 5m boundary');
             } catch (e) {
-              logger.debug({ e }, 'schedule5mBoundaryScan: failed to set open trades allowed');
+              logger.debug({ e }, 'LOOP 2: Failed to enable open trades');
             }
           }
         } catch (err) {
-          logger.error({ err }, 'schedule5mBoundaryScan: boundary task failed');
+          logger.error({ err }, 'LOOP 2: Boundary task failed');
         } finally {
           schedule();
         }
@@ -342,168 +337,239 @@ module.exports = {
 
   /**
    * scan5mBoundary:
-   * - Scans all symbols for new root signals
-   * - Compares against lastScannedSignalKeys
-   * - Sends telegram ONLY for new signals (per-signal blocks, no summary/recommended)
-   * - Updates lastScannedSignalKeys with current signals
-   * - Also monitors MTF alignment changes on already-detected signals (TODO)
+   * - Actively SCANS all symbols for root signals (not just reports)
+   * - Compares newly detected signals against previous boundary
+   * - Sends telegram ONLY for signals new since last boundary
    */
-  async scan5mBoundary() {
+  async scan5mBoundary(lastBoundarySignalKeys = new Set()) {
     try {
-      const db = dbModule;
       const scanStart = Date.now();
+      logger.info({ scanStart: new Date(scanStart).toISOString() }, 'LOOP 2: Starting 5m boundary scan');
 
-      logger.info('scan5mBoundary: starting 5m boundary scan');
+      // ACTIVELY SCAN all symbols for root signals
+      const db = dbModule.get();
+      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
-      // Scan all symbols for new root signals
-      const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: scanStart }));
+        const tasks = page.map(r => 
+          this.scanSymbolRootsWithoutTracking(r.symbol, { notifyImmediately: false, detected_ts: scanStart })
+        );
         try {
           await Promise.all(tasks);
         } catch (e) {
-          logger.debug({ e }, 'scan5mBoundary: page tasks error (continuing)');
+          logger.debug({ e }, 'LOOP 2: Page error (continuing)');
         }
       }
 
-      // Get current signals snapshot
-      const after = db.getLatestSignalsSnapshot();
-      const currentKeys = new Set(after.map(r => r.key));
+      // Get current signals and identify NEW ones
+      const currentSignals = dbModule.getLatestSignalsSnapshot();
+      const currentKeys = new Set(currentSignals.map(s => s.key));
+      const newSignals = currentSignals.filter(s => 
+        !lastBoundarySignalKeys.has(s.key) && s.detected_at >= scanStart
+      );
 
-      // Find NEW signals (not in lastScannedSignalKeys and detected in this scan)
-      const newSignals = after.filter(r => !lastScannedSignalKeys.has(r.key) && r.detected_at >= scanStart);
+      logger.info({ 
+        totalSignals: currentSignals.length, 
+        previousBoundary: lastBoundarySignalKeys.size, 
+        newCount: newSignals.length 
+      }, 'LOOP 2: Scan complete');
 
       if (newSignals.length > 0) {
-        logger.info({ newSignals: newSignals.length }, 'scan5mBoundary: new signals found, sending per-signal blocks');
-
+        logger.info({ newCount: newSignals.length }, 'LOOP 2: New signals found, sending telegram blocks');
         const telegram = require('./telegram');
+
         for (let i = 0; i < newSignals.length; i++) {
           const s = newSignals[i];
           try {
-            // Send ONLY single signal block (no summary, no recommended)
             await telegram.sendNewSignalSingleBlock(s);
+            logger.debug({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 2: Sent signal block');
           } catch (e) {
-            logger.debug({ e, s }, 'scan5mBoundary: failed to send new-signal message');
+            logger.warn({ err: e, symbol: s.symbol }, 'LOOP 2: Failed to send block');
           }
           await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
         }
       } else {
-        logger.info('scan5mBoundary: no new signals found this boundary');
+        logger.info('LOOP 2: No new signals found this boundary');
       }
 
-      // TODO: MTF Alignment Alerts
-      // Monitor existing signals for alignment changes and send alert blocks
-      // Example: if a signal's MTF alignment improved/degraded significantly
-
-      // Update lastScannedSignalKeys for next boundary
-      lastScannedSignalKeys = currentKeys;
-
-      try {
-        db.setState('lastScanAt', scanStart);
-        db.setState('lastScanSignals', Array.from(currentKeys));
-      } catch (e) {
-        logger.debug({ e }, 'scan5mBoundary: failed to persist scan state');
-      }
     } catch (err) {
-      logger.error({ err }, 'scan5mBoundary: unexpected error');
+      logger.error({ err }, 'LOOP 2: Unexpected error');
     }
   },
 
   /**
    * LOOP 3: New Root Candle Open Scan
-   * - Runs at precise root timeframe candle opens
-   * - Detects when a new root candle opens (1m, 5m, 15m, 1h, D, etc.)
-   * - Sends telegram update for signals on those new candles
+   * - Runs at PRECISE root timeframe candle opens
+   * - ACTIVELY SCANS for new signals AT candle open time
+   * - Sends telegram per-signal blocks for detected signals
    */
   scheduleNewRootCandleScan() {
-    const calculateNextCandle = () => {
-      const now = new Date();
-      const nowMs = now.getTime();
-      let nextCandle = null;
-
-      for (const tf of config.ROOT_TFS || []) {
-        const tfStr = String(tf).toUpperCase();
-        const tfMs = this.timeframeToMs(tfStr);
-        if (tfMs <= 0) continue;
-
-        const epochMs = Math.floor(nowMs / tfMs) * tfMs + tfMs;
-        if (!nextCandle || epochMs < nextCandle) {
-          nextCandle = epochMs;
-        }
-      }
-
-      return nextCandle || (nowMs + 60000); // fallback to 1 min
-    };
-
     const schedule = async () => {
-      const nextCandleMs = calculateNextCandle();
-      const wait = nextCandleMs - Date.now();
-      
-      logger.info({ wait, loopName: 'new_root_candle_scan' }, 'scheduleNewRootCandleScan: waiting ms until next root candle');
-      
-      setTimeout(async () => {
-        try {
-          await this.scanNewRootCandle();
-        } catch (err) {
-          logger.error({ err }, 'scheduleNewRootCandleScan: scan task failed');
-        } finally {
-          schedule();
+      try {
+        const nextEvent = this.calculateNextCandleEvent();
+        const waitMs = Math.max(nextEvent.waitMs, 100);
+        
+        logger.info({ 
+          nextTf: nextEvent.tf, 
+          nextOpenTime: new Date(nextEvent.nextOpenTime).toISOString(),
+          waitMs,
+          loopName: 'LOOP_3_new_root_candle_scan' 
+        }, 'LOOP 3: Scheduled next candle scan');
+        
+        await sleep(waitMs);
+        
+        // Execute scan at candle open
+        const detectedTfs = this.detectCurrentCandleOpens();
+        if (detectedTfs && detectedTfs.length > 0) {
+          logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Candle(s) detected as open');
+          await this.scanAndNotifyNewCandles(detectedTfs);
+        } else {
+          logger.debug('LOOP 3: No candles detected as open this cycle');
         }
-      }, Math.max(wait, 0));
+      } catch (err) {
+        logger.error({ err }, 'LOOP 3: Unexpected error');
+      } finally {
+        // Reschedule immediately
+        schedule();
+      }
     };
 
     schedule();
   },
 
   /**
-   * scanNewRootCandle:
-   * - Called when a new root candle opens
-   * - Sends telegram update with signals for newly opened root TFs
-   * - Includes per-signal blocks (full detail)
+   * calculateNextCandleEvent:
+   * - Calculate NEXT candle open time across ALL root TFs
+   * - Factor in 100ms buffer for system latency
    */
-  async scanNewRootCandle() {
+  calculateNextCandleEvent() {
+    const nowMs = Date.now();
+    let nextOpenMs = Infinity;
+    let nextTf = null;
+
+    for (const tf of (config.ROOT_TFS || [])) {
+      const tfMs = this.timeframeToMs(tf);
+      if (tfMs <= 0) continue;
+
+      const epochFloor = Math.floor(nowMs / tfMs);
+      const candidateMs = (epochFloor + 1) * tfMs;
+
+      if (candidateMs < nextOpenMs) {
+        nextOpenMs = candidateMs;
+        nextTf = tf;
+      }
+    }
+
+    if (nextOpenMs === Infinity) {
+      return {
+        tf: '1m',
+        nextOpenTime: nowMs + 60000,
+        waitMs: 60000
+      };
+    }
+
+    const bufferMs = 100;
+    const waitMs = Math.max(nextOpenMs - nowMs - bufferMs, 100);
+
+    return {
+      tf: nextTf,
+      nextOpenTime: nextOpenMs,
+      waitMs
+    };
+  },
+
+  /**
+   * detectCurrentCandleOpens:
+   * - Check which root TFs are currently opening (within ±2 second window)
+   */
+  detectCurrentCandleOpens() {
+    const nowMs = Date.now();
+    const detectedTfs = [];
+    const openWindowMs = 2000;
+
+    for (const tf of (config.ROOT_TFS || [])) {
+      const tfMs = this.timeframeToMs(tf);
+      if (tfMs <= 0) continue;
+
+      const epochFloor = Math.floor(nowMs / tfMs);
+      const candleOpenMs = epochFloor * tfMs;
+      const timeSinceCandleOpen = nowMs - candleOpenMs;
+
+      if (timeSinceCandleOpen >= -openWindowMs && timeSinceCandleOpen <= openWindowMs) {
+        detectedTfs.push(tf);
+        logger.debug({ 
+          tf, 
+          timeSinceCandleOpen,
+          candleOpenTime: new Date(candleOpenMs).toISOString()
+        }, 'LOOP 3: Detected candle open');
+      }
+    }
+
+    return detectedTfs;
+  },
+
+  /**
+   * scanAndNotifyNewCandles:
+   * - ACTIVELY SCANS all symbols for root signals on newly opened TFs
+   * - Sends telegram per-signal blocks for detected signals
+   */
+  async scanAndNotifyNewCandles(detectedTfs = []) {
     try {
-      logger.info('scanNewRootCandle: new root candle(s) detected, sending update');
-      
-      const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
-      
-      if (!snapshot || snapshot.length === 0) {
-        logger.info('scanNewRootCandle: no signals to report');
+      if (!detectedTfs || detectedTfs.length === 0) {
+        logger.info('LOOP 3: No TFs to scan');
         return;
       }
 
-      // Identify which root TF just opened
-      const now = new Date();
-      const openedTfs = [];
-      
-      for (const tf of config.ROOT_TFS || []) {
-        const tfStr = String(tf).toUpperCase();
-        const tfMs = this.timeframeToMs(tfStr);
-        if (tfMs <= 0) continue;
+      logger.info({ detectedTfs, time: new Date().toISOString() }, 'LOOP 3: Starting active scan for new candle signals');
+      const scanStart = Date.now();
 
-        const epochMs = Math.floor(now.getTime() / tfMs) * tfMs;
-        if (Math.abs(Date.now() - epochMs) < 5000) { // within 5 seconds of candle open
-          openedTfs.push(tf);
+      // ACTIVELY SCAN all symbols for signals on the newly opened TFs
+      const db = dbModule.get();
+      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+
+      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
+        const page = rows.slice(i, i + config.PAGE_SIZE);
+        const tasks = page.map(r => 
+          this.scanSymbolRootsWithoutTracking(r.symbol, { notifyImmediately: false, detected_ts: scanStart })
+        );
+        try {
+          await Promise.all(tasks);
+        } catch (e) {
+          logger.debug({ e }, 'LOOP 3: Page error (continuing)');
         }
       }
 
-      logger.info({ openedTfs }, 'scanNewRootCandle: identified newly opened root TFs');
+      // Get signals detected in this scan and filter to the opened TFs
+      const allSignals = dbModule.getLatestSignalsSnapshot();
+      const candleSignals = allSignals.filter(s => 
+        detectedTfs.includes(String(s.root_tf)) && s.detected_at >= scanStart
+      );
 
-      const telegram = require('./telegram');
-      const filtered = openedTfs.length > 0
-        ? snapshot.filter(s => openedTfs.includes(String(s.root_tf)))
-        : snapshot;
+      logger.info({ 
+        detectedTfs, 
+        foundCount: candleSignals.length 
+      }, 'LOOP 3: Scan complete');
 
-      if (filtered.length > 0) {
-        await telegram.sendRootCandleUpdate({ snapshot: filtered, newRootTfs: openedTfs });
-        logger.info({ count: filtered.length }, 'scanNewRootCandle: sent root candle update with per-signal blocks');
+      if (candleSignals.length > 0) {
+        logger.info({ count: candleSignals.length }, 'LOOP 3: Signals detected, sending telegram blocks');
+        const telegram = require('./telegram');
+
+        for (let i = 0; i < candleSignals.length; i++) {
+          const s = candleSignals[i];
+          try {
+            await telegram.sendNewSignalSingleBlock(s);
+            logger.debug({ symbol: s.symbol, tf: s.root_tf }, 'LOOP 3: Sent signal block');
+          } catch (e) {
+            logger.warn({ err: e, symbol: s.symbol }, 'LOOP 3: Failed to send block');
+          }
+          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+        }
       } else {
-        logger.info('scanNewRootCandle: no signals for newly opened candles');
+        logger.info({ detectedTfs }, 'LOOP 3: No signals detected on these candle opens');
       }
     } catch (err) {
-      logger.error({ err }, 'scanNewRootCandle: unexpected error');
+      logger.error({ err }, 'LOOP 3: scanAndNotifyNewCandles error');
     }
   },
 
