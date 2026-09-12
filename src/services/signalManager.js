@@ -1,17 +1,3 @@
-/**
- * src/services/signalManager.js
- *
- * Responsibilities:
- * - Orchestrates per-symbol "root" signals (market data, TV rating, MTF alignment, decision)
- * - Persists a signal snapshot to DB (via dbModule.insertSignal when available)
- * - Sends Telegram blocks immediately (or returns the signal object)
- * - Computes a fallback TV-like score when TradingView is unavailable
- *
- * v0.5.0 Updates:
- * - Feature 4: Validate signal flip at open price for 5-min boundary scans
- * - Feature 5: Root candle open scan support (disabled by default)
- */
-
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -23,221 +9,13 @@ const config = require('../config');
 const logger = require('pino')();
 
 let openTradesAllowed = true;
+
 function setOpenTradesAllowed(v) {
   openTradesAllowed = !!v;
   logger.info({ openTradesAllowed }, 'signalManager: openTradesAllowed set');
 }
 
 const inProgress = new Map();
-const lastSignalPerBoundary = new Map(); // Track signals per 5-min block to deduplicate
-
-async function fetchLatestSignalsSnapshotFallback(limit = 500) {
-  // Try multiple fallbacks to obtain a recent snapshot of signals for summaries
-  try {
-    // 1) Prefer dbModule.getLatestSignalsSnapshot()
-    if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-      try {
-        const snap = dbModule.getLatestSignalsSnapshot();
-        if (Array.isArray(snap) && snap.length) return snap;
-      } catch (e) {
-        logger.debug({ e }, 'fetchLatestSignalsSnapshotFallback: getLatestSignalsSnapshot failed');
-      }
-    }
-
-    // 2) Try dbModule.get().prepare(...) reading signals table if available
-    if (dbModule && typeof dbModule.get === 'function') {
-      try {
-        const db = dbModule.get();
-        const rows = db.prepare('SELECT key, symbol, root_tf, detected_at, state, meta FROM signals ORDER BY detected_at DESC LIMIT ?').all(limit || 500);
-        if (rows && rows.length) {
-          return rows.map(r => {
-            let meta = r.meta;
-            if (typeof meta === 'string') {
-              try { meta = JSON.parse(meta); } catch (e) { /* keep as string */ }
-            }
-            return {
-              key: r.key,
-              symbol: r.symbol,
-              root_tf: r.root_tf,
-              detected_at: r.detected_at,
-              state: r.state,
-              meta
-            };
-          });
-        }
-      } catch (e) {
-        logger.debug({ e }, 'fetchLatestSignalsSnapshotFallback: reading signals table failed');
-      }
-    }
-  } catch (e) {
-    logger.debug({ e }, 'fetchLatestSignalsSnapshotFallback: unexpected error');
-  }
-
-  return [];
-}
-
-/**
- * Get current 5-min boundary block ID (e.g., "2026-09-10_14:35:00")
- */
-function getCurrentBoundaryBlockId() {
-  const now = new Date();
-  const mins = Math.floor(now.getUTCMinutes() / 5) * 5;
-  const pad = (n) => String(n).padStart(2, '0');
-  const date = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}`;
-  const time = `${pad(now.getUTCHours())}:${pad(mins)}:00`;
-  return `${date}_${time}`;
-}
-
-/**
- * Feature 1: Prioritize root TFS by weight
- * Returns an object with TF => priority score
- */
-function evaluateTimeframeHierarchy(alignment) {
-  const priorityMap = {};
-  const rootPriority = config.ROOT_TFS_PRIORITY || ['240', 'D', '60'];
-  
-  for (const tf of Object.keys(alignment)) {
-    let priority = 1; // default
-    const tfStr = String(tf);
-    
-    if (rootPriority.includes(tfStr)) {
-      const idx = rootPriority.indexOf(tfStr);
-      priority = Math.max(3 - idx, 1); // 240=3, D=2, 60=1
-    }
-    
-    priorityMap[tf] = priority;
-  }
-  
-  return priorityMap;
-}
-
-/**
- * Feature 2: Validate MTF flip enforcement for 1D signals
- * If ENFORCE_MTF_FLIP_1D is true and root_tf is '1D' or 'D':
- *   - Only accept if 1H, 4H, and 1D all flipped (confirmed flip)
- *   - Prevents 5m/15m noise from triggering 1D signals
- */
-async function validateMtfFlipEnforcement(symbol, root_tf, alignment) {
-  if (!config.ENFORCE_MTF_FLIP_1D) {
-    return { valid: true, reason: 'MTF flip enforcement disabled' };
-  }
-
-  const rootTfStr = String(root_tf).toUpperCase();
-  if (rootTfStr !== 'D' && rootTfStr !== '1D') {
-    return { valid: true, reason: 'Not a 1D signal; enforcement N/A' };
-  }
-
-  // For 1D signals, require 1H, 4H, 1D to all flip
-  const requiredTfs = ['60', '240', 'D']; // 1H=60, 4H=240, 1D=D
-  const alignedTfs = Object.keys(alignment).filter(tf => alignment[tf] && alignment[tf].positive);
-
-  const allRequired = requiredTfs.every(tf => alignedTfs.includes(tf));
-  if (!allRequired) {
-    logger.info({
-      symbol,
-      root_tf,
-      required: requiredTfs,
-      aligned: alignedTfs
-    }, 'validateMtfFlipEnforcement: 1D signal rejected - not all MTF (1H/4H/1D) aligned');
-    return { valid: false, reason: '1D signal requires 1H, 4H, 1D all aligned' };
-  }
-
-  return { valid: true, reason: '1D signal MTF flip validated' };
-}
-
-/**
- * Feature 4: Validate signal flip at open price (5-min boundary scans only)
- * If VALIDATE_SIGNAL_FLIP_AT_OPEN is true, check if flip occurred near the candle open price.
- */
-async function validateSignalFlipAtOpen(symbol, root_tf, tolerance_pct = 0.5) {
-  if (!config.VALIDATE_SIGNAL_FLIP_AT_OPEN) {
-    return { valid: true, reason: 'Open price validation disabled' };
-  }
-
-  try {
-    const db = dbModule.get();
-    // Get last 2 candles to check flip occurred at open of the latest one
-    const klines = db.prepare(
-      'SELECT open_time, open, close, high, low FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2'
-    ).all(symbol, root_tf);
-
-    if (!klines || klines.length < 2) {
-      logger.debug({ symbol, root_tf }, 'validateSignalFlipAtOpen: insufficient klines');
-      return { valid: true, reason: 'Insufficient klines for validation' };
-    }
-
-    const current = klines[0]; // Latest candle
-    const openPrice = Number(current.open) || 0;
-    const closePrice = Number(current.close) || 0;
-    const tolerance = (openPrice * tolerance_pct) / 100;
-
-    // Check: did flip happen near open (not deep into candle)?
-    // MACD flips negative->positive at candle open = valid
-    // If price moved far from open before flip = invalid (2nd candle behavior)
-    const distanceFromOpen = Math.abs(closePrice - openPrice);
-
-    if (distanceFromOpen > tolerance) {
-      logger.warn(
-        { symbol, root_tf, openPrice, closePrice, tolerance, distance: distanceFromOpen },
-        'validateSignalFlipAtOpen: flip did not occur at candle open (may be 2nd candle flip)'
-      );
-      return { 
-        valid: false, 
-        reason: `Flip away from open price (${distanceFromOpen.toFixed(6)} > ${tolerance.toFixed(6)})` 
-      };
-    }
-
-    logger.info(
-      { symbol, root_tf, openPrice, closePrice, distance: distanceFromOpen },
-      'validateSignalFlipAtOpen: flip validated at open price'
-    );
-    return { valid: true, reason: 'Flip confirmed at candle open' };
-  } catch (e) {
-    logger.debug({ e, symbol, root_tf }, 'validateSignalFlipAtOpen: error');
-    return { valid: true, reason: 'Validation check skipped (error)' };
-  }
-}
-
-/**
- * Feature 3: Check if signal already sent in current 5-min boundary
- */
-function isSignalDuplicateInBlock(symbol, root_tf) {
-  const blockId = getCurrentBoundaryBlockId();
-  const signalKey = `${symbol}:${root_tf}`;
-  const fullKey = `${blockId}:${signalKey}`;
-
-  if (lastSignalPerBoundary.has(fullKey)) {
-    return true;
-  }
-
-  return false;
-}
-
-function markSignalInBlock(symbol, root_tf) {
-  const blockId = getCurrentBoundaryBlockId();
-  const signalKey = `${symbol}:${root_tf}`;
-  const fullKey = `${blockId}:${signalKey}`;
-  lastSignalPerBoundary.set(fullKey, true);
-
-  // Clean up old block entries (older than 30 min) to prevent memory leak
-  const now = new Date();
-  const cutoff = now.getTime() - 30 * 60 * 1000;
-  for (const [key] of lastSignalPerBoundary) {
-    try {
-      const blockPart = key.split(':')[0]; // e.g., "2026-09-10_14:35:00"
-      const [datePart, timePart] = blockPart.split('_');
-      const [year, month, day] = datePart.split('-').map(Number);
-      const [hour, min] = timePart.split(':').map(Number);
-      const blockTime = new Date(Date.UTC(year, month - 1, day, hour, min, 0)).getTime();
-      
-      if (blockTime < cutoff) {
-        lastSignalPerBoundary.delete(key);
-      }
-    } catch (e) {
-      // ignore cleanup errors
-    }
-  }
-}
 
 module.exports = {
   start() {
@@ -248,185 +26,85 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - Applies all 3 features
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
-   * - isBoundaryScan: if true, applies Feature 4 validation (open price check)
-   * - returns the persisted signal object (or null on error)
+   * - returns the persisted signal object
+   * - ALWAYS fetches fresh market data and TV rating for complete signal block
    */
-  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true, isBoundaryScan = false } = {}) {
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
     if (inProgress.has(key)) {
       logger.debug({ key }, 'handleRootSignal: already in progress');
       return null;
     }
     inProgress.set(key, true);
-
     try {
-      logger.info({ symbol, root_tf, isBoundaryScan }, 'Root signal received');
+      logger.info({ symbol, root_tf }, 'Root signal received');
 
-      // Feature 3: Deduplicate within 5-min block
-      if (isSignalDuplicateInBlock(symbol, root_tf)) {
-        logger.info({ symbol, root_tf }, 'handleRootSignal: signal already sent in this 5-min boundary, skipping');
-        return null;
-      }
-      markSignalInBlock(symbol, root_tf);
-
-      // 1) Market data
+      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
       let mdata = null;
       try {
         mdata = await marketData.updateSymbolMarketData(symbol);
-        if (!mdata) mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
+        if (!mdata) {
+          mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
+        }
       } catch (err) {
-        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using safe defaults');
+        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using zeros');
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
-      // Normalize market data
-      const normalizedMdata = (function(md) {
-        const price = Number(md?.price ?? md?.last_price ?? md?.last ?? md?.close ?? 0) || 0;
-        const vol24 = Number(md?.volume_24h_usdt ?? md?.volume_24h ?? md?.volumeUsd24h ?? md?.volume ?? md?.turnover24h ?? 0) || 0;
-        const marketCapRaw = md?.market_cap ?? md?.marketCap ?? md?.marketCapUsd ?? null;
-        const market_cap = marketCapRaw !== null && marketCapRaw !== undefined ? Number(marketCapRaw) : null;
-        const volChangeRaw = (md?.volume_change_pct ?? md?.volumeChangePct ?? md?.volume_change ?? null);
-        const volume_change_pct = (typeof volChangeRaw === 'number') ? volChangeRaw : (volChangeRaw !== null && !isNaN(Number(volChangeRaw)) ? Number(volChangeRaw) : null);
-
-        return {
-          price,
-          market_cap,
-          volume_24h_usdt: vol24,
-          volume_change_pct,
-          marketCap: market_cap,
-          volume24h: vol24,
-          volumeChangePct: volume_change_pct,
-          raw: md || {}
-        };
-      })(mdata);
-
-      // 2) TV rating (cached or fresh)
-      let tv = { score: 0, score_pct: 0, source: 'error' };
+      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
+      let tv = { score: 0, source: 'error' };
       try {
         logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
         const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
         if (tvRes && typeof tvRes.score === 'number') {
-          tv = {
-            score: tvRes.score,
-            score_pct: typeof tvRes.score_pct === 'number' ? tvRes.score_pct : Math.round((tvRes.score || 0) * 100),
-            source: tvRes.source || 'unknown'
-          };
-          logger.info({ symbol, score: tv.score, score_pct: tv.score_pct, source: tv.source }, 'TV rating acquired');
+          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
+          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
         } else {
           logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
-          tv = { score: 0, score_pct: 0, source: 'error' };
+          tv = { score: 0, source: 'error' };
         }
       } catch (err) {
         logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
-        tv = { score: 0, score_pct: 0, source: 'error' };
+        tv = { score: 0, source: 'error' };
       }
 
-      // 3) Subscribe to MTF websockets (best-effort)
-      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { logger.debug({ e }, 'subscribeSymbolMTF failed (non-fatal)'); }
+      // Subscribe to MTF websockets (for alignment updates)
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
-      // 4) Evaluate MTF alignment (MACD)
+      // Evaluate MTF alignment
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
       const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-      // 5) Compute fallback TV-like score if TV missing or fallback
-      if ((tv.source && String(tv.source).toLowerCase().startsWith('fallback')) || tv.score === 0) {
-        try {
-          const macdPositiveFraction = mtfScore || 0;
-          const volChangePct = (typeof normalizedMdata.volume_change_pct === 'number') ? normalizedMdata.volume_change_pct : 0;
-          let fb = null;
-          if (typeof tradingview.fallbackScore === 'function') {
-            fb = tradingview.fallbackScore({ macdPositiveFraction, volChangePct });
-          }
-          if (fb && typeof fb.score === 'number') {
-            logger.info({ symbol, computedFallbackScore: fb.score, computedFallbackPct: fb.score_pct }, 'Computed fallback TV-like score from MACD/volume');
-            tv = { score: fb.score, score_pct: (typeof fb.score_pct === 'number' ? fb.score_pct : Math.round((fb.score || 0) * 100)), source: 'fallback_computed' };
-          }
-        } catch (e) {
-          logger.debug({ e, symbol }, 'Failed to compute fallback TV score (continuing)');
-        }
-      }
+      // Apply decision rules
+      const accept = await this.applyDecision(alignment);
 
-      // 6) Apply decision rules
-      const accept = await this.applyDecision(alignment, symbol, root_tf);
-
-      // 7) Feature 2: Validate MTF flip enforcement for 1D signals
-      let mtfFlipValidation = { valid: true, reason: 'N/A' };
-      if (accept && accept.decision === 'accept') {
-        mtfFlipValidation = await validateMtfFlipEnforcement(symbol, root_tf, alignment);
-        if (!mtfFlipValidation.valid) {
-          accept.decision = 'reject';
-          accept.reason = mtfFlipValidation.reason;
-          logger.info({ symbol, root_tf, reason: mtfFlipValidation.reason }, 'Decision rejected due to MTF flip enforcement');
-        }
-      }
-
-      // 8) Feature 4: Validate signal flip at open price (for 5-min boundary scans only)
-      let openPriceValidation = { valid: true, reason: 'N/A' };
-      if (accept && accept.decision === 'accept' && isBoundaryScan) {
-        openPriceValidation = await validateSignalFlipAtOpen(symbol, root_tf, config.SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT);
-        if (!openPriceValidation.valid) {
-          accept.decision = 'reject';
-          accept.reason = openPriceValidation.reason;
-          logger.info({ symbol, root_tf, reason: openPriceValidation.reason }, 'Decision rejected due to open price validation');
-        }
-      }
-
-      // 9) Compose meta and persist
+      // Compose meta and persist signal to DB
       const meta = {
         tvScore: tv.score || 0,
-        tvScorePct: tv.score_pct || 0,
         tvSource: tv.source || 'error',
         mtfScore,
         alignment,
         acceptReason: accept && accept.reason ? accept.reason : null,
         decision: accept && accept.decision ? accept.decision : 'monitor',
-        mtfFlipValidation,
-        openPriceValidation,
-        marketData: normalizedMdata,
-        boundaryBlockId: getCurrentBoundaryBlockId(),
-        isBoundaryScan
+        marketData: mdata || {}
       };
 
-      // Persist using dbModule.insertSignal if available, otherwise try a safe DB write fallback
-      try {
-        if (dbModule && typeof dbModule.insertSignal === 'function') {
-          dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
-        } else if (dbModule && typeof dbModule.get === 'function') {
-          const db = dbModule.get();
-          try {
-            db.prepare(`CREATE TABLE IF NOT EXISTS signals (
-              key TEXT PRIMARY KEY,
-              symbol TEXT,
-              root_tf TEXT,
-              detected_at INTEGER,
-              state TEXT,
-              meta TEXT
-            )`).run();
-          } catch (e) { /* ignore create errors */ }
+      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
 
-          try {
-            const keyVal = `${symbol}:${root_tf}`;
-            db.prepare('INSERT OR REPLACE INTO signals (key, symbol, root_tf, detected_at, state, meta) VALUES (?, ?, ?, ?, ?, ?)')
-              .run(keyVal, symbol, root_tf, detected_at, 'detected', JSON.stringify(meta));
-          } catch (e) {
-            logger.debug({ e }, 'Fallback signals insert failed (non-fatal)');
-          }
-        } else {
-          logger.debug('No DB persistence available for insertSignal');
-        }
-      } catch (e) {
-        logger.debug({ e }, 'Signal persistence failed (non-fatal)');
-      }
+      const signalObj = {
+        key,
+        symbol,
+        root_tf,
+        detected_at,
+        state: 'detected',
+        meta
+      };
 
-      // Build the signal object
-      const signalObj = { key, symbol, root_tf, detected_at, state: 'detected', meta };
-
-      // 10) Notify (telegram)
       if (notifyImmediately) {
+        // send telegram block immediately with all metrics
         try {
           await telegram.sendRootSignalBlock({
             symbol,
@@ -434,13 +112,12 @@ module.exports = {
             alignment,
             detected_at,
             accept,
-            marketData: normalizedMdata,
+            marketData: mdata || {},
             tvScore: tv.score || 0,
-            tvScorePct: tv.score_pct || 0,
             tvSource: tv.source || 'error',
             mtfScore
           });
-          logger.info({ symbol, root_tf, tvScorePct: tv.score_pct }, 'Telegram root signal block sent');
+          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
@@ -449,40 +126,38 @@ module.exports = {
         return signalObj;
       }
 
-      // 11) Open trade if accepted and allowed
+      // Only when decision is 'accept' do we attempt to open a trade
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
           logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
         } else if (!openTradesAllowed) {
           logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
         } else {
+          // Apply market-level filters
           let passFilters = true;
-
           if (config.MIN_MARKET_CAP > 0) {
-            if (!normalizedMdata || !normalizedMdata.market_cap || Number(normalizedMdata.market_cap) < config.MIN_MARKET_CAP) {
+            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
-              logger.info({ symbol, market_cap: normalizedMdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP');
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
-
           if (config.MIN_24H_USDT_VOLUME > 0) {
-            if (!normalizedMdata || !normalizedMdata.volume_24h_usdt || Number(normalizedMdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
-              logger.info({ symbol, volume_24h_usdt: normalizedMdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME');
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
-
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
-            const change = normalizedMdata?.volume_change_pct;
+            const change = mdata?.volume_change_pct;
             if (change === null || change === undefined) {
               if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
                 passFilters = false;
-                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT');
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
               }
             } else {
               if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
                 passFilters = false;
-                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT');
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
               }
             }
           }
@@ -510,7 +185,7 @@ module.exports = {
   },
 
   /**
-   * evaluateMtfAlignment
+   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
    */
   async evaluateMtfAlignment(symbol) {
     const result = {};
@@ -540,21 +215,20 @@ module.exports = {
   },
 
   /**
-   * applyDecision: determine acceptance
-   * Feature 1: Uses timeframe hierarchy for weighted evaluation
+   * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
    */
-  async applyDecision(alignment, symbol = null, root_tf = null) {
+  async applyDecision(alignment) {
     const tfList = Object.keys(alignment);
-    if (!tfList || tfList.length === 0) return { decision: 'reject', reason: 'no_mtf_data' };
-
-    // Feature 1: Evaluate with priority weighting
-    const hierarchy = config.PRIORITIZE_ROOT_TFS ? evaluateTimeframeHierarchy(alignment) : {};
-    
-    const allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
-    if (allPositive) {
-      const priorityInfo = config.PRIORITIZE_ROOT_TFS ? ` (hierarchy: ${JSON.stringify(hierarchy)})` : '';
-      return { decision: 'accept', reason: `all_positive${priorityInfo}` };
+    if (!tfList || tfList.length === 0) {
+      return { decision: 'reject', reason: 'no_mtf_data' };
     }
+
+    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    if (allPositive) return { decision: 'accept', reason: 'all_positive' };
 
     const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
     if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
@@ -563,96 +237,39 @@ module.exports = {
       return { decision: 'monitor', reason: 'daily_not_rising' };
     }
 
-    if (negatives.length >= 1) return { decision: 'monitor', reason: 'some_negative' };
+    if (negatives.length >= 1) {
+      return { decision: 'monitor', reason: 'some_negative' };
+    }
 
     return { decision: 'reject', reason: 'unknown' };
   },
 
   /**
-   * sendStartupSummary: builds snapshot and forwards to telegram sendStartupSummary()
-   * - Ensures snapshot filled by trying multiple retrieval methods
+   * sendStartupSummary: builds a snapshot of latest root signals and sends initial telegram message
    */
   async sendStartupSummary() {
     try {
-      let snapshot = [];
-      try {
-        if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-          snapshot = dbModule.getLatestSignalsSnapshot() || [];
-        }
-      } catch (e) {
-        logger.debug({ e }, 'sendStartupSummary: primary snapshot retrieval failed');
-      }
-
-      if (!Array.isArray(snapshot) || snapshot.length === 0) {
-        snapshot = await fetchLatestSignalsSnapshotFallback();
-      }
-
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
       const telegramSvc = require('./telegram');
+
       await telegramSvc.sendStartupSummary({ snapshot });
     } catch (e) {
       logger.debug({ e }, 'sendStartupSummary failed');
     }
   },
 
+  /**
+   * handleNewRootCandle: Called when new root candle opens
+   */
   async handleNewRootCandle(newRootTfs = []) {
     try {
-      let snapshot = [];
-      try {
-        if (dbModule && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-          snapshot = dbModule.getLatestSignalsSnapshot() || [];
-        }
-      } catch (e) {
-        logger.debug({ e }, 'handleNewRootCandle: primary snapshot retrieval failed');
-      }
-
-      if (!Array.isArray(snapshot) || snapshot.length === 0) {
-        snapshot = await fetchLatestSignalsSnapshotFallback();
-      }
-
+      const db = dbModule;
+      const snapshot = db.getLatestSignalsSnapshot();
       const telegramSvc = require('./telegram');
       await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
     } catch (e) {
       logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
-    }
-  },
-
-  /**
-   * Feature 3 helper: Check for alignment confirmation
-   * Sends alert when ALL MTF TFS align for a symbol
-   */
-  async checkAlignmentConfirmation(symbol) {
-    if (!config.ALIGNMENT_CONFIRMATION_ALERT) {
-      return; // Feature disabled
-    }
-
-    try {
-      const alignment = await this.evaluateMtfAlignment(symbol);
-      const mtfTfs = Object.keys(alignment || {});
-      
-      if (mtfTfs.length === 0) return;
-
-      const allPositive = mtfTfs.every(tf => alignment[tf] && alignment[tf].positive);
-      if (!allPositive) return; // Not all aligned
-
-      // Check if we already sent this confirmation in current block
-      const blockId = getCurrentBoundaryBlockId();
-      const confirmKey = `confirm:${blockId}:${symbol}`;
-      if (lastSignalPerBoundary.has(confirmKey)) {
-        return; // Already sent
-      }
-
-      lastSignalPerBoundary.set(confirmKey, true);
-
-      const telegramSvc = require('./telegram');
-      await telegramSvc.sendAlignmentConfirmation({
-        symbol,
-        alignment,
-        blockId
-      });
-
-      logger.info({ symbol, blockId }, 'Alignment confirmation sent');
-    } catch (e) {
-      logger.debug({ e, symbol }, 'checkAlignmentConfirmation error');
     }
   }
 };
