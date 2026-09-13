@@ -26,11 +26,11 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - notifyImmediately: 
-   *   - true (LOOP 1, LOOP 3): send telegram immediately via sendNewSignalSingleBlock
-   *   - false (LOOP 2): persist signal and return for caller to notify later
-   * - ALWAYS fetches fresh market data and TV rating for complete signal block
-   * - returns the persisted signal object
+   * - LOOP 1 (notifyImmediately=false): persist signal, return it for caller to send via sendStartupSummary
+   * - LOOP 2 (notifyImmediately=false): persist signal, return it for caller to send (only new ones)
+   * - LOOP 3 (notifyImmediately=true): persist signal AND send immediately via sendNewSignalSingleBlock
+   * 
+   * ALWAYS fetches fresh market data and TV rating for complete signal block
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
@@ -40,7 +40,7 @@ module.exports = {
     }
     inProgress.set(key, true);
     try {
-      logger.info({ symbol, root_tf }, 'Root signal received');
+      logger.info({ symbol, root_tf, notifyImmediately }, 'Root signal received');
 
       // ALWAYS fetch fresh market data (best-effort, with fallbacks)
       let mdata = null;
@@ -105,17 +105,17 @@ module.exports = {
         meta
       };
 
-      // ✅ FIX: Use sendNewSignalSingleBlock (which exists in telegram.js)
-      if (notifyImmediately) {
+      // ✅ LOOP 3 ONLY: Send telegram immediately when notifyImmediately=true
+      if (notifyImmediately === true) {
         try {
-          // Send via telegram.sendNewSignalSingleBlock() with complete signal object
+          logger.info({ symbol, root_tf }, 'handleRootSignal: LOOP 3 sending telegram immediately');
           await telegram.sendNewSignalSingleBlock(signalObj);
-          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram signal block sent (notifyImmediately=true)');
+          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram signal block sent (LOOP 3 - candle open)');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
       } else {
-        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object for caller to notify');
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object for caller (LOOP 1 or LOOP 2)');
       }
 
       // Only when decision is 'accept' do we attempt to open a trade
@@ -237,13 +237,16 @@ module.exports = {
   },
 
   /**
-   * handleNewRootCandle: Called when new root candle opens (LOOP 3)
+   * handleNewRootCandle: Called when new root candle opens (LOOP 2 / LOOP 3)
    * Sends MTF alignment alerts via sendRootCandleUpdate
    */
   async handleNewRootCandle(newRootTfs = []) {
     try {
+      logger.info({ newRootTfs }, 'handleNewRootCandle: fetching latest signals snapshot');
       const db = dbModule;
       const snapshot = db.getLatestSignalsSnapshot();
+      
+      logger.info({ snapshotCount: snapshot.length, newRootTfs }, 'handleNewRootCandle: sending telegram update');
       const telegramSvc = require('./telegram');
       await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
       logger.info({ newRootTfs }, 'handleNewRootCandle: telegram update sent');
