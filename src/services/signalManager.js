@@ -26,9 +26,11 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
-   * - returns the persisted signal object
+   * - notifyImmediately: 
+   *   - true (LOOP 1, LOOP 3): send telegram immediately via sendNewSignalSingleBlock
+   *   - false (LOOP 2): persist signal and return for caller to notify later
    * - ALWAYS fetches fresh market data and TV rating for complete signal block
+   * - returns the persisted signal object
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
     const key = `${symbol}:${root_tf}`;
@@ -103,27 +105,17 @@ module.exports = {
         meta
       };
 
+      // ✅ FIX: Use sendNewSignalSingleBlock (which exists in telegram.js)
       if (notifyImmediately) {
-        // send telegram block immediately with all metrics
         try {
-          await telegram.sendRootSignalBlock({
-            symbol,
-            root_tf,
-            alignment,
-            detected_at,
-            accept,
-            marketData: mdata || {},
-            tvScore: tv.score || 0,
-            tvSource: tv.source || 'error',
-            mtfScore
-          });
-          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
+          // Send via telegram.sendNewSignalSingleBlock() with complete signal object
+          await telegram.sendNewSignalSingleBlock(signalObj);
+          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram signal block sent (notifyImmediately=true)');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
       } else {
-        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
-        return signalObj;
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object for caller to notify');
       }
 
       // Only when decision is 'accept' do we attempt to open a trade
@@ -245,7 +237,8 @@ module.exports = {
   },
 
   /**
-   * handleNewRootCandle: Called when new root candle opens
+   * handleNewRootCandle: Called when new root candle opens (LOOP 3)
+   * Sends MTF alignment alerts via sendRootCandleUpdate
    */
   async handleNewRootCandle(newRootTfs = []) {
     try {
@@ -253,6 +246,7 @@ module.exports = {
       const snapshot = db.getLatestSignalsSnapshot();
       const telegramSvc = require('./telegram');
       await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
+      logger.info({ newRootTfs }, 'handleNewRootCandle: telegram update sent');
     } catch (e) {
       logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
     }
