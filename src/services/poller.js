@@ -18,6 +18,82 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
 }
 
+// Helper: build startup / TF-scoped summary text block (A-Z symbols + counts per TF + signals snapshot)
+async function buildStartupSummaryText(dbHandle, symbolRows = [], scopeTfs = null) {
+  try {
+    const symbols = Array.isArray(symbolRows) ? symbolRows.map(r => r.symbol).filter(Boolean) : [];
+    symbols.sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'base' }));
+    const total = symbols.length;
+
+    const tfList = Array.isArray(scopeTfs) && scopeTfs.length ? scopeTfs : (Array.isArray(config.ROOT_TFS) ? config.ROOT_TFS : []);
+    const countsPerTf = {};
+    try {
+      for (const tf of tfList) {
+        try {
+          const row = dbHandle.prepare('SELECT COUNT(DISTINCT symbol) as c FROM klines WHERE timeframe = ?').get(String(tf));
+          countsPerTf[String(tf)] = (row && row.c) ? row.c : 0;
+        } catch (e) {
+          countsPerTf[String(tf)] = 0;
+        }
+      }
+    } catch (e) {
+      logger.debug({ e }, 'buildStartupSummaryText: failed to compute countsPerTf');
+      for (const tf of tfList) countsPerTf[String(tf)] = countsPerTf[String(tf)] || 0;
+    }
+
+    // Signals snapshot (best-effort)
+    let signals = [];
+    try {
+      if (typeof dbModule.getLatestSignalsSnapshot === 'function') {
+        signals = dbModule.getLatestSignalsSnapshot();
+      } else {
+        signals = [];
+      }
+    } catch (e) {
+      logger.debug({ e }, 'buildStartupSummaryText: failed to fetch latest signals snapshot');
+      signals = [];
+    }
+
+    const lines = [];
+    lines.push('Startup Scan Summary');
+    lines.push(`Total symbols: ${total}`);
+    lines.push('');
+    lines.push('Symbols (A-Z):');
+    if (symbols.length) {
+      // chunk to keep lines reasonable
+      for (let i = 0; i < symbols.length; i += 12) {
+        lines.push(symbols.slice(i, i + 12).join(', '));
+      }
+    } else {
+      lines.push('(no symbols)');
+    }
+    lines.push('');
+    lines.push('Counts per TF:');
+    if (Object.keys(countsPerTf).length) {
+      for (const tfKey of Object.keys(countsPerTf)) {
+        lines.push(` - ${tfKey}: ${countsPerTf[tfKey]}`);
+      }
+    } else {
+      lines.push(' - (no TFs configured)');
+    }
+    lines.push('');
+    lines.push('Signals snapshot:');
+    if (Array.isArray(signals) && signals.length) {
+      for (const s of signals) {
+        const sigLine = `${s.key || s.symbol || 'unknown'} | root_tf=${s.root_tf || '-'} | ${s.side || '-'} | detected_at=${new Date(s.detected_at || 0).toISOString()}`;
+        lines.push(` - ${sigLine}`);
+      }
+    } else {
+      lines.push(' - (no signals)');
+    }
+
+    return lines.join('\n');
+  } catch (err) {
+    logger.debug({ err }, 'buildStartupSummaryText: unexpected error');
+    return 'Startup Scan Summary: (error building summary)';
+  }
+}
+
 module.exports = {
   start() {
     if (isRunning) return;
@@ -203,12 +279,14 @@ module.exports = {
 
   // ============================================================
   // LOOP 1: Initial/Deploy Scan (runs once at startup)
+  // Sends startup summary (A-Z list + counts per TF + signals snapshot), then per-signal blocks, then recommended trades
   // ============================================================
   async scanAllForStartup() {
     try {
       logger.info('scanAllForStartup: starting full startup pass (silent)');
-      const db = dbModule.get();
-      const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      const dbHandle = dbModule.get();
+      const rows = dbHandle.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
         const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false, detected_ts: Date.now() }));
@@ -218,6 +296,64 @@ module.exports = {
           logger.debug({ e }, 'scanAllForStartup: page tasks error (continuing)');
         }
       }
+
+      // Build and send a single summary block (A-Z list + counts per TF + signals snapshot)
+      try {
+        const telegram = require('./telegram');
+        const summaryText = await buildStartupSummaryText(dbHandle, rows);
+        if (telegram && typeof telegram.sendStartupSummaryBlock === 'function') {
+          await telegram.sendStartupSummaryBlock({ text: summaryText });
+        } else if (telegram && typeof telegram.sendRawMessage === 'function') {
+          await telegram.sendRawMessage(summaryText);
+        } else {
+          logger.info('scanAllForStartup: telegram startup summary method not found (skipping)');
+        }
+      } catch (e) {
+        logger.debug({ e }, 'scanAllForStartup: failed to send startup summary');
+      }
+
+      // After summary block, send one block per currently detected signal
+      try {
+        const telegram = require('./telegram');
+        const currentSignals = typeof dbModule.getLatestSignalsSnapshot === 'function' ? dbModule.getLatestSignalsSnapshot() : [];
+        if (Array.isArray(currentSignals) && currentSignals.length) {
+          for (let i = 0; i < currentSignals.length; i++) {
+            const s = currentSignals[i];
+            try {
+              await telegram.sendNewSignalSingleBlock(s);
+            } catch (e) {
+              logger.debug({ e, s }, 'scanAllForStartup: failed to send signal block');
+            }
+            await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+          }
+        } else {
+          logger.info('scanAllForStartup: no current signals to send individually');
+        }
+      } catch (e) {
+        logger.debug({ e }, 'scanAllForStartup: error sending individual signal blocks');
+      }
+
+      // Finally, send a recommended trades block if available
+      try {
+        const telegram = require('./telegram');
+        if (tradeManager && typeof tradeManager.getRecommendedTrades === 'function') {
+          const rec = await tradeManager.getRecommendedTrades();
+          if (rec && rec.length) {
+            if (telegram && typeof telegram.sendRecommendedTradesBlock === 'function') {
+              await telegram.sendRecommendedTradesBlock(rec);
+            } else if (telegram && typeof telegram.sendRawMessage === 'function') {
+              await telegram.sendRawMessage('Recommended trades:\n' + JSON.stringify(rec, null, 2));
+            }
+          } else {
+            logger.info('scanAllForStartup: no recommended trades returned');
+          }
+        } else {
+          logger.debug('scanAllForStartup: tradeManager.getRecommendedTrades not available (skipping recommended trades block)');
+        }
+      } catch (e) {
+        logger.debug({ e }, 'scanAllForStartup: failed to send recommended trades block');
+      }
+
       logger.info('scanAllForStartup: completed full startup pass');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
@@ -227,6 +363,7 @@ module.exports = {
   // ============================================================
   // LOOP 2: 5m Boundary Scan (runs at every 5m boundary)
   // Sends ONE new signal per block (only signals not in previous snapshot)
+  // Also sends MTF alignment alerts when new root candles found
   // ============================================================
   start5mBoundaryScanLoop() {
     const msToNext5 = () => {
@@ -333,6 +470,18 @@ module.exports = {
           } catch (e) {
             logger.debug({ e, newRootTfs }, 'scan5mBoundary: handleNewRootCandle failed');
           }
+
+          // Send explicit MTF alignment/notify via telegram (best-effort)
+          try {
+            const telegram = require('./telegram');
+            if (telegram && typeof telegram.sendMtfAlignmentAlert === 'function') {
+              await telegram.sendMtfAlignmentAlert(newRootTfs);
+            } else if (telegram && typeof telegram.sendRawMessage === 'function') {
+              await telegram.sendRawMessage(`MTF alignment: new root candles: ${newRootTfs.join(', ')}`);
+            }
+          } catch (e) {
+            logger.debug({ e, newRootTfs }, 'scan5mBoundary: failed to send MTF alignment alert');
+          }
         }
       } catch (e) {
         logger.debug({ e }, 'scan5mBoundary: root TF detection failed');
@@ -366,7 +515,7 @@ module.exports = {
 
   // ============================================================
   // LOOP 3: Root TF Candle Open Scan (triggered at candle open)
-  // Detects flips at exact candle open and sends Telegram
+  // For relevant new TFs: sends TF-scoped summary (A-Z + counts), one block per flip, then recommended trades for that TF
   // ============================================================
   startRootTfCandleOpenScanLoop() {
     const getNextCandleOpenTime = () => {
@@ -426,12 +575,12 @@ module.exports = {
 
   async scanRootTfCandleOpen() {
     try {
-      const db = dbModule;
+      const dbHandle = dbModule.get();
       const scanStart = Date.now();
 
       logger.info({ loop: 'root-tf-candle-open-scan' }, 'Scanning root TF candle opens for flips');
 
-      const rows = db.get().prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      const rows = dbHandle.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
       const detectedFlips = [];
 
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
@@ -439,7 +588,7 @@ module.exports = {
         const tasks = page.map(r => 
           this.scanSymbolRootsForCandleOpen(r.symbol, scanStart)
             .then(flips => {
-              if (Array.isArray(flips)) detectedFlips.push(...flips);
+              if (Array.isArray(flips) && flips.length) detectedFlips.push(...flips);
             })
         );
         try {
@@ -453,16 +602,63 @@ module.exports = {
         logger.info({ detectedFlips: detectedFlips.length, loop: 'root-tf-candle-open-scan' }, 'Flips detected at candle open');
 
         const telegram = require('./telegram');
-        for (let i = 0; i < detectedFlips.length; i++) {
-          const s = detectedFlips[i];
+
+        // Group flips by root_tf so we can send TF-scoped summary blocks
+        const byTf = detectedFlips.reduce((acc, s) => {
+          const tf = String(s.root_tf || 'unknown');
+          (acc[tf] = acc[tf] || []).push(s);
+          return acc;
+        }, {});
+
+        for (const tf of Object.keys(byTf)) {
+          const flipsForTf = byTf[tf];
+
+          // Build a TF-scoped symbol list for this TF (A-Z)
+          const symbolsInTf = flipsForTf.map(f => ({ symbol: f.symbol }));
+          const tfSummaryText = await buildStartupSummaryText(dbHandle, symbolsInTf, [tf]);
+
+          // Send TF-scoped summary block
           try {
-            // Send flip signal with existing layout
-            await telegram.sendNewSignalSingleBlock(s);
+            if (telegram && typeof telegram.sendStartupSummaryBlock === 'function') {
+              await telegram.sendStartupSummaryBlock({ text: tfSummaryText, tf });
+            } else if (telegram && typeof telegram.sendRawMessage === 'function') {
+              await telegram.sendRawMessage(`TF ${tf} summary\n${tfSummaryText}`);
+            } else {
+              logger.info('scanRootTfCandleOpen: telegram startup summary method not found (skipping TF summary)');
+            }
           } catch (e) {
-            logger.debug({ e, s }, 'scanRootTfCandleOpen: failed to send flip message');
+            logger.debug({ e, tf }, 'scanRootTfCandleOpen: failed to send TF summary block');
           }
-          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-        }
+
+          // Then send one block per flip (existing layout)
+          for (let i = 0; i < flipsForTf.length; i++) {
+            const s = flipsForTf[i];
+            try {
+              await telegram.sendNewSignalSingleBlock(s);
+            } catch (e) {
+              logger.debug({ e, s }, 'scanRootTfCandleOpen: failed to send flip message');
+            }
+            await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+          }
+
+          // Finally recommend trades for this TF if available
+          try {
+            if (tradeManager && typeof tradeManager.getRecommendedTradesForTf === 'function') {
+              const rec = await tradeManager.getRecommendedTradesForTf(tf);
+              if (rec && rec.length) {
+                if (telegram && typeof telegram.sendRecommendedTradesBlock === 'function') {
+                  await telegram.sendRecommendedTradesBlock(rec, { tf });
+                } else if (telegram && typeof telegram.sendRawMessage === 'function') {
+                  await telegram.sendRawMessage(`Recommended trades (${tf}):\n` + JSON.stringify(rec, null, 2));
+                }
+              } else {
+                logger.info({ tf }, 'scanRootTfCandleOpen: no recommended trades for TF');
+              }
+            }
+          } catch (e) {
+            logger.debug({ e, tf }, 'scanRootTfCandleOpen: failed to send recommended trades block');
+          }
+        } // end for each tf
       } else {
         logger.info({ loop: 'root-tf-candle-open-scan' }, 'No flips detected at candle open');
       }
