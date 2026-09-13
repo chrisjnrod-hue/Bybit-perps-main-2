@@ -102,17 +102,58 @@ module.exports = {
     try {
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal single block sent');
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
     } catch (err) {
       logger.warn({ err }, 'Failed to send telegram new-signal block');
     }
   },
 
+  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvSource = 'error', mtfScore = 0 }) {
+    if (!bot) return;
+    const timeStr = new Date(detected_at).toISOString();
+    
+    let alignmentLines = Object.entries(alignment || {}).map(([tf, info]) => {
+      if (!info || !info.hasOwnProperty('histogram')) return `${tf}: ⚪ unknown`;
+      const posSym = info.positive ? '🟢' : '🔴';
+      const rise = info.rising ? '↑' : '↓';
+      return `${tf}: ${posSym} ${info.positive ? 'POS' : 'NEG'} hist=${Number(info.histogram).toFixed(6)} ${rise}`;
+    }).join('\n');
+
+    const decision = accept && accept.decision ? accept.decision : 'monitor';
+    const tvPercent = Math.round((tvScore || 0) * 100);
+    const mtfPercent = Math.round((mtfScore || 0) * 100);
+
+    const marketLines = this.formatMarketData(marketData || {});
+
+    const msg = [
+      `🎯 Root signal: ${symbol} (${root_tf})`,
+      `⏰ Time: ${timeStr}`,
+      `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision}`,
+      '',
+      `📊 Scoring: TV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`,
+      '',
+      `🛰️ MTF Status:`,
+      alignmentLines || 'No MTF data',
+      '',
+      `💱 Market Data:`,
+      marketLines,
+      '',
+      `Reason: ${accept?.reason || 'n/a'}`
+    ].join('\n');
+
+    try {
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
+      logger.info({ symbol, root_tf }, 'Telegram root signal message sent with market data & TV rating');
+    } catch (err) {
+      logger.warn({ err }, 'Failed to send telegram root signal block');
+    }
+  },
+
   /**
    * sendStartupSummary:
-   * - LOOP 1 initial startup method
-   * - Sends: header with counts + per-signal detail blocks + recommended section
-   * - This is used ONLY at initial deploy/startup
+   * - Summary header with counts per root TF + vertical symbol list
+   * - Per-signal detailed blocks (no alphabetical labels)
+   * - Recommended block with highest-scoring signals
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -250,12 +291,6 @@ module.exports = {
     }
   },
 
-  /**
-   * sendRootCandleUpdate:
-   * - LOOP 3: Called when new root candles open
-   * - Sends per-signal detail blocks for the new candles
-   * - NO summary header, NO recommended section
-   */
   async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
     if (!bot) return;
     try {
@@ -268,30 +303,8 @@ module.exports = {
         ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
         : signals;
 
-      if (filtered.length === 0) {
-        logger.info({ newRootTfs }, 'sendRootCandleUpdate: no signals to send for new candles');
-        return;
-      }
-
-      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending per-signal blocks for new root candles');
-
-      // Send ONLY per-signal blocks (no summary header, no recommended)
-      filtered.sort((a, b) => {
-        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
-        if (s !== 0) return s;
-        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
-      });
-
-      for (let i = 0; i < filtered.length; i++) {
-        try {
-          await this.sendNewSignalSingleBlock(filtered[i], null);
-        } catch (e) {
-          logger.debug({ e, i }, 'sendRootCandleUpdate: failed to send per-signal block');
-        }
-        await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-      }
-
-      logger.info({ count: filtered.length }, 'sendRootCandleUpdate: completed (per-signal blocks sent)');
+      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending for new root candles');
+      await this.sendStartupSummary({ snapshot: filtered });
     } catch (err) {
       logger.warn({ err }, 'Failed to send root candle update');
     }
