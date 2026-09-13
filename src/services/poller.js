@@ -13,15 +13,76 @@ const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
 let lastRootCandleState = {}; // Track last root candle to prevent duplicate flips
+let keepAliveInterval = null; // Track keep-alive interval
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
+}
+
+// ============================================================
+// KEEP-ALIVE MECHANISM (Prevents Render spin-down)
+// ============================================================
+function startKeepAlive() {
+  if (keepAliveInterval) return; // Already running
+  
+  const KEEP_ALIVE_INTERVAL = 3 * 60 * 1000; // 3 minutes (safer than 4)
+  
+  keepAliveInterval = setInterval(() => {
+    try {
+      // Log activity to keep event loop active
+      logger.info({
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        keepAlive: true
+      }, 'Keep-alive heartbeat - preventing spin-down');
+
+      // Trigger a lightweight DB operation to keep connection active
+      try {
+        const db = dbModule.get();
+        const stmt = db.prepare('SELECT COUNT(*) as count FROM symbols');
+        const result = stmt.get();
+        logger.debug({ symbolCount: result.count }, 'Keep-alive DB check');
+      } catch (e) {
+        logger.debug({ e }, 'Keep-alive DB check failed (non-fatal)');
+      }
+
+      // Optional: Send heartbeat to external service
+      if (config.KEEP_ALIVE_WEBHOOK) {
+        try {
+          const https = require('https');
+          https.get(config.KEEP_ALIVE_WEBHOOK, (res) => {
+            logger.debug({ statusCode: res.statusCode }, 'External keep-alive ping sent');
+          }).on('error', (e) => {
+            logger.debug({ e }, 'External keep-alive ping failed (non-fatal)');
+          });
+        } catch (e) {
+          logger.debug({ e }, 'Keep-alive webhook error (non-fatal)');
+        }
+      }
+    } catch (err) {
+      logger.error({ err }, 'Keep-alive mechanism error');
+    }
+  }, KEEP_ALIVE_INTERVAL);
+
+  logger.info('Keep-alive mechanism started (3 min interval)');
+}
+
+function stopKeepAlive() {
+  if (keepAliveInterval) {
+    clearInterval(keepAliveInterval);
+    keepAliveInterval = null;
+    logger.info('Keep-alive mechanism stopped');
+  }
 }
 
 module.exports = {
   start() {
     if (isRunning) return;
     isRunning = true;
+
+    logger.info('Poller starting - initializing keep-alive mechanism');
+    startKeepAlive(); // Start keep-alive immediately
 
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
 
@@ -68,6 +129,12 @@ module.exports = {
         logger.error({ err }, 'poller: initialScan failed');
       }
     })();
+  },
+
+  stop() {
+    isRunning = false;
+    stopKeepAlive();
+    logger.info('Poller stopped');
   },
 
   async initialScan() {
