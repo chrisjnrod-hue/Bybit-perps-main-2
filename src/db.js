@@ -144,27 +144,37 @@ module.exports = {
     }
   },
 
-  // insert signal row (we keep history; latest per symbol/root_tf is used by helpers)
+  // ✅ FIX: insert signal row and return it for caller
   insertSignal({ symbol, root_tf, detected_at = Date.now(), state = 'detected', meta = {} } = {}) {
     try {
+      const metaStr = JSON.stringify(meta || {});
       const stmt = db.prepare('INSERT INTO signals (symbol, root_tf, detected_at, state, meta) VALUES (?, ?, ?, ?, ?)');
-      stmt.run(symbol, root_tf, detected_at, state, JSON.stringify(meta || {}));
+      const result = stmt.run(symbol, root_tf, detected_at, state, metaStr);
+      logger.debug({ symbol, root_tf, id: result.lastInsertRowid }, 'Signal inserted into DB');
+      return result.lastInsertRowid;
     } catch (err) {
       logger.warn({ err, symbol, root_tf }, 'db.insertSignal failed');
+      return null;
     }
   },
 
-  // Return latest signals snapshot: one row per symbol/root_tf with the most recent detected_at
+  // ✅ FIX: Return latest signals snapshot with DISTINCT to prevent duplicates
+  // One row per symbol/root_tf with the most recent detected_at
   getLatestSignalsSnapshot() {
     try {
       const rows = db.prepare(`
-        SELECT s1.symbol, s1.root_tf, s1.detected_at, s1.state, s1.meta
+        SELECT DISTINCT 
+          s1.symbol, 
+          s1.root_tf, 
+          s1.detected_at, 
+          s1.state, 
+          s1.meta
         FROM signals s1
-        INNER JOIN (
-          SELECT symbol, root_tf, MAX(detected_at) as max_dt
+        WHERE (s1.symbol, s1.root_tf, s1.detected_at) IN (
+          SELECT symbol, root_tf, MAX(detected_at)
           FROM signals
           GROUP BY symbol, root_tf
-        ) s2 ON s1.symbol = s2.symbol AND s1.root_tf = s2.root_tf AND s1.detected_at = s2.max_dt
+        )
         ORDER BY UPPER(s1.symbol) ASC
       `).all();
 
