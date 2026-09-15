@@ -5,7 +5,6 @@ const logger = require('pino')();
 const dbModule = require('../db');
 
 let bot = null;
-let startupSummaryInProgress = false;
 
 module.exports = {
   init() {
@@ -112,20 +111,12 @@ module.exports = {
 
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
-    
-    // Prevent concurrent startup summary sends
-    if (startupSummaryInProgress) {
-      logger.info('Telegram: startup summary already in progress, skipping duplicate');
-      return;
-    }
-    startupSummaryInProgress = true;
 
     try {
       const signals = Array.isArray(snapshot) && snapshot.length > 0 ? snapshot : [];
 
       if (signals.length === 0) {
         logger.warn('Telegram: no signals provided to startup summary');
-        startupSummaryInProgress = false;
         return;
       }
 
@@ -223,8 +214,6 @@ module.exports = {
       logger.info('Telegram: startup summary flow completed');
     } catch (err) {
       logger.error({ err }, 'Telegram: startup summary flow failed');
-    } finally {
-      startupSummaryInProgress = false;
     }
   }
 };
