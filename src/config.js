@@ -1,3 +1,4 @@
+// config.js - FULLY UPDATED
 const parseList = (v) => (v ? v.split(',').map(x => x.trim()) : []);
 
 /* Env boolean helper */
@@ -64,10 +65,10 @@ module.exports = {
   BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
   BREAK_EVEN_TRAILING: (process.env.BREAK_EVEN_TRAILING === 'true'),
 
-  // Symbol filtering - USDT.P PERPETUALS ONLY (non-expiry contracts)
-  // Matches: BTCUSDT.P, ETHUSDT.P, etc.
+  // Symbol filtering - USDT PERPETUALS (accepts both USDT and USDT.P formats)
+  // Matches: BTCUSDT, BTCUSDT.P, ETHUSDT, ETHUSDT.P, etc.
   // Rejects: BTCUSDTQ (quarterly), BTCUSDTH (monthly), any other variants with dates
-  SYMBOL_FILTER: process.env.SYMBOL_FILTER || '^[A-Z0-9]+USDT\\.P$',
+  SYMBOL_FILTER: process.env.SYMBOL_FILTER || '^[A-Z0-9]+USDT(\\.P)?$',
   
   // Close least profitable trade feature
   CLOSE_LEAST_PROFITABLE_ENABLED: envBool('CLOSE_LEAST_PROFITABLE_ENABLED', false),
