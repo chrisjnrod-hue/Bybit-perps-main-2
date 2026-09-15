@@ -34,6 +34,9 @@ function validateSymbol(symbol) {
 const WS_SUBSCRIBE_CHUNK = config.WS_SUBSCRIBE_CHUNK || (process.env.WS_SUBSCRIBE_CHUNK ? Number(process.env.WS_SUBSCRIBE_CHUNK) : 50);
 const WS_SUBSCRIBE_RETRY_BASE_MS = config.WS_SUBSCRIBE_RETRY_BASE_MS || (process.env.WS_SUBSCRIBE_RETRY_BASE_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_BASE_MS) : 1000);
 const WS_SUBSCRIBE_RETRY_MAX_MS = config.WS_SUBSCRIBE_RETRY_MAX_MS || (process.env.WS_SUBSCRIBE_RETRY_MAX_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_MAX_MS) : 60000);
+const WS_RECONNECT_DELAY_MS = config.WS_RECONNECT_DELAY_MS || 500;
+const WS_RECONNECT_BACKOFF_FACTOR = config.WS_RECONNECT_BACKOFF_FACTOR || 1.5;
+const WS_RECONNECT_MAX_MS = config.WS_RECONNECT_MAX_MS || 30000;
 
 class WSManager extends EventEmitter {
   constructor() {
@@ -44,6 +47,7 @@ class WSManager extends EventEmitter {
     this.maxSockets = config.MAX_CONCURRENT_WS || 20;
     this.batchSize = config.BATCH_WS_SIZE || 20;
     this.klineBuffer = new Map();
+    this.reconnectDelayMs = WS_RECONNECT_DELAY_MS;
   }
 
   start() {
@@ -87,11 +91,14 @@ class WSManager extends EventEmitter {
       pendingTopics: new Set(),
       ready: false,
       retryDelayMs: WS_SUBSCRIBE_RETRY_BASE_MS,
-      _retryTimer: null
+      _retryTimer: null,
+      reconnectRetries: 0,
+      _reconnectTimer: null
     };
 
     ws.on('open', () => {
       conn.ready = true;
+      conn.reconnectRetries = 0; // Reset reconnect counter on successful connection
       logger.info({ connId: conn.id, wsUrl }, 'WS connection opened');
       if (conn.pendingTopics && conn.pendingTopics.size) {
         logger.info({ connId: conn.id, pending: conn.pendingTopics.size }, 'Flushing pending subscribe topics on open');
@@ -179,17 +186,44 @@ class WSManager extends EventEmitter {
       this.connections = this.connections.filter(c => c !== conn);
       this.openSockets = Math.max(0, this.openSockets - 1);
 
-      if (symbolsToRecover && symbolsToRecover.length) {
-        logger.info({ connId: conn.id, recoverCount: symbolsToRecover.length }, 'Re-queueing symbols from closed connection');
-        setTimeout(() => {
+      // Clear any pending timers
+      if (conn._retryTimer) {
+        clearTimeout(conn._retryTimer);
+        conn._retryTimer = null;
+      }
+      if (conn._reconnectTimer) {
+        clearTimeout(conn._reconnectTimer);
+        conn._reconnectTimer = null;
+      }
+
+      // Re-subscribe symbols with exponential backoff (only if not too many retries)
+      if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries < 5) {
+        logger.info({ connId: conn.id, recoverCount: symbolsToRecover.length, retryAttempt: conn.reconnectRetries + 1 }, 'Re-queueing symbols from closed connection');
+        
+        const recoveryDelay = Math.min(
+          WS_RECONNECT_DELAY_MS * Math.pow(WS_RECONNECT_BACKOFF_FACTOR, conn.reconnectRetries),
+          WS_RECONNECT_MAX_MS
+        );
+        conn.reconnectRetries++;
+        
+        conn._reconnectTimer = setTimeout(() => {
+          conn._reconnectTimer = null;
           for (const sym of symbolsToRecover) {
             try {
-              this.subscribeSymbolMTF(sym);
+              // Only re-subscribe if symbol is not already in another connection
+              const existing = this.symbolToConn.get(sym);
+              if (!existing) {
+                this.subscribeSymbolMTF(sym);
+              }
             } catch (e) {
               logger.debug({ err: e, symbol: sym }, 'Error re-subscribing symbol');
             }
           }
-        }, 500);
+        }, recoveryDelay);
+        
+        logger.debug({ connId: conn.id, recoveryDelayMs: recoveryDelay }, 'Scheduled symbol recovery for connection');
+      } else if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries >= 5) {
+        logger.warn({ connId: conn.id, recoverCount: symbolsToRecover.length, retries: conn.reconnectRetries }, 'Max reconnect retries reached, abandoning symbol recovery');
       }
     });
 
@@ -336,7 +370,7 @@ class WSManager extends EventEmitter {
     target.symbols.add(symbol);
     this.symbolToConn.set(symbol, target);
 
-    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size, topics: topics }, 'Queued symbol for subscription (pending until socket OPEN)');
+    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size }, 'Queued symbol for subscription (pending until socket OPEN)');
     
     if (target.ws && target.ws.readyState === WebSocket.OPEN) {
       this._flushPendingForConn(target);
@@ -382,9 +416,11 @@ class WSManager extends EventEmitter {
     this.klineBuffer.delete(symbol);
     logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');
 
+    // Close connection if no more symbols
     if (conn.symbols.size === 0) {
       try {
         if (conn._retryTimer) clearTimeout(conn._retryTimer);
+        if (conn._reconnectTimer) clearTimeout(conn._reconnectTimer);
       } catch (e) { /* ignore */ }
       try { if (conn.ws) conn.ws.close(); } catch (e) { /* ignore */ }
     }
@@ -452,6 +488,17 @@ class WSManager extends EventEmitter {
       
       for (const conn of this.connections.slice()) {
         try {
+          // Clear all timers
+          if (conn._retryTimer) {
+            clearTimeout(conn._retryTimer);
+            conn._retryTimer = null;
+          }
+          if (conn._reconnectTimer) {
+            clearTimeout(conn._reconnectTimer);
+            conn._reconnectTimer = null;
+          }
+
+          // Unsubscribe all topics
           const topics = Array.from(conn._topics || []);
           if (topics.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
             try {
@@ -461,10 +508,11 @@ class WSManager extends EventEmitter {
               logger.debug({ err: e }, 'Failed to unsubscribe on close');
             }
           }
+
+          // Close websocket
           if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
             try { conn.ws.close(); } catch (e) { /* ignore */ }
           }
-          if (conn._retryTimer) clearTimeout(conn._retryTimer);
         } catch (e) {
           logger.debug({ err: e, connId: conn.id }, 'Error closing connection');
         }
@@ -473,6 +521,7 @@ class WSManager extends EventEmitter {
       this.symbolToConn = new Map();
       this.klineBuffer = new Map();
       this.openSockets = 0;
+      this.reconnectDelayMs = WS_RECONNECT_DELAY_MS;
       logger.info('WSManager: closed all connections');
     } catch (err) {
       logger.warn({ err: err && err.message ? err.message : err }, 'WSManager.closeAll error');
