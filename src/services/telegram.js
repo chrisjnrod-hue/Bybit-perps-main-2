@@ -156,9 +156,22 @@ module.exports = {
       logger.info('Telegram: startup header sent');
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      // STEP 2: (REMOVED) - We no longer loop through and send individual detail blocks for every signal.
-      // This prevents chat flooding and duplicate messages during the startup scan.
-      logger.info('Telegram: skipping individual detail blocks for startup summary');
+      // STEP 2: Send individual signal detail blocks (one per signal, sorted A-Z)
+      signals.sort((a, b) => {
+        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
+        if (s !== 0) return s;
+        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
+      });
+
+      for (let i = 0; i < signals.length; i++) {
+        try {
+          await this.sendNewSignalSingleBlock(signals[i]);
+          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Telegram: signal block sent');
+        } catch (e) {
+          logger.warn({ err: e, symbol: signals[i].symbol }, 'Telegram: failed to send signal block');
+        }
+        await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+      }
 
       // STEP 3: Send recommended trades block
       let openCount = 0;
