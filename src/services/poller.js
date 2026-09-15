@@ -42,10 +42,7 @@ module.exports = {
       try {
         logger.info('poller: starting initialization');
         await this.initialScan();
-        logger.info('poller: initialScan completed');
-
-        // Startup scan is now handled within initialScan, no need to call again
-        // This prevents duplicate Telegram messages
+        logger.info('poller: initialScan and startup scan completed');
 
         // Enable open trades after initial scan completes
         try {
@@ -133,7 +130,10 @@ module.exports = {
     }
 
     // Now perform the full startup scan ONCE (within initialScan, not as a separate call)
-    await this.scanAllForStartup();
+    // This prevents duplicate Telegram messages
+    if (!startupComplete) {
+      await this.scanAllForStartup();
+    }
   },
 
   async performWsInitialScan() {
@@ -236,6 +236,12 @@ module.exports = {
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
+      if (!rows || rows.length === 0) {
+        logger.info('scanAllForStartup: no symbols in database');
+        startupComplete = true;
+        return;
+      }
+
       // Validate all symbols are USDT or USDT.P (non-expiry)
       const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
@@ -254,11 +260,16 @@ module.exports = {
         );
       }
 
-      // Collect all signals
+      // Collect ALL signals from ALL symbols first (BEFORE sending any Telegram messages)
       const newSignals = [];
+      const pageSize = config.PAGE_SIZE || 50;
 
-      for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
+      logger.info({ totalSymbols: rows.length, pageSize }, 'scanAllForStartup: processing symbols in batches');
+
+      for (let i = 0; i < rows.length; i += pageSize) {
+        const page = rows.slice(i, i + pageSize);
+        logger.debug({ page: i / pageSize + 1, pageSize: page.length }, 'scanAllForStartup: processing page');
+
         const tasks = page
           .filter(r => {
             const sym = String(r.symbol || '').toUpperCase();
@@ -274,10 +285,13 @@ module.exports = {
         try {
           const results = await Promise.all(tasks);
           newSignals.push(...results.flat());
+          logger.debug({ pageSignals: results.flat().length, totalSoFar: newSignals.length }, 'scanAllForStartup: page completed');
         } catch (e) {
           logger.debug({ e }, 'scanAllForStartup: page tasks error (continuing)');
         }
       }
+
+      logger.info({ totalNewSignals: newSignals.length }, 'scanAllForStartup: all pages processed, preparing signals');
 
       // Sort signals by symbol (A-Z)
       newSignals.sort((a, b) => {
@@ -297,7 +311,9 @@ module.exports = {
         return true;
       });
 
-      // Send Telegram startup flow (complete flow: summary + detail blocks + recommended)
+      logger.info({ uniqueSignals: uniqueSignals.length }, 'scanAllForStartup: sending Telegram startup flow (ONCE)');
+
+      // Send Telegram startup flow ONCE after ALL signals are collected
       if (uniqueSignals.length > 0) {
         logger.info({ newSignals: uniqueSignals.length }, 'scanAllForStartup: triggering telegram startup flow');
 
