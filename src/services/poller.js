@@ -39,8 +39,8 @@ module.exports = {
         logger.info('poller: starting initialScan');
         await this.initialScan();
         logger.info('poller: initialScan completed');
-        
-        // Full silent startup scan
+
+        // Full silent startup scan with proper telegram flow
         try {
           await this.scanAllForStartup();
           logger.info('poller: startup full scan completed');
@@ -225,10 +225,10 @@ module.exports = {
 
   async scanAllForStartup() {
     try {
-      logger.info('scanAllForStartup: starting full startup pass (silent)');
+      logger.info('scanAllForStartup: starting full startup pass (will send telegram summary + sorted signals)');
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
-      
+
       // Validate all symbols are USDT or USDT.P (non-expiry)
       const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
@@ -247,8 +247,9 @@ module.exports = {
         );
       }
 
+      // Collect all signals first
       const newSignals = [];
-      
+
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
         const tasks = page
@@ -262,6 +263,7 @@ module.exports = {
             return /USDT(\.P)?$/.test(sym);
           })
           .map(r => this.scanSymbolRoots(r.symbol));
+
         try {
           const results = await Promise.all(tasks);
           newSignals.push(...results.flat());
@@ -269,22 +271,57 @@ module.exports = {
           logger.debug({ e }, 'scanAllForStartup: page tasks error (continuing)');
         }
       }
-      
-      // Send Telegram notifications for signals found during startup
+
+      // Sort signals by symbol (A-Z)
+      newSignals.sort((a, b) => {
+        const symA = String(a.symbol || '').toUpperCase();
+        const symB = String(b.symbol || '').toUpperCase();
+        return symA.localeCompare(symB);
+      });
+
+      // Send Telegram notifications in correct order:
+      // 1. Summary block first
+      // 2. Individual signal blocks (sorted A-Z)
+      // 3. Recommended blocks
+
       if (newSignals.length > 0) {
-        logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: new signals found');
+        logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: new signals found, sending telegram flow');
+
         const telegram = require('./telegram');
+
+        // STEP 1: Send startup summary block (one time only)
+        try {
+          await telegram.sendStartupSummary({ snapshot: newSignals });
+          logger.info('scanAllForStartup: startup summary block sent');
+        } catch (e) {
+          logger.debug({ e }, 'scanAllForStartup: failed to send startup summary block');
+        }
+
+        await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+
+        // STEP 2: Send individual signal blocks (sorted A-Z)
         for (let i = 0; i < newSignals.length; i++) {
           const s = newSignals[i];
           try {
             await telegram.sendNewSignalSingleBlock(s);
+            logger.info({ symbol: s.symbol, index: i + 1, total: newSignals.length }, 'scanAllForStartup: signal block sent');
           } catch (e) {
-            logger.debug({ e, s }, 'scanAllForStartup: failed to send new-signal message');
+            logger.debug({ e, symbol: s.symbol }, 'scanAllForStartup: failed to send signal block');
           }
           await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
         }
+
+        // STEP 3: Send recommended blocks
+        try {
+          await telegram.sendRecommendedBlocks({ signals: newSignals });
+          logger.info({ signalCount: newSignals.length }, 'scanAllForStartup: recommended blocks sent');
+        } catch (e) {
+          logger.debug({ e }, 'scanAllForStartup: failed to send recommended blocks');
+        }
+      } else {
+        logger.info('scanAllForStartup: no new signals found');
       }
-      
+
       logger.info('scanAllForStartup: completed full startup pass (USDT perpetuals only)');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
@@ -294,7 +331,7 @@ module.exports = {
   async scanSymbolRoots(symbol) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
-    
+
     // Validate symbol is USDT or USDT.P
     const symUpper = String(symbol || '').toUpperCase();
     if (!/USDT(\.P)?$/.test(symUpper)) {
@@ -313,6 +350,7 @@ module.exports = {
         const db = dbModule.get();
         const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2');
         let rows = selectStmt.all(symbol, tf);
+
         if (!rows || rows.length < 2) {
           logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines, seeding now');
           await this.seedKlinesForSymbol(symbol, tf);
@@ -332,7 +370,7 @@ module.exports = {
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
-            notifyImmediately: false
+            notifyImmediately: false // Don't notify immediately during startup scan
           });
           if (sig) results.push(sig);
         }
@@ -340,6 +378,7 @@ module.exports = {
         logger.debug({ err, symbol, tf }, 'scanSymbolRoots: error checking flip');
       }
     }
+
     return results;
   }
 };
