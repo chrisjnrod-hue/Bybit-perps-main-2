@@ -88,7 +88,7 @@ module.exports = {
     }
 
     if (!allSymbols || allSymbols.length === 0) {
-      logger.info('poller: fetching symbols via REST (cursor pagination)');
+      logger.info('poller: fetching symbols via REST (cursor pagination for USDT.P only)');
       allSymbols = await bybit.fetchAllSymbols();
     }
 
@@ -102,14 +102,27 @@ module.exports = {
     const now = Date.now();
     const insertMany = db.transaction((rows) => {
       for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT[Pp]?$/i, ''), s.quote || 'USDT', now);
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT\.P?$/i, ''), s.quote || 'USDT', now);
       }
     });
     insertMany(allSymbols.filter(s => s && s.symbol));
-    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted');
+    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted (USDT.P only)');
 
     const seedSymbols = bybit.getSeedSymbols(allSymbols);
     if (seedSymbols && seedSymbols.length) {
+      // Validate that all seed symbols are USDT.P
+      const nonUsdtP = seedSymbols.filter(s => {
+        const sym = String(s.symbol || '').toUpperCase();
+        return !sym.endsWith('USDT.P');
+      });
+
+      if (nonUsdtP.length > 0) {
+        logger.error(
+          { count: nonUsdtP.length, samples: nonUsdtP.slice(0, 5).map(s => s.symbol) },
+          'poller.initialScan: CRITICAL - non-USDT.P symbols in seed list! These should have been filtered.'
+        );
+      }
+
       setImmediate(() => this.backgroundSeedKlines(seedSymbols));
     } else {
       logger.info('poller.initialScan: no seed symbols to process (SYMBOL_SEED_ALL disabled or none)');
@@ -134,7 +147,7 @@ module.exports = {
       logger.info('backgroundSeedKlines: nothing to seed');
       return;
     }
-    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting');
+    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting (USDT.P only)');
 
     for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
       const batch = symbols.slice(i, i + SEED_CONCURRENCY);
@@ -150,6 +163,13 @@ module.exports = {
 
   async seedKlinesForSymbol(symbol, timeframe = null) {
     try {
+      // Validate symbol is USDT.P
+      const symUpper = String(symbol || '').toUpperCase();
+      if (!symUpper.endsWith('USDT.P')) {
+        logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is not USDT.P, skipping');
+        return;
+      }
+
       const rootTfs = timeframe ? [String(timeframe)] : (config.ROOT_TFS || []);
       const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
       const tfsSet = new Set([...(rootTfs || []), ...(mtfTfs || [])]);
@@ -197,11 +217,30 @@ module.exports = {
       logger.info('scanAllForStartup: starting full startup pass (silent)');
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      
+      // Validate all symbols are USDT.P
+      const nonUsdtP = rows.filter(r => {
+        const sym = String(r.symbol || '').toUpperCase();
+        return !sym.endsWith('USDT.P');
+      });
+
+      if (nonUsdtP.length > 0) {
+        logger.warn(
+          { count: nonUsdtP.length, samples: nonUsdtP.slice(0, 5).map(r => r.symbol) },
+          'scanAllForStartup: WARNING - database contains non-USDT.P symbols! These will be skipped.'
+        );
+      }
+
       const newSignals = [];
       
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol));
+        const tasks = page
+          .filter(r => {
+            const sym = String(r.symbol || '').toUpperCase();
+            return sym.endsWith('USDT.P');
+          })
+          .map(r => this.scanSymbolRoots(r.symbol));
         try {
           const results = await Promise.all(tasks);
           newSignals.push(...results.flat());
@@ -225,7 +264,7 @@ module.exports = {
         }
       }
       
-      logger.info('scanAllForStartup: completed full startup pass');
+      logger.info('scanAllForStartup: completed full startup pass (USDT.P only)');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
     }
@@ -234,6 +273,14 @@ module.exports = {
   async scanSymbolRoots(symbol) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
+    
+    // Validate symbol is USDT.P
+    const symUpper = String(symbol || '').toUpperCase();
+    if (!symUpper.endsWith('USDT.P')) {
+      logger.warn({ symbol }, 'scanSymbolRoots: symbol is not USDT.P, skipping');
+      return results;
+    }
+
     for (const tf of tfList) {
       try {
         const db = dbModule.get();
