@@ -82,7 +82,7 @@ module.exports = {
     const marketBlock = `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
 
     const msgParts = [
-      `🎯 New signal: ${symbol} (${root_tf})`,
+      `🎯 Signal: ${symbol} (${root_tf})`,
       `⏰ Time: ${timeStr}`,
       `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision} (reason: ${reason})`,
       '',
@@ -102,58 +102,19 @@ module.exports = {
     try {
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram new-signal message sent (detail block)');
+      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram signal block sent');
     } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram new-signal block');
-    }
-  },
-
-  async sendRootSignalBlock({ symbol, root_tf, alignment, detected_at, accept, marketData, tvScore = 0, tvSource = 'error', mtfScore = 0 }) {
-    if (!bot) return;
-    const timeStr = new Date(detected_at).toISOString();
-    
-    let alignmentLines = Object.entries(alignment || {}).map(([tf, info]) => {
-      if (!info || !info.hasOwnProperty('histogram')) return `${tf}: ⚪ unknown`;
-      const posSym = info.positive ? '🟢' : '🔴';
-      const rise = info.rising ? '↑' : '↓';
-      return `${tf}: ${posSym} ${info.positive ? 'POS' : 'NEG'} hist=${Number(info.histogram).toFixed(6)} ${rise}`;
-    }).join('\n');
-
-    const decision = accept && accept.decision ? accept.decision : 'monitor';
-    const tvPercent = Math.round((tvScore || 0) * 100);
-    const mtfPercent = Math.round((mtfScore || 0) * 100);
-
-    const marketLines = this.formatMarketData(marketData || {});
-
-    const msg = [
-      `🎯 Root signal: ${symbol} (${root_tf})`,
-      `⏰ Time: ${timeStr}`,
-      `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision}`,
-      '',
-      `📊 Scoring: TV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`,
-      '',
-      `🛰️ MTF Status:`,
-      alignmentLines || 'No MTF data',
-      '',
-      `💱 Market Data:`,
-      marketLines,
-      '',
-      `Reason: ${accept?.reason || 'n/a'}`
-    ].join('\n');
-
-    try {
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, msg);
-      logger.info({ symbol, root_tf }, 'Telegram root signal message sent with market data & TV rating');
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram root signal block');
+      logger.warn({ err }, 'Failed to send telegram signal block');
     }
   },
 
   /**
    * sendStartupSummary:
-   * - Summary header with counts per root TF + vertical symbol list
-   * - Per-signal detailed blocks (no alphabetical labels)
-   * - Recommended block with highest-scoring signals
+   * STEP 1: Summary header with counts per root TF + vertical symbol list
+   * STEP 2: Per-signal detailed blocks (sorted A-Z, one per signal)
+   * STEP 3: Recommended trade block (highest-scoring accepted signals)
+   * 
+   * NO DUPLICATE BLOCKS - each signal sent exactly once
    */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
@@ -166,36 +127,18 @@ module.exports = {
       }
 
       if (!signals.length) {
-        try {
-          const poller = require('./poller');
-          try { await poller.initialScan(); } catch (e) { logger.debug({ e }, 'sendStartupSummary: initialScan failed'); }
-          try { 
-            if (typeof poller.scanAllForStartup === 'function') {
-              await poller.scanAllForStartup();
-            } else if (typeof poller.scanOnce === 'function') {
-              await poller.scanOnce({ notifyNewSignals: false });
-            }
-          } catch (e) { logger.debug({ e }, 'sendStartupSummary: scan pass failed'); }
-        } catch (e) {
-          logger.debug({ e }, 'sendStartupSummary: could not require poller');
-        }
-
-        const waitMs = Number(config.STARTUP_SUMMARY_WAIT_MS || 15000);
-        const retryMs = Number(config.STARTUP_SUMMARY_RETRY_MS || 500);
-        const start = Date.now();
-        while (Date.now() - start < waitMs) {
-          try {
-            signals = dbModule.getLatestSignalsSnapshot() || [];
-          } catch (e) {
-            logger.debug({ e }, 'sendStartupSummary: error fetching snapshot');
-            signals = [];
-          }
-          if (signals && signals.length) break;
-          await this._sleep(retryMs);
-        }
+        logger.info('sendStartupSummary: no signals provided');
+        return;
       }
 
-      // Build counts per root_tf
+      // Sort signals by symbol (A-Z) for consistent ordering
+      signals.sort((a, b) => {
+        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
+        if (s !== 0) return s;
+        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
+      });
+
+      // === STEP 1: Send summary header ===
       const tfCounts = {};
       const symbolSet = new Set();
       for (const s of signals) {
@@ -212,46 +155,37 @@ module.exports = {
       }
 
       const summaryParts = orderedRootTfs.map(tf => `${tf}: ${tfCounts[tf] || 0}`);
-
-      // vertical symbol list (one symbol per line, sorted)
       const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
       const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
 
       const header = `📊 Startup root TF summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, header);
-      logger.info('Sent startup summary header');
+      logger.info({ signalCount: signals.length }, 'Startup summary header sent');
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      // Per-signal detail blocks (sorted by symbol, then root_tf)
-      signals.sort((a, b) => {
-        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
-        if (s !== 0) return s;
-        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
-      });
-
+      // === STEP 2: Send individual signal blocks (sorted A-Z, one per signal) ===
       for (let i = 0; i < signals.length; i++) {
         try {
           await this.sendNewSignalSingleBlock(signals[i], null);
+          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Signal block sent');
         } catch (e) {
-          logger.debug({ e, i }, 'sendStartupSummary: failed to send per-signal block');
+          logger.debug({ e, symbol: signals[i].symbol }, 'Failed to send signal block');
         }
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
 
-      // Recommended block (sorted by TV score desc, then MTF score desc)
+      // === STEP 3: Send recommended trade blocks ===
       let openCount = 0;
       try {
         const row = db.prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
         openCount = row ? Number(row.cnt || 0) : 0;
       } catch (e) {
-        logger.debug({ e }, 'sendStartupSummary: failed to read open trades count');
+        logger.debug({ e }, 'Failed to read open trades count');
         openCount = 0;
       }
-      const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
-      const recHeader = `📈 Recommended to open (${maxSlots} slots available):`;
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
-      await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
+      const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
+      
       const candidates = signals
         .map(s => ({
           symbol: s.symbol,
@@ -270,6 +204,11 @@ module.exports = {
 
       const recommended = candidates.slice(0, maxSlots);
 
+      // Send recommended header
+      const recHeader = `📈 Recommended to open (${maxSlots} slots available):`;
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
+      await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+
       if (recommended.length === 0) {
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
       } else {
@@ -285,9 +224,9 @@ module.exports = {
         }
       }
 
-      logger.info('Startup telegram summary completed (header + per-signal blocks + recommended)');
+      logger.info({ totalSignals: signals.length, recommendedCount: recommended.length }, 'Startup telegram summary completed (header + signals + recommended)');
     } catch (err) {
-      logger.warn({ err }, 'Failed to send startup telegram summary');
+      logger.error({ err }, 'Failed to send startup telegram summary');
     }
   },
 
