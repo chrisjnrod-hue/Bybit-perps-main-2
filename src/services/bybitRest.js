@@ -9,7 +9,7 @@
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
  * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals (no topN limit, USDT.P only)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
- * - fetchKlines: UPDATED with V5 API only + intelligent fallback to mainnet/testnet
+ * - fetchKlines: UPDATED with V5 API only + intelligent fallback + graceful invalid symbol handling
  */
 
 const fetch = require('node-fetch');
@@ -539,13 +539,13 @@ function getSeedSymbols(symbols) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * UPDATED: V5 API only with intelligent fallback to mainnet/testnet + enhanced diagnostics
+ * UPDATED: V5 API only + intelligent fallback + graceful invalid symbol handling
  * 
  * - Uses getBase() for primary attempt (respects MAINNET/testnet auto-switching)
  * - Falls back to mainnet, then testnet if primary fails
  * - Only uses official Bybit V5 REST endpoint (/v5/market/kline)
+ * - Handles 400/404 errors gracefully (invalid/delisted symbols)
  * - Requires category parameter (category=linear for perpetuals)
- * - Logs detailed response info for debugging
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
@@ -553,9 +553,6 @@ async function fetchKlines(symbol, interval, limit = 200) {
     logger.error({ symbol, interval }, 'fetchKlines: no base available (getBase returned null)');
     return [];
   }
-
-  // V5 API candidate (official endpoint)
-  const primaryCandidate = { path: '/v5/market/kline', params: { category: 'linear', symbol, interval, limit: String(limit) } };
 
   // Fallback bases to try if primary base fails
   const fallbackBases = [
@@ -571,28 +568,33 @@ async function fetchKlines(symbol, interval, limit = 200) {
 
   for (const { base: tryBase, label } of allBasesToTry) {
     try {
-      const url = new URL(`${tryBase.replace(/\/$/, '')}${primaryCandidate.path}`);
-      Object.entries(primaryCandidate.params || {}).forEach(([k, v]) => {
-        if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
-      });
+      const url = new URL(`${tryBase.replace(/\/$/, '')}/v5/market/kline`);
+      url.searchParams.append('category', 'linear');
+      url.searchParams.append('symbol', symbol);
+      url.searchParams.append('interval', String(interval));
+      url.searchParams.append('limit', String(limit));
 
-      logger.debug({ base: tryBase, label, symbol, interval, url: url.toString() }, 'fetchKlines: attempting');
+      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: attempting');
 
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       let json = null;
       let responseText = null;
-      
-      try { 
+
+      try {
         responseText = await res.text();
         try { json = JSON.parse(responseText); } catch (e) { json = null; }
-      } catch (e) { 
+      } catch (e) {
         responseText = null;
       }
 
-      logger.debug({ base: tryBase, label, symbol, interval, status: res.status, responseLength: responseText ? responseText.length : 0 }, 'fetchKlines: response received');
+      // Handle 400/404 errors (invalid symbol or delisted on this base)
+      if (res.status === 400 || res.status === 404) {
+        logger.debug({ base: tryBase, label, symbol, status: res.status }, 'fetchKlines: invalid/delisted symbol on this base, trying next');
+        continue;
+      }
 
       if (!res.ok) {
-        logger.warn({ base: tryBase, label, status: res.status, symbol, interval, snippet: responseText ? responseText.slice(0, 300) : null }, 'fetchKlines: HTTP error');
+        logger.debug({ base: tryBase, label, status: res.status, symbol, interval }, 'fetchKlines: HTTP error, trying next base');
         continue;
       }
 
@@ -601,7 +603,7 @@ async function fetchKlines(symbol, interval, limit = 200) {
         if (json.result.list.length > 0) {
           const list = json.result.list;
           logger.info({ base: tryBase, label, symbol, interval, count: list.length }, 'fetchKlines: success');
-          
+
           return list.map(r => ({
             open_time: r.startTime || r.start || r.t || r.open_time || r[0],
             open: Number(r.open || r.o || r[1] || 0),
@@ -611,23 +613,18 @@ async function fetchKlines(symbol, interval, limit = 200) {
             volume: Number(r.volume || r.v || r[5] || 0)
           }));
         } else {
-          logger.warn({ base: tryBase, label, symbol, interval }, 'fetchKlines: result.list is empty array');
+          logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: result.list is empty, trying next base');
           continue;
         }
       }
 
-      // Log what we actually got
-      if (json) {
-        logger.warn({ base: tryBase, label, symbol, interval, jsonKeys: Object.keys(json).slice(0, 5), hasResult: !!json.result }, 'fetchKlines: response shape unexpected');
-      } else {
-        logger.warn({ base: tryBase, label, symbol, interval, snippet: responseText ? responseText.slice(0, 300) : null }, 'fetchKlines: failed to parse JSON');
-      }
+      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: unexpected response shape, trying next base');
     } catch (err) {
-      logger.warn({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception');
+      logger.debug({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception, trying next base');
     }
   }
 
-  logger.error({ symbol, interval, basesAttempted: allBasesToTry.length }, 'fetchKlines: all bases failed');
+  logger.warn({ symbol, interval }, 'fetchKlines: symbol not found on any base (likely delisted or invalid)');
   return [];
 }
 
