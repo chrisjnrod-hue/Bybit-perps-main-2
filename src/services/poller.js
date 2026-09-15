@@ -40,10 +40,10 @@ module.exports = {
         await this.initialScan();
         logger.info('poller: initialScan completed');
         
-        // Full silent startup scan (MACD warm-up, no Telegram notifications)
+        // Full silent startup scan
         try {
           await this.scanAllForStartup();
-          logger.info('poller: startup full scan completed (MACD initialized, ready for live signals)');
+          logger.info('poller: startup full scan completed');
         } catch (err) {
           logger.error({ err }, 'poller: scanAllForStartup error');
         }
@@ -102,7 +102,7 @@ module.exports = {
     const now = Date.now();
     const insertMany = db.transaction((rows) => {
       for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT\.P$/i, ''), s.quote || 'USDT', now);
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT[Pp]?$/i, ''), s.quote || 'USDT', now);
       }
     });
     insertMany(allSymbols.filter(s => s && s.symbol));
@@ -194,28 +194,44 @@ module.exports = {
 
   async scanAllForStartup() {
     try {
-      logger.info('scanAllForStartup: starting full startup pass (SILENT - no Telegram notifications)');
+      logger.info('scanAllForStartup: starting full startup pass (silent)');
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+      const newSignals = [];
       
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
-        // 🔇 SILENT SCAN: notifyImmediately=false means no Telegram alerts during startup
-        // This initializes MACD states without spamming notifications
-        const tasks = page.map(r => this.scanSymbolRoots(r.symbol, { notifyImmediately: false }));
+        const tasks = page.map(r => this.scanSymbolRoots(r.symbol));
         try {
-          await Promise.all(tasks);
+          const results = await Promise.all(tasks);
+          newSignals.push(...results.flat());
         } catch (e) {
           logger.debug({ e }, 'scanAllForStartup: page tasks error (continuing)');
         }
       }
-      logger.info('scanAllForStartup: completed full startup pass (all MACD states initialized, NO Telegram notifications sent)');
+      
+      // Send Telegram notifications for signals found during startup
+      if (newSignals.length > 0) {
+        logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: new signals found');
+        const telegram = require('./telegram');
+        for (let i = 0; i < newSignals.length; i++) {
+          const s = newSignals[i];
+          try {
+            await telegram.sendNewSignalSingleBlock(s);
+          } catch (e) {
+            logger.debug({ e, s }, 'scanAllForStartup: failed to send new-signal message');
+          }
+          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+        }
+      }
+      
+      logger.info('scanAllForStartup: completed full startup pass');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
     }
   },
 
-  async scanSymbolRoots(symbol, { notifyImmediately = true } = {}) {
+  async scanSymbolRoots(symbol) {
     const tfList = config.ROOT_TFS || [];
     const results = [];
     for (const tf of tfList) {
@@ -238,11 +254,11 @@ module.exports = {
 
         const flip = await require('./macd').isMacdFlip(symbol, tf);
         if (flip) {
-          const sig = await signalManager.handleRootSignal({
+          const sig = await require('./signalManager').handleRootSignal({
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
-            notifyImmediately
+            notifyImmediately: false
           });
           if (sig) results.push(sig);
         }
