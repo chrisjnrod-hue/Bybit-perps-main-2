@@ -539,12 +539,13 @@ function getSeedSymbols(symbols) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * UPDATED: V5 API only with intelligent fallback to mainnet/testnet
+ * UPDATED: V5 API only with intelligent fallback to mainnet/testnet + enhanced diagnostics
  * 
  * - Uses getBase() for primary attempt (respects MAINNET/testnet auto-switching)
  * - Falls back to mainnet, then testnet if primary fails
  * - Only uses official Bybit V5 REST endpoint (/v5/market/kline)
  * - Requires category parameter (category=linear for perpetuals)
+ * - Logs detailed response info for debugging
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
@@ -575,35 +576,54 @@ async function fetchKlines(symbol, interval, limit = 200) {
         if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
       });
 
-      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: attempting');
+      logger.debug({ base: tryBase, label, symbol, interval, url: url.toString() }, 'fetchKlines: attempting');
 
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       let json = null;
-      try { json = await res.json(); } catch (e) { json = null; }
+      let responseText = null;
+      
+      try { 
+        responseText = await res.text();
+        try { json = JSON.parse(responseText); } catch (e) { json = null; }
+      } catch (e) { 
+        responseText = null;
+      }
+
+      logger.debug({ base: tryBase, label, symbol, interval, status: res.status, responseLength: responseText ? responseText.length : 0 }, 'fetchKlines: response received');
 
       if (!res.ok) {
-        logger.debug({ base: tryBase, label, status: res.status, symbol, interval }, 'fetchKlines: HTTP error');
+        logger.warn({ base: tryBase, label, status: res.status, symbol, interval, snippet: responseText ? responseText.slice(0, 300) : null }, 'fetchKlines: HTTP error');
         continue;
       }
 
       // Parse V5 response format: result.list array with kline candles
-      if (json && json.result && Array.isArray(json.result.list) && json.result.list.length > 0) {
-        const list = json.result.list;
-        logger.info({ base: tryBase, label, symbol, interval, count: list.length }, 'fetchKlines: success');
-        
-        return list.map(r => ({
-          open_time: r.startTime || r.start || r.t || r.open_time || r[0],
-          open: Number(r.open || r.o || r[1] || 0),
-          high: Number(r.high || r.h || r[2] || 0),
-          low: Number(r.low || r.l || r[3] || 0),
-          close: Number(r.close || r.c || r[4] || 0),
-          volume: Number(r.volume || r.v || r[5] || 0)
-        }));
+      if (json && json.result && Array.isArray(json.result.list)) {
+        if (json.result.list.length > 0) {
+          const list = json.result.list;
+          logger.info({ base: tryBase, label, symbol, interval, count: list.length }, 'fetchKlines: success');
+          
+          return list.map(r => ({
+            open_time: r.startTime || r.start || r.t || r.open_time || r[0],
+            open: Number(r.open || r.o || r[1] || 0),
+            high: Number(r.high || r.h || r[2] || 0),
+            low: Number(r.low || r.l || r[3] || 0),
+            close: Number(r.close || r.c || r[4] || 0),
+            volume: Number(r.volume || r.v || r[5] || 0)
+          }));
+        } else {
+          logger.warn({ base: tryBase, label, symbol, interval }, 'fetchKlines: result.list is empty array');
+          continue;
+        }
       }
 
-      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: response shape unexpected or empty');
+      // Log what we actually got
+      if (json) {
+        logger.warn({ base: tryBase, label, symbol, interval, jsonKeys: Object.keys(json).slice(0, 5), hasResult: !!json.result }, 'fetchKlines: response shape unexpected');
+      } else {
+        logger.warn({ base: tryBase, label, symbol, interval, snippet: responseText ? responseText.slice(0, 300) : null }, 'fetchKlines: failed to parse JSON');
+      }
     } catch (err) {
-      logger.debug({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception');
+      logger.warn({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception');
     }
   }
 
