@@ -44,7 +44,7 @@ module.exports = {
         await this.initialScan();
         logger.info('poller: initialScan completed');
 
-        // Full silent startup scan with proper telegram flow
+        // Full startup scan
         try {
           await this.scanAllForStartup();
           logger.info('poller: startup full scan completed');
@@ -241,9 +241,11 @@ module.exports = {
       // Validate all symbols are USDT or USDT.P (non-expiry)
       const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
+        // Reject if it's a dated variant
         if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
           return true;
         }
+        // Accept USDT and USDT.P
         return !(/USDT(\.P)?$/.test(sym));
       });
 
@@ -254,7 +256,7 @@ module.exports = {
         );
       }
 
-      // Collect all signals first
+      // Collect all signals
       const newSignals = [];
 
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
@@ -262,9 +264,11 @@ module.exports = {
         const tasks = page
           .filter(r => {
             const sym = String(r.symbol || '').toUpperCase();
+            // Reject if it's a dated variant
             if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
               return false;
             }
+            // Accept USDT and USDT.P
             return /USDT(\.P)?$/.test(sym);
           })
           .map(r => this.scanSymbolRoots(r.symbol));
@@ -277,35 +281,34 @@ module.exports = {
         }
       }
 
-      // Deduplicate signals by symbol_timeframe
+      // Sort signals by symbol (A-Z)
+      newSignals.sort((a, b) => {
+        const symA = String(a.symbol || '').toUpperCase();
+        const symB = String(b.symbol || '').toUpperCase();
+        return symA.localeCompare(symB);
+      });
+
+      // Deduplicate signals
       const uniqueSignals = newSignals.filter(sig => {
         const sigId = `${sig.symbol}_${sig.root_tf}`;
         if (processedSignalIds.has(sigId)) {
-          logger.debug({ signal: sigId }, 'Skipping duplicate signal');
+          logger.debug({ signal: sigId }, 'scanAllForStartup: skipping duplicate signal');
           return false;
         }
         processedSignalIds.add(sigId);
         return true;
       });
 
-      // Sort signals by symbol (A-Z)
-      uniqueSignals.sort((a, b) => {
-        const symA = String(a.symbol || '').toUpperCase();
-        const symB = String(b.symbol || '').toUpperCase();
-        return symA.localeCompare(symB);
-      });
-
-      // === SINGLE CALL TO sendStartupSummary ===
-      // This sends: summary header + individual signal blocks + recommended trades
+      // Send Telegram startup flow (complete flow: summary + detail blocks + recommended)
       if (uniqueSignals.length > 0) {
-        logger.info({ newSignals: uniqueSignals.length }, 'scanAllForStartup: sending telegram startup summary');
+        logger.info({ newSignals: uniqueSignals.length }, 'scanAllForStartup: triggering telegram startup flow');
 
-        const telegram = require('./telegram');
         try {
+          const telegram = require('./telegram');
           await telegram.sendStartupSummary({ snapshot: uniqueSignals });
-          logger.info('scanAllForStartup: startup summary completed via telegram');
+          logger.info('scanAllForStartup: telegram startup flow completed');
         } catch (e) {
-          logger.error({ e }, 'scanAllForStartup: failed to send startup summary');
+          logger.error({ e }, 'scanAllForStartup: telegram startup flow failed');
         }
       } else {
         logger.info('scanAllForStartup: no new signals found');
