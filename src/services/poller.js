@@ -6,13 +6,13 @@ const logger = require('pino')();
 const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
+const notificationQueue = require('./notificationQueue');
 
 const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
 let startupComplete = false;
-const processedSignalIds = new Set();
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
@@ -23,7 +23,6 @@ module.exports = {
     if (isRunning) return;
     isRunning = true;
     startupComplete = false;
-    processedSignalIds.clear();
 
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
 
@@ -288,28 +287,10 @@ module.exports = {
         return symA.localeCompare(symB);
       });
 
-      // Deduplicate signals
-      const uniqueSignals = newSignals.filter(sig => {
-        const sigId = `${sig.symbol}_${sig.root_tf}`;
-        if (processedSignalIds.has(sigId)) {
-          logger.debug({ signal: sigId }, 'scanAllForStartup: skipping duplicate signal');
-          return false;
-        }
-        processedSignalIds.add(sigId);
-        return true;
-      });
-
-      // Send Telegram startup flow (complete flow: summary + detail blocks + recommended)
-      if (uniqueSignals.length > 0) {
-        logger.info({ newSignals: uniqueSignals.length }, 'scanAllForStartup: triggering telegram startup flow');
-
-        try {
-          const telegram = require('./telegram');
-          await telegram.sendStartupSummary({ snapshot: uniqueSignals });
-          logger.info('scanAllForStartup: telegram startup flow completed');
-        } catch (e) {
-          logger.error({ e }, 'scanAllForStartup: telegram startup flow failed');
-        }
+      // ENQUEUE STARTUP BATCH TO NOTIFICATION QUEUE (instead of directly calling telegram)
+      if (newSignals.length > 0) {
+        logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: enqueuing startup batch to notification queue');
+        notificationQueue.enqueueStartupBatch(newSignals);
       } else {
         logger.info('scanAllForStartup: no new signals found');
       }
@@ -363,7 +344,7 @@ module.exports = {
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
-            notifyImmediately: false // Don't notify immediately during startup scan
+            notifyImmediately: false // Signal goes to queue, not immediate telegram
           });
           if (sig) results.push(sig);
         }
