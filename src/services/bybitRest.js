@@ -7,9 +7,9 @@
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals (non-expiry only)
+ * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (non-expiry only)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
- * - SYMBOL FILTERING: STRICT USDT.P only - rejects USDTQ, USDTH, and other dated variants
+ * - SYMBOL FILTERING: Accepts USDT and USDT.P - rejects USDTQ, USDTH, and other dated variants
  */
 
 const fetch = require('node-fetch');
@@ -252,13 +252,13 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
     for (const it of arr) {
       if (!it || !it.symbol) continue;
       const base = String(it.symbol).toUpperCase();
-      const candidate = `${base}USDT.P`;
+      const candidate = `${base}USDT`;
       if (!seen.has(candidate)) {
         seen.add(candidate);
         mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
       }
     }
-    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared (USDT.P only)');
+    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
     return mapped;
   } catch (err) {
     logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
@@ -267,31 +267,31 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 }
 
 /**
- * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION & STRICT USDT.P FILTERING
+ * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION & FLEXIBLE USDT FILTERING
  * 
- * Fetches ALL USDT.P perpetual pairs (non-expiry only) using cursor-based pagination.
+ * Fetches ALL USDT/USDT.P perpetual pairs (non-expiry only) using cursor-based pagination.
  * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
  * 
- * SYMBOL FILTERING: STRICT ENFORCEMENT
- * - ACCEPTS: BTCUSDT.P, ETHUSDT.P, SOLUSDT.P (perpetuals with .P suffix)
+ * SYMBOL FILTERING: ACCEPTS BOTH FORMATS
+ * - ACCEPTS: BTCUSDT, ETHUSDT, BTCUSDT.P, ETHUSDT.P (perpetuals)
  * - REJECTS: BTCUSDTQ, BTCUSDTH, BTCUSDT0 (quarterly, monthly, dated variants)
  * 
  * Algorithm:
  * 1. Use getBase() for single authoritative host
  * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
- * 3. Filter by STRICT USDT.P suffix only
+ * 3. Filter by USDT or USDT.P suffix
  * 4. Reject any contracts with date variants (Q, H, Z, or numbers after USDT)
  * 5. Accumulate ALL matching symbols
  * 6. Remove duplicates and sort A->Z
  * 7. Fall back to CoinGecko if REST fails
  */
 async function fetchAllSymbols() {
-  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for USDT.P perpetuals only');
+  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for USDT perpetuals');
 
-  // STRICT USDT.P filter: only accept .P suffix, reject all variants with dates/letters
+  // Accept both USDT and USDT.P, but reject dated variants
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
     ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
-    : /usdt\.p$/i;
+    : /usdt(\.p)?$/i;
 
   const base = getBase();
   if (!base) {
@@ -389,37 +389,46 @@ async function fetchAllSymbols() {
         totalRawInstruments += instruments.length;
         logger.info(
           { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
-          'fetchAllSymbols: page fetched, applying STRICT USDT.P filter'
+          'fetchAllSymbols: page fetched, applying USDT filter'
         );
 
-        // STRICT FILTER: Only accept USDT.P perpetuals (reject dated/quarterly variants)
+        // FILTER: Accept USDT and USDT.P perpetuals, reject dated variants
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
             try {
               const sym = String(it.symbol);
               const su = sym.toUpperCase();
+              const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
 
-              // PRIMARY FILTER: Regex match against STRICT USDT.P only
+              // PRIMARY: Regex match (accepts USDT and USDT.P)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) {
-                return true;
-              }
-
-              // SECONDARY: Explicit check for USDT.P suffix
-              if (su.endsWith('USDT.P')) {
-                return true;
-              }
-
-              // REJECTION LOGIC: If ends with USDT but NOT .P, it's a dated variant
-              if (su.endsWith('USDT')) {
-                // Check for date variants: USDTQ (quarterly), USDTH (monthly), USDT0-9 (dates)
-                const lastSixChars = su.slice(-6);
-                if (/USDT[QHUZ0-9]/.test(lastSixChars)) {
+                // But reject if it's a dated variant
+                if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
                   rejectedDateVariants++;
-                  return false; // Reject dated/quarterly/monthly variants
+                  return false;
                 }
-                // Pure USDT (no .P): reject it
-                return false;
+                return true;
+              }
+
+              // SECONDARY: Explicit quote field check
+              if (quote === 'USDT') {
+                // But reject if it's a dated variant
+                if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
+                  rejectedDateVariants++;
+                  return false;
+                }
+                return true;
+              }
+
+              // TERTIARY: Symbol suffix check (USDT or USDT.P)
+              if (su.endsWith('USDT') || su.endsWith('USDT.P')) {
+                // But reject if it's a dated variant
+                if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
+                  rejectedDateVariants++;
+                  return false;
+                }
+                return true;
               }
 
               return false;
@@ -468,7 +477,7 @@ async function fetchAllSymbols() {
     if (allSymbols.length === 0) {
       logger.warn(
         { totalRawInstruments, totalFiltered, rejectedDateVariants },
-        'fetchAllSymbols: no USDT.P symbols matched filter after full pagination'
+        'fetchAllSymbols: no USDT symbols matched filter after full pagination'
       );
       return [];
     }
@@ -502,7 +511,7 @@ async function fetchAllSymbols() {
         sampleFirst: unique.slice(0, 5).map(s => s.symbol),
         sampleLast: unique.slice(-5).map(s => s.symbol)
       },
-      'fetchAllSymbols: returning all unique USDT.P symbols (sorted A-Z)'
+      'fetchAllSymbols: returning all unique USDT symbols (sorted A-Z)'
     );
 
     return unique;
@@ -517,7 +526,7 @@ async function fetchAllSymbols() {
  * getSeedSymbols(symbols) - UPDATED
  * 
  * Respects only SYMBOL_SEED_ALL flag (no topN cutting).
- * Validates that all symbols are USDT.P only.
+ * Validates that all symbols are USDT/USDT.P (non-expiry).
  * - If SYMBOL_SEED_ALL=true: return ALL symbols for seeding (after validation)
  * - If SYMBOL_SEED_ALL=false: return empty array (no seeding)
  */
@@ -527,32 +536,42 @@ function getSeedSymbols(symbols) {
   const seedAll = envBool('SYMBOL_SEED_ALL', false);
 
   if (seedAll) {
-    // Validate that all seed symbols are USDT.P (warn if any aren't)
-    const nonUsdtP = symbols.filter(s => {
+    // Validate that all seed symbols are USDT or USDT.P (not dated variants)
+    const invalidSymbols = symbols.filter(s => {
       const sym = String(s.symbol || '').toUpperCase();
-      return !sym.endsWith('USDT.P');
+      // Reject if it's a dated variant (USDTQ, USDTH, etc.)
+      if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+        return true;
+      }
+      // Accept USDT and USDT.P
+      return !(/USDT(\.P)?$/.test(sym));
     });
 
-    if (nonUsdtP.length > 0) {
+    if (invalidSymbols.length > 0) {
       logger.warn(
-        { count: nonUsdtP.length, samples: nonUsdtP.slice(0, 5).map(s => s.symbol) },
-        'getSeedSymbols: WARNING - found non-USDT.P symbols in seed list! These will be filtered out.'
+        { count: invalidSymbols.length, samples: invalidSymbols.slice(0, 5).map(s => s.symbol) },
+        'getSeedSymbols: WARNING - found invalid symbols in seed list! These will be filtered out.'
       );
-      // Filter out non-USDT.P symbols
+      // Filter out invalid symbols
       const filtered = symbols.filter(s => {
         const sym = String(s.symbol || '').toUpperCase();
-        return sym.endsWith('USDT.P');
+        // Reject if it's a dated variant
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+          return false;
+        }
+        // Accept USDT and USDT.P
+        return /USDT(\.P)?$/.test(sym);
       });
       logger.info(
-        { totalSymbols: symbols.length, usdtPOnly: filtered.length },
-        'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding USDT.P symbols only'
+        { totalSymbols: symbols.length, validSymbols: filtered.length },
+        'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding valid USDT symbols only'
       );
       return filtered;
     }
 
     logger.info(
       { totalSymbols: symbols.length },
-      'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL symbols (all are USDT.P)'
+      'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL symbols (all are valid USDT)'
     );
     return symbols.slice(); // return copy of all
   }
