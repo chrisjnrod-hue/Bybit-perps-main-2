@@ -40,17 +40,12 @@ module.exports = {
 
     (async () => {
       try {
-        logger.info('poller: starting initialScan');
+        logger.info('poller: starting initialization');
         await this.initialScan();
         logger.info('poller: initialScan completed');
 
-        // Full startup scan
-        try {
-          await this.scanAllForStartup();
-          logger.info('poller: startup full scan completed');
-        } catch (err) {
-          logger.error({ err }, 'poller: scanAllForStartup error');
-        }
+        // Startup scan is now handled within initialScan, no need to call again
+        // This prevents duplicate Telegram messages
 
         // Enable open trades after initial scan completes
         try {
@@ -60,7 +55,7 @@ module.exports = {
           logger.debug({ e }, 'poller: failed to enable open trades');
         }
       } catch (err) {
-        logger.error({ err }, 'poller: initialScan failed');
+        logger.error({ err }, 'poller: initialization failed');
       }
     })();
   },
@@ -136,6 +131,9 @@ module.exports = {
     } else {
       logger.info('poller.initialScan: no seed symbols to process (SYMBOL_SEED_ALL disabled or none)');
     }
+
+    // Now perform the full startup scan ONCE (within initialScan, not as a separate call)
+    await this.scanAllForStartup();
   },
 
   async performWsInitialScan() {
