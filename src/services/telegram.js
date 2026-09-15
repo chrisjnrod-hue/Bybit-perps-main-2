@@ -129,7 +129,7 @@ module.exports = {
         return;
       }
 
-      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow (ONCE)');
+      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow');
 
       // STEP 1: Send startup header with summary counts
       const tfCounts = {};
@@ -156,26 +156,11 @@ module.exports = {
       logger.info('Telegram: startup header sent');
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      // STEP 2: Send individual signal detail blocks (one per signal, sorted A-Z)
-      signals.sort((a, b) => {
-        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
-        if (s !== 0) return s;
-        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
-      });
-
-      logger.info({ signalCount: signals.length }, 'Telegram: sending individual signal blocks');
-      for (let i = 0; i < signals.length; i++) {
-        try {
-          await this.sendNewSignalSingleBlock(signals[i]);
-          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Telegram: signal block sent');
-        } catch (e) {
-          logger.warn({ err: e, symbol: signals[i].symbol }, 'Telegram: failed to send signal block');
-        }
-        await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-      }
+      // STEP 2: (REMOVED) - We no longer loop through and send individual detail blocks for every signal.
+      // This prevents chat flooding and duplicate messages during the startup scan.
+      logger.info('Telegram: skipping individual detail blocks for startup summary');
 
       // STEP 3: Send recommended trades block
-      logger.info('Telegram: compiling recommended trades');
       let openCount = 0;
       try {
         const row = dbModule.get().prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
@@ -208,9 +193,7 @@ module.exports = {
 
       if (recommended.length === 0) {
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
-        logger.info('Telegram: no recommended signals to send');
       } else {
-        logger.info({ count: recommended.length }, 'Telegram: sending recommended trades');
         for (let i = 0; i < recommended.length; i++) {
           const r = recommended[i];
           const label = this.getLabel(i, { lowercase: true });
@@ -224,7 +207,7 @@ module.exports = {
         }
       }
 
-      logger.info('Telegram: startup summary flow completed successfully');
+      logger.info('Telegram: startup summary flow completed');
     } catch (err) {
       logger.error({ err }, 'Telegram: startup summary flow failed');
     } finally {
