@@ -1,3 +1,4 @@
+
 /**
  * src/services/bybitRest.js
  *
@@ -7,9 +8,8 @@
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals (no topN limit, USDT.P only)
+ * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (no topN limit)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
- * - fetchKlines: UPDATED with V5 API only + intelligent fallback + graceful invalid symbol handling
  */
 
 const fetch = require('node-fetch');
@@ -239,7 +239,6 @@ async function probeHosts(timeoutMs = 5000) {
 /** Helper: fetch symbols from CoinGecko markets as a fallback */
 async function fetchSymbolsFromCoinGecko(perPage = 500) {
   try {
-    logger.info({ perPage }, 'fetchSymbolsFromCoinGecko: attempting CoinGecko fallback');
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
     const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
     if (!res.ok) {
@@ -247,56 +246,52 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
       return [];
     }
     const arr = await res.json().catch(() => null);
-    if (!Array.isArray(arr)) {
-      logger.warn('CoinGecko fallback: response not an array');
-      return [];
-    }
+    if (!Array.isArray(arr)) return [];
     const mapped = [];
     const seen = new Set();
     for (const it of arr) {
       if (!it || !it.symbol) continue;
       const base = String(it.symbol).toUpperCase();
-      const candidate = `${base}USDT.P`;
+      const candidate = `${base}USDT`;
       if (!seen.has(candidate)) {
         seen.add(candidate);
-        mapped.push({ symbol: candidate, base, quote: 'USDT.P', status: 'active' });
+        mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
       }
     }
-    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared (USDT.P only)');
+    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
     return mapped;
   } catch (err) {
-    logger.warn({ err: err && err.message ? err.message : String(err) }, 'fetchSymbolsFromCoinGecko: failed');
+    logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
     return [];
   }
 }
 
 /**
- * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION (USDT.P ONLY)
+ * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION
  * 
- * Fetches ALL USDT.P perpetual pairs using cursor-based pagination.
+ * Fetches ALL USDT/USDT.P perpetual pairs using cursor-based pagination.
  * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
- * NOW: STRICT USDT.P ONLY (non-expiry perpetuals)
  * 
  * Algorithm:
  * 1. Use getBase() for single authoritative host
  * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
- * 3. Filter by USDT.P suffix ONLY (strict perpetuals)
+ * 3. Filter by USDT/USDT.P suffix
  * 4. Accumulate ALL matching symbols
  * 5. Remove duplicates and sort A->Z
  * 6. Fall back to CoinGecko if REST fails
  */
 async function fetchAllSymbols() {
-  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for USDT.P perpetuals only');
+  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for all symbols');
 
-  // Symbol filter: STRICT USDT.P ONLY (case-insensitive)
+  // Symbol filter: accept USDT or USDT.P suffix (case-insensitive)
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
     ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
-    : /usdt\.p$/i;
+    : /usdt(\.p)?$/i;
 
   const base = getBase();
   if (!base) {
-    logger.warn('fetchAllSymbols: no base available (getBase returned null), attempting CoinGecko fallback');
-    return await fetchSymbolsFromCoinGecko();
+    logger.warn('fetchAllSymbols: no base available (getBase returned null)');
+    return [];
   }
 
   const allSymbols = [];
@@ -305,7 +300,6 @@ async function fetchAllSymbols() {
   let pageNum = 0;
   let totalRawInstruments = 0;
   let totalFiltered = 0;
-  let restError = false;
 
   try {
     // ===== CURSOR PAGINATION LOOP =====
@@ -330,7 +324,7 @@ async function fetchAllSymbols() {
       });
 
       logger.info(
-        { page: pageNum, cursor: cursor || 'initial', limit },
+        { page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() },
         'fetchAllSymbols: fetching page'
       );
 
@@ -353,10 +347,9 @@ async function fetchAllSymbols() {
       // Handle HTTP errors
       if (!res.ok) {
         logger.warn(
-          { status: res.status, page: pageNum },
-          'fetchAllSymbols: HTTP error, stopping pagination and will attempt CoinGecko fallback'
+          { status: res.status, page: pageNum, url: url.toString() },
+          'fetchAllSymbols: HTTP error, stopping pagination'
         );
-        restError = true;
         break;
       }
 
@@ -364,9 +357,8 @@ async function fetchAllSymbols() {
       if (!json) {
         logger.warn(
           { page: pageNum, snippet: bodyText ? bodyText.slice(0, 200) : null },
-          'fetchAllSymbols: invalid JSON response, stopping pagination and will attempt CoinGecko fallback'
+          'fetchAllSymbols: invalid JSON response, stopping pagination'
         );
-        restError = true;
         break;
       }
 
@@ -377,9 +369,8 @@ async function fetchAllSymbols() {
         if (rc !== 0) {
           logger.warn(
             { retCode: rc, retMsg: rm, page: pageNum },
-            'fetchAllSymbols: API returned non-zero retCode, stopping pagination and will attempt CoinGecko fallback'
+            'fetchAllSymbols: API returned non-zero retCode, stopping pagination'
           );
-          restError = true;
           break;
         }
       }
@@ -390,24 +381,28 @@ async function fetchAllSymbols() {
       // Process page
       if (instruments.length > 0) {
         totalRawInstruments += instruments.length;
-        logger.debug(
+        logger.info(
           { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
-          'fetchAllSymbols: page fetched, applying USDT.P filter'
+          'fetchAllSymbols: page fetched, applying USDT filter'
         );
 
-        // Filter for USDT.P pairs ONLY
+        // Filter for USDT/USDT.P pairs
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
             try {
               const sym = String(it.symbol);
+              const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
 
-              // Match by regex (USDT.P only)
+              // Match by regex (handles USDT and USDT.P)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
 
-              // Match by symbol suffix (strict USDT.P)
+              // Match by explicit quote field
+              if (quote === 'USDT') return true;
+
+              // Match by symbol suffix
               const su = sym.toUpperCase();
-              if (su.endsWith('USDT.P')) return true;
+              if (su.endsWith('USDT') || su.endsWith('USDT.P')) return true;
             } catch (e) {
               return false;
             }
@@ -416,14 +411,14 @@ async function fetchAllSymbols() {
           .map(it => ({
             symbol: it.symbol,
             base: it.baseCoin || it.base || null,
-            quote: 'USDT.P',
-            status: it.status || 'active'
+            quote: it.quoteCoin || it.quote || 'USDT',
+            status: it.status || null
           }));
 
         allSymbols.push(...filtered);
         totalFiltered += filtered.length;
 
-        logger.debug(
+        logger.info(
           {
             page: pageNum,
             pageSize: instruments.length,
@@ -432,21 +427,15 @@ async function fetchAllSymbols() {
           },
           'fetchAllSymbols: page filtered and accumulated'
         );
-
-        // Log sample of raw symbols on first page for debugging
-        if (pageNum === 1 && instruments.length > 0) {
-          const sampleSymbols = instruments.slice(0, 3).map(i => i.symbol);
-          logger.debug({ sampleSymbols, totalPageSize: instruments.length }, 'fetchAllSymbols: sample raw symbols from API (first page)');
-        }
       } else {
-        logger.debug({ page: pageNum }, 'fetchAllSymbols: empty page received');
+        logger.info({ page: pageNum }, 'fetchAllSymbols: empty page received');
       }
 
       // Check for next page cursor
       cursor = result.nextPageCursor;
       if (!cursor) {
         logger.info(
-          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments, totalFiltered },
+          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments },
           'fetchAllSymbols: no nextPageCursor found, pagination complete'
         );
         break;
@@ -458,15 +447,9 @@ async function fetchAllSymbols() {
 
     if (allSymbols.length === 0) {
       logger.warn(
-        { totalRawInstruments, totalFiltered, restError },
-        'fetchAllSymbols: no USDT.P symbols after full pagination. Attempting CoinGecko fallback...'
+        { totalRawInstruments, totalFiltered },
+        'fetchAllSymbols: no symbols matched USDT filter after full pagination'
       );
-      const fallback = await fetchSymbolsFromCoinGecko();
-      if (fallback.length > 0) {
-        logger.info({ count: fallback.length }, 'fetchAllSymbols: successfully obtained symbols from CoinGecko fallback');
-        return fallback;
-      }
-      logger.error('fetchAllSymbols: CoinGecko fallback also returned no symbols');
       return [];
     }
 
@@ -478,8 +461,8 @@ async function fetchAllSymbols() {
         uniqueMap.set(key, {
           symbol: String(s.symbol),
           base: s.base || null,
-          quote: 'USDT.P',
-          status: s.status || 'active'
+          quote: s.quote || 'USDT',
+          status: s.status || null
         });
       }
     }
@@ -499,14 +482,14 @@ async function fetchAllSymbols() {
         sampleFirst: unique.slice(0, 5).map(s => s.symbol),
         sampleLast: unique.slice(-5).map(s => s.symbol)
       },
-      'fetchAllSymbols: returning all unique USDT.P symbols (sorted A-Z)'
+      'fetchAllSymbols: returning all unique symbols (sorted A-Z)'
     );
 
     return unique;
 
   } catch (e) {
-    logger.error({ e: e && e.message ? e.message : String(e) }, 'fetchAllSymbols: exception during pagination, attempting CoinGecko fallback');
-    return await fetchSymbolsFromCoinGecko();
+    logger.error({ e }, 'fetchAllSymbols: exception during pagination');
+    return [];
   }
 }
 
@@ -539,13 +522,7 @@ function getSeedSymbols(symbols) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * UPDATED: V5 API only + intelligent fallback + graceful invalid symbol handling
- * 
- * - Uses getBase() for primary attempt (respects MAINNET/testnet auto-switching)
- * - Falls back to mainnet, then testnet if primary fails
- * - Only uses official Bybit V5 REST endpoint (/v5/market/kline)
- * - Handles 400/404 errors gracefully (invalid/delisted symbols)
- * - Requires category parameter (category=linear for perpetuals)
+ * Uses single base (getBase()) only.
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
@@ -554,77 +531,92 @@ async function fetchKlines(symbol, interval, limit = 200) {
     return [];
   }
 
-  // Fallback bases to try if primary base fails
-  const fallbackBases = [
-    'https://api.bybit.com',           // Mainnet
-    'https://api-testnet.bybit.com'    // Testnet
-  ].filter(b => b !== base); // Don't retry the same base
-
-  // Build list of bases to try: [primary base, fallback bases]
-  const allBasesToTry = [
-    { base, label: 'primary' },
-    ...fallbackBases.map(b => ({ base: b, label: 'fallback' }))
+  const candidates = [
+    { path: '/v5/market/kline', params: { category: 'linear', symbol, interval, limit: String(limit) } },
+    { path: '/v2/public/kline', params: { symbol, interval, limit: String(limit) } },
+    { path: '/v2/public/kline/list', params: { symbol, interval, limit: String(limit) } }
   ];
 
-  for (const { base: tryBase, label } of allBasesToTry) {
+  for (const c of candidates) {
     try {
-      const url = new URL(`${tryBase.replace(/\/$/, '')}/v5/market/kline`);
-      url.searchParams.append('category', 'linear');
-      url.searchParams.append('symbol', symbol);
-      url.searchParams.append('interval', String(interval));
-      url.searchParams.append('limit', String(limit));
-
-      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: attempting');
+      const url = new URL(`${base.replace(/\/$/, '')}${c.path}`);
+      Object.entries(c.params || {}).forEach(([k, v]) => {
+        if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
+      });
 
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       let json = null;
-      let responseText = null;
-
-      try {
-        responseText = await res.text();
-        try { json = JSON.parse(responseText); } catch (e) { json = null; }
-      } catch (e) {
-        responseText = null;
-      }
-
-      // Handle 400/404 errors (invalid symbol or delisted on this base)
-      if (res.status === 400 || res.status === 404) {
-        logger.debug({ base: tryBase, label, symbol, status: res.status }, 'fetchKlines: invalid/delisted symbol on this base, trying next');
-        continue;
-      }
+      try { json = await res.json(); } catch (e) { json = null; }
 
       if (!res.ok) {
-        logger.debug({ base: tryBase, label, status: res.status, symbol, interval }, 'fetchKlines: HTTP error, trying next base');
+        logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error on base');
         continue;
       }
 
-      // Parse V5 response format: result.list array with kline candles
       if (json && json.result && Array.isArray(json.result.list)) {
-        if (json.result.list.length > 0) {
-          const list = json.result.list;
-          logger.info({ base: tryBase, label, symbol, interval, count: list.length }, 'fetchKlines: success');
+        const list = json.result.list;
+        return list.map(r => ({
+          open_time: r.start || r.t || r.open_time || r[0],
+          open: Number(r.open || r.o || r[1] || 0),
+          high: Number(r.high || r.h || r[2] || 0),
+          low: Number(r.low || r.l || r[3] || 0),
+          close: Number(r.close || r.c || r[4] || 0),
+          volume: Number(r.volume || r.v || r[5] || 0)
+        }));
+      }
 
-          return list.map(r => ({
-            open_time: r.startTime || r.start || r.t || r.open_time || r[0],
+      if (json && json.result && Array.isArray(json.result)) {
+        const arr = json.result;
+        if (arr.length && Array.isArray(arr[0])) {
+          return arr.map(r => ({
+            open_time: r[0],
+            open: Number(r[1]),
+            high: Number(r[2]),
+            low: Number(r[3]),
+            close: Number(r[4]),
+            volume: Number(r[5])
+          }));
+        } else if (arr.length && typeof arr[0] === 'object') {
+          return arr.map(r => ({
+            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
             open: Number(r.open || r.o || r[1] || 0),
             high: Number(r.high || r.h || r[2] || 0),
             low: Number(r.low || r.l || r[3] || 0),
             close: Number(r.close || r.c || r[4] || 0),
             volume: Number(r.volume || r.v || r[5] || 0)
           }));
-        } else {
-          logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: result.list is empty, trying next base');
-          continue;
         }
       }
 
-      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: unexpected response shape, trying next base');
+      if (Array.isArray(json)) {
+        if (json.length && Array.isArray(json[0])) {
+          return json.map(r => ({
+            open_time: r[0],
+            open: Number(r[1]),
+            high: Number(r[2]),
+            low: Number(r[3]),
+            close: Number(r[4]),
+            volume: Number(r[5])
+          }));
+        } else if (json.length && typeof json[0] === 'object') {
+          return json.map(r => ({
+            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
+            open: Number(r.open || r.o || r[1] || 0),
+            high: Number(r.high || r.h || r[2] || 0),
+            low: Number(r.low || r.l || r[3] || 0),
+            close: Number(r.close || r.c || r[4] || 0),
+            volume: Number(r.volume || r.v || r[5] || 0)
+          }));
+        }
+      }
+
+      logger.debug({ base, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate endpoint');
     } catch (err) {
-      logger.debug({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception, trying next base');
+      logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
     }
   }
 
-  logger.warn({ symbol, interval }, 'fetchKlines: symbol not found on any base (likely delisted or invalid)');
+  logger.error({ symbol, interval }, 'fetchKlines: all candidates on base failed');
   return [];
 }
 
