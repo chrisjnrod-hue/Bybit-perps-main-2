@@ -88,7 +88,7 @@ module.exports = {
     }
 
     if (!allSymbols || allSymbols.length === 0) {
-      logger.info('poller: fetching symbols via REST (cursor pagination for USDT.P only)');
+      logger.info('poller: fetching symbols via REST (cursor pagination for USDT perpetuals)');
       allSymbols = await bybit.fetchAllSymbols();
     }
 
@@ -102,24 +102,29 @@ module.exports = {
     const now = Date.now();
     const insertMany = db.transaction((rows) => {
       for (const s of rows) {
-        insert.run(s.symbol, s.base || s.symbol.replace(/USDT\.P?$/i, ''), s.quote || 'USDT', now);
+        insert.run(s.symbol, s.base || s.symbol.replace(/USDT(\.P)?$/i, ''), s.quote || 'USDT', now);
       }
     });
     insertMany(allSymbols.filter(s => s && s.symbol));
-    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted (USDT.P only)');
+    logger.info({ total: allSymbols.length }, 'poller.initialScan: symbols persisted (USDT perpetuals only)');
 
     const seedSymbols = bybit.getSeedSymbols(allSymbols);
     if (seedSymbols && seedSymbols.length) {
-      // Validate that all seed symbols are USDT.P
-      const nonUsdtP = seedSymbols.filter(s => {
+      // Validate that all seed symbols are USDT or USDT.P
+      const invalidSymbols = seedSymbols.filter(s => {
         const sym = String(s.symbol || '').toUpperCase();
-        return !sym.endsWith('USDT.P');
+        // Reject if it's a dated variant
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+          return true;
+        }
+        // Accept USDT and USDT.P
+        return !(/USDT(\.P)?$/.test(sym));
       });
 
-      if (nonUsdtP.length > 0) {
+      if (invalidSymbols.length > 0) {
         logger.error(
-          { count: nonUsdtP.length, samples: nonUsdtP.slice(0, 5).map(s => s.symbol) },
-          'poller.initialScan: CRITICAL - non-USDT.P symbols in seed list! These should have been filtered.'
+          { count: invalidSymbols.length, samples: invalidSymbols.slice(0, 5).map(s => s.symbol) },
+          'poller.initialScan: CRITICAL - invalid symbols in seed list! These should have been filtered.'
         );
       }
 
@@ -147,7 +152,7 @@ module.exports = {
       logger.info('backgroundSeedKlines: nothing to seed');
       return;
     }
-    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting (USDT.P only)');
+    logger.info({ count: symbols.length, concurrency: SEED_CONCURRENCY }, 'backgroundSeedKlines: starting');
 
     for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
       const batch = symbols.slice(i, i + SEED_CONCURRENCY);
@@ -163,10 +168,16 @@ module.exports = {
 
   async seedKlinesForSymbol(symbol, timeframe = null) {
     try {
-      // Validate symbol is USDT.P
+      // Validate symbol is USDT or USDT.P
       const symUpper = String(symbol || '').toUpperCase();
-      if (!symUpper.endsWith('USDT.P')) {
-        logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is not USDT.P, skipping');
+      if (!/USDT(\.P)?$/.test(symUpper)) {
+        logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is not valid USDT, skipping');
+        return;
+      }
+
+      // Reject if it's a dated variant
+      if (/USDT[QHUZ0-9]/.test(symUpper.slice(-6))) {
+        logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is a dated variant, skipping');
         return;
       }
 
@@ -218,16 +229,21 @@ module.exports = {
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
       
-      // Validate all symbols are USDT.P
-      const nonUsdtP = rows.filter(r => {
+      // Validate all symbols are USDT or USDT.P (non-expiry)
+      const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
-        return !sym.endsWith('USDT.P');
+        // Reject if it's a dated variant
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+          return true;
+        }
+        // Accept USDT and USDT.P
+        return !(/USDT(\.P)?$/.test(sym));
       });
 
-      if (nonUsdtP.length > 0) {
+      if (invalidSymbols.length > 0) {
         logger.warn(
-          { count: nonUsdtP.length, samples: nonUsdtP.slice(0, 5).map(r => r.symbol) },
-          'scanAllForStartup: WARNING - database contains non-USDT.P symbols! These will be skipped.'
+          { count: invalidSymbols.length, samples: invalidSymbols.slice(0, 5).map(r => r.symbol) },
+          'scanAllForStartup: WARNING - database contains invalid symbols! These will be skipped.'
         );
       }
 
@@ -238,7 +254,12 @@ module.exports = {
         const tasks = page
           .filter(r => {
             const sym = String(r.symbol || '').toUpperCase();
-            return sym.endsWith('USDT.P');
+            // Reject if it's a dated variant
+            if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+              return false;
+            }
+            // Accept USDT and USDT.P
+            return /USDT(\.P)?$/.test(sym);
           })
           .map(r => this.scanSymbolRoots(r.symbol));
         try {
@@ -264,7 +285,7 @@ module.exports = {
         }
       }
       
-      logger.info('scanAllForStartup: completed full startup pass (USDT.P only)');
+      logger.info('scanAllForStartup: completed full startup pass (USDT perpetuals only)');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
     }
@@ -274,10 +295,16 @@ module.exports = {
     const tfList = config.ROOT_TFS || [];
     const results = [];
     
-    // Validate symbol is USDT.P
+    // Validate symbol is USDT or USDT.P
     const symUpper = String(symbol || '').toUpperCase();
-    if (!symUpper.endsWith('USDT.P')) {
-      logger.warn({ symbol }, 'scanSymbolRoots: symbol is not USDT.P, skipping');
+    if (!/USDT(\.P)?$/.test(symUpper)) {
+      logger.warn({ symbol }, 'scanSymbolRoots: symbol is not valid USDT, skipping');
+      return results;
+    }
+
+    // Reject if it's a dated variant
+    if (/USDT[QHUZ0-9]/.test(symUpper.slice(-6))) {
+      logger.warn({ symbol }, 'scanSymbolRoots: symbol is a dated variant, skipping');
       return results;
     }
 
