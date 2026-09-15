@@ -9,6 +9,7 @@
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
  * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals (no topN limit, USDT.P only)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
+ * - fetchKlines: UPDATED with V5 API only + intelligent fallback to mainnet/testnet
  */
 
 const fetch = require('node-fetch');
@@ -538,7 +539,12 @@ function getSeedSymbols(symbols) {
 
 /**
  * fetchKlines(symbol, interval, limit)
- * Uses single base (getBase()) only.
+ * UPDATED: V5 API only with intelligent fallback to mainnet/testnet
+ * 
+ * - Uses getBase() for primary attempt (respects MAINNET/testnet auto-switching)
+ * - Falls back to mainnet, then testnet if primary fails
+ * - Only uses official Bybit V5 REST endpoint (/v5/market/kline)
+ * - Requires category parameter (category=linear for perpetuals)
  */
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
@@ -547,32 +553,46 @@ async function fetchKlines(symbol, interval, limit = 200) {
     return [];
   }
 
-  const candidates = [
-    { path: '/v5/market/kline', params: { category: 'linear', symbol, interval, limit: String(limit) } },
-    { path: '/v2/public/kline', params: { symbol, interval, limit: String(limit) } },
-    { path: '/v2/public/kline/list', params: { symbol, interval, limit: String(limit) } }
+  // V5 API candidate (official endpoint)
+  const primaryCandidate = { path: '/v5/market/kline', params: { category: 'linear', symbol, interval, limit: String(limit) } };
+
+  // Fallback bases to try if primary base fails
+  const fallbackBases = [
+    'https://api.bybit.com',           // Mainnet
+    'https://api-testnet.bybit.com'    // Testnet
+  ].filter(b => b !== base); // Don't retry the same base
+
+  // Build list of bases to try: [primary base, fallback bases]
+  const allBasesToTry = [
+    { base, label: 'primary' },
+    ...fallbackBases.map(b => ({ base: b, label: 'fallback' }))
   ];
 
-  for (const c of candidates) {
+  for (const { base: tryBase, label } of allBasesToTry) {
     try {
-      const url = new URL(`${base.replace(/\/$/, '')}${c.path}`);
-      Object.entries(c.params || {}).forEach(([k, v]) => {
+      const url = new URL(`${tryBase.replace(/\/$/, '')}${primaryCandidate.path}`);
+      Object.entries(primaryCandidate.params || {}).forEach(([k, v]) => {
         if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
       });
+
+      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: attempting');
 
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       let json = null;
       try { json = await res.json(); } catch (e) { json = null; }
 
       if (!res.ok) {
-        logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error on base');
+        logger.debug({ base: tryBase, label, status: res.status, symbol, interval }, 'fetchKlines: HTTP error');
         continue;
       }
 
-      if (json && json.result && Array.isArray(json.result.list)) {
+      // Parse V5 response format: result.list array with kline candles
+      if (json && json.result && Array.isArray(json.result.list) && json.result.list.length > 0) {
         const list = json.result.list;
+        logger.info({ base: tryBase, label, symbol, interval, count: list.length }, 'fetchKlines: success');
+        
         return list.map(r => ({
-          open_time: r.start || r.t || r.open_time || r[0],
+          open_time: r.startTime || r.start || r.t || r.open_time || r[0],
           open: Number(r.open || r.o || r[1] || 0),
           high: Number(r.high || r.h || r[2] || 0),
           low: Number(r.low || r.l || r[3] || 0),
@@ -581,58 +601,13 @@ async function fetchKlines(symbol, interval, limit = 200) {
         }));
       }
 
-      if (json && json.result && Array.isArray(json.result)) {
-        const arr = json.result;
-        if (arr.length && Array.isArray(arr[0])) {
-          return arr.map(r => ({
-            open_time: r[0],
-            open: Number(r[1]),
-            high: Number(r[2]),
-            low: Number(r[3]),
-            close: Number(r[4]),
-            volume: Number(r[5])
-          }));
-        } else if (arr.length && typeof arr[0] === 'object') {
-          return arr.map(r => ({
-            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-            open: Number(r.open || r.o || r[1] || 0),
-            high: Number(r.high || r.h || r[2] || 0),
-            low: Number(r.low || r.l || r[3] || 0),
-            close: Number(r.close || r.c || r[4] || 0),
-            volume: Number(r.volume || r.v || r[5] || 0)
-          }));
-        }
-      }
-
-      if (Array.isArray(json)) {
-        if (json.length && Array.isArray(json[0])) {
-          return json.map(r => ({
-            open_time: r[0],
-            open: Number(r[1]),
-            high: Number(r[2]),
-            low: Number(r[3]),
-            close: Number(r[4]),
-            volume: Number(r[5])
-          }));
-        } else if (json.length && typeof json[0] === 'object') {
-          return json.map(r => ({
-            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-            open: Number(r.open || r.o || r[1] || 0),
-            high: Number(r.high || r.h || r[2] || 0),
-            low: Number(r.low || r.l || r[3] || 0),
-            close: Number(r.close || r.c || r[4] || 0),
-            volume: Number(r.volume || r.v || r[5] || 0)
-          }));
-        }
-      }
-
-      logger.debug({ base, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate endpoint');
+      logger.debug({ base: tryBase, label, symbol, interval }, 'fetchKlines: response shape unexpected or empty');
     } catch (err) {
-      logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
+      logger.debug({ base: tryBase, label, symbol, interval, err: err && err.message ? err.message : String(err) }, 'fetchKlines: exception');
     }
   }
 
-  logger.error({ symbol, interval }, 'fetchKlines: all candidates on base failed');
+  logger.error({ symbol, interval, basesAttempted: allBasesToTry.length }, 'fetchKlines: all bases failed');
   return [];
 }
 
