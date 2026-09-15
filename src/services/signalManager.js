@@ -1,3 +1,4 @@
+// src/services/signalManager.js
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -103,27 +104,18 @@ module.exports = {
         meta
       };
 
+      // FIX 1: Use telegram.sendNewSignalSingleBlock and pass the correctly formatted signalObj
       if (notifyImmediately) {
-        // send telegram block immediately with all metrics
         try {
-          await telegram.sendRootSignalBlock({
-            symbol,
-            root_tf,
-            alignment,
-            detected_at,
-            accept,
-            marketData: mdata || {},
-            tvScore: tv.score || 0,
-            tvSource: tv.source || 'error',
-            mtfScore
-          });
+          // Send telegram block immediately with all metrics
+          await telegram.sendNewSignalSingleBlock(signalObj);
           logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
         } catch (err) {
           logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
         }
       } else {
-        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
-        return signalObj;
+        // FIX 2: Do NOT return early here. Log it and allow execution to continue to trade processing.
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, skipping immediate telegram block');
       }
 
       // Only when decision is 'accept' do we attempt to open a trade
@@ -175,6 +167,7 @@ module.exports = {
         }
       }
 
+      // Always return the signal object at the end
       return signalObj;
     } catch (err) {
       logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
