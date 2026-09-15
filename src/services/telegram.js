@@ -5,6 +5,8 @@ const logger = require('pino')();
 const dbModule = require('../db');
 
 let bot = null;
+let startupSummaryInProgress = false;
+
 module.exports = {
   init() {
     if (!config.TELEGRAM_BOT_TOKEN) {
@@ -97,48 +99,39 @@ module.exports = {
     return msgParts.join('\n');
   },
 
-  async sendNewSignalSingleBlock(signal, _label = null) {
+  async sendNewSignalSingleBlock(signal) {
     if (!bot) return;
     try {
       const baseMsg = this.buildSignalMessage(signal);
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.info({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram signal block sent');
+      logger.debug({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram: signal detail block sent');
     } catch (err) {
-      logger.warn({ err }, 'Failed to send telegram signal block');
+      logger.warn({ err }, 'Telegram: failed to send signal detail block');
     }
   },
 
-  /**
-   * sendStartupSummary:
-   * STEP 1: Summary header with counts per root TF + vertical symbol list
-   * STEP 2: Per-signal detailed blocks (sorted A-Z, one per signal)
-   * STEP 3: Recommended trade block (highest-scoring accepted signals)
-   * 
-   * NO DUPLICATE BLOCKS - each signal sent exactly once
-   */
   async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
+    
+    // Prevent concurrent startup summary sends
+    if (startupSummaryInProgress) {
+      logger.info('Telegram: startup summary already in progress, skipping duplicate');
+      return;
+    }
+    startupSummaryInProgress = true;
+
     try {
-      const db = dbModule.get();
+      const signals = Array.isArray(snapshot) && snapshot.length > 0 ? snapshot : [];
 
-      let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals.length && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-        signals = dbModule.getLatestSignalsSnapshot() || [];
-      }
-
-      if (!signals.length) {
-        logger.info('sendStartupSummary: no signals provided');
+      if (signals.length === 0) {
+        logger.warn('Telegram: no signals provided to startup summary');
+        startupSummaryInProgress = false;
         return;
       }
 
-      // Sort signals by symbol (A-Z) for consistent ordering
-      signals.sort((a, b) => {
-        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
-        if (s !== 0) return s;
-        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
-      });
+      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow');
 
-      // === STEP 1: Send summary header ===
+      // STEP 1: Send startup header with summary counts
       const tfCounts = {};
       const symbolSet = new Set();
       for (const s of signals) {
@@ -158,34 +151,42 @@ module.exports = {
       const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
       const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
 
-      const header = `📊 Startup root TF summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
+      const header = `📊 Startup Summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, header);
-      logger.info({ signalCount: signals.length }, 'Startup summary header sent');
+      logger.info('Telegram: startup header sent');
       await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
-      // === STEP 2: Send individual signal blocks (sorted A-Z, one per signal) ===
+      // STEP 2: Send individual signal detail blocks (one per signal, sorted A-Z)
+      signals.sort((a, b) => {
+        const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
+        if (s !== 0) return s;
+        return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
+      });
+
       for (let i = 0; i < signals.length; i++) {
         try {
-          await this.sendNewSignalSingleBlock(signals[i], null);
-          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Signal block sent');
+          await this.sendNewSignalSingleBlock(signals[i]);
+          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Telegram: signal block sent');
         } catch (e) {
-          logger.debug({ e, symbol: signals[i].symbol }, 'Failed to send signal block');
+          logger.warn({ err: e, symbol: signals[i].symbol }, 'Telegram: failed to send signal block');
         }
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
 
-      // === STEP 3: Send recommended trade blocks ===
+      // STEP 3: Send recommended trades block
       let openCount = 0;
       try {
-        const row = db.prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
+        const row = dbModule.get().prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
         openCount = row ? Number(row.cnt || 0) : 0;
       } catch (e) {
-        logger.debug({ e }, 'Failed to read open trades count');
+        logger.debug({ e }, 'Telegram: failed to read open trades count');
         openCount = 0;
       }
-
       const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
-      
+      const recHeader = `📈 Recommended to Open (${maxSlots} slots available):`;
+      await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
+      await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
+
       const candidates = signals
         .map(s => ({
           symbol: s.symbol,
@@ -193,8 +194,7 @@ module.exports = {
           tvScore: s.meta?.tvScore || 0,
           mtfScore: s.meta?.mtfScore || 0,
           acceptDecision: s.meta?.decision || 'monitor',
-          reason: s.meta?.acceptReason || 'n/a',
-          raw: s
+          reason: s.meta?.acceptReason || 'n/a'
         }))
         .filter(c => c.acceptDecision === 'accept')
         .sort((a, b) => {
@@ -203,11 +203,6 @@ module.exports = {
         });
 
       const recommended = candidates.slice(0, maxSlots);
-
-      // Send recommended header
-      const recHeader = `📈 Recommended to open (${maxSlots} slots available):`;
-      await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
-      await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
 
       if (recommended.length === 0) {
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
@@ -220,32 +215,16 @@ module.exports = {
           const simNote = config.OPENTRADE ? '' : ' [SIMULATED]';
           const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${tvPercent}% MTF:${mtfPercent}% - ${r.reason}${simNote}`;
           await bot.sendMessage(config.TELEGRAM_CHAT_ID, line);
+          logger.debug({ symbol: r.symbol, index: i + 1, total: recommended.length }, 'Telegram: recommended block sent');
           await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
         }
       }
 
-      logger.info({ totalSignals: signals.length, recommendedCount: recommended.length }, 'Startup telegram summary completed (header + signals + recommended)');
+      logger.info('Telegram: startup summary flow completed');
     } catch (err) {
-      logger.error({ err }, 'Failed to send startup telegram summary');
-    }
-  },
-
-  async sendRootCandleUpdate({ snapshot = [], newRootTfs = [] } = {}) {
-    if (!bot) return;
-    try {
-      let signals = Array.isArray(snapshot) && snapshot.length ? snapshot.slice() : [];
-      if (!signals && typeof dbModule.getLatestSignalsSnapshot === 'function') {
-        signals = dbModule.getLatestSignalsSnapshot() || [];
-      }
-
-      const filtered = (newRootTfs && newRootTfs.length)
-        ? signals.filter(s => newRootTfs.includes(String(s.root_tf)))
-        : signals;
-
-      logger.info({ newRootTfs, filteredCount: filtered.length }, 'sendRootCandleUpdate: sending for new root candles');
-      await this.sendStartupSummary({ snapshot: filtered });
-    } catch (err) {
-      logger.warn({ err }, 'Failed to send root candle update');
+      logger.error({ err }, 'Telegram: startup summary flow failed');
+    } finally {
+      startupSummaryInProgress = false;
     }
   }
 };
