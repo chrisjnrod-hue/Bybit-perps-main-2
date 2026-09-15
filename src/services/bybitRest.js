@@ -1,4 +1,3 @@
-
 /**
  * src/services/bybitRest.js
  *
@@ -8,7 +7,7 @@
  * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
  * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
  *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (no topN limit)
+ * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT.P perpetuals ONLY (no spot, no dated)
  * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
  */
 
@@ -252,13 +251,14 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
     for (const it of arr) {
       if (!it || !it.symbol) continue;
       const base = String(it.symbol).toUpperCase();
-      const candidate = `${base}USDT`;
+      // USDT.P format (perpetual)
+      const candidate = `${base}USDT.P`;
       if (!seen.has(candidate)) {
         seen.add(candidate);
         mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
       }
     }
-    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
+    logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared (USDT.P only)');
     return mapped;
   } catch (err) {
     logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
@@ -267,26 +267,35 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
 }
 
 /**
+ * isUsdtPerpetual(symbol)
+ * STRICT filter: must end with USDT.P (not spot USDT, not dated contracts)
+ * ✅ BTCUSDT.P  -> true
+ * ❌ BTCUSDT    -> false (spot)
+ * ❌ BTCUSD.P   -> false (not USDT)
+ * ❌ BTC-31DEC  -> false (dated)
+ */
+function isUsdtPerpetual(symbol) {
+  if (!symbol) return false;
+  const sym = String(symbol).toUpperCase().trim();
+  return sym.endsWith('USDT.P');
+}
+
+/**
  * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION
  * 
- * Fetches ALL USDT/USDT.P perpetual pairs using cursor-based pagination.
- * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
+ * Fetches ONLY USDT.P perpetual pairs using cursor-based pagination.
+ * Rejects spot (USDT), dated contracts (BTC-31DEC), and other quote currencies.
  * 
  * Algorithm:
  * 1. Use getBase() for single authoritative host
  * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
- * 3. Filter by USDT/USDT.P suffix
+ * 3. STRICT filter: must end with USDT.P (perpetual futures only)
  * 4. Accumulate ALL matching symbols
  * 5. Remove duplicates and sort A->Z
  * 6. Fall back to CoinGecko if REST fails
  */
 async function fetchAllSymbols() {
-  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for all symbols');
-
-  // Symbol filter: accept USDT or USDT.P suffix (case-insensitive)
-  const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
-    ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
-    : /usdt(\.p)?$/i;
+  logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for USDT.P perpetuals ONLY');
 
   const base = getBase();
   if (!base) {
@@ -383,35 +392,27 @@ async function fetchAllSymbols() {
         totalRawInstruments += instruments.length;
         logger.info(
           { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
-          'fetchAllSymbols: page fetched, applying USDT filter'
+          'fetchAllSymbols: page fetched, applying USDT.P PERPETUAL filter'
         );
 
-        // Filter for USDT/USDT.P pairs
+        // STRICT filter: ONLY USDT.P perpetuals (reject spot USDT and dated contracts)
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
-            try {
-              const sym = String(it.symbol);
-              const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
-
-              // Match by regex (handles USDT and USDT.P)
-              if (DEFAULT_SYMBOL_FILTER.test(sym)) return true;
-
-              // Match by explicit quote field
-              if (quote === 'USDT') return true;
-
-              // Match by symbol suffix
-              const su = sym.toUpperCase();
-              if (su.endsWith('USDT') || su.endsWith('USDT.P')) return true;
-            } catch (e) {
+            const sym = String(it.symbol);
+            
+            // ✅ Must end with USDT.P (not USDT, not BUSD.P, not USD.P, not dated)
+            if (!isUsdtPerpetual(sym)) {
+              logger.debug({ symbol: sym }, 'fetchAllSymbols: rejected (not USDT.P)');
               return false;
             }
-            return false;
+            
+            return true;
           })
           .map(it => ({
             symbol: it.symbol,
-            base: it.baseCoin || it.base || null,
-            quote: it.quoteCoin || it.quote || 'USDT',
+            base: it.baseCoin || it.base || String(it.symbol).replace(/USDT\.P$/i, ''),
+            quote: 'USDT',
             status: it.status || null
           }));
 
@@ -435,7 +436,7 @@ async function fetchAllSymbols() {
       cursor = result.nextPageCursor;
       if (!cursor) {
         logger.info(
-          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments },
+          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments, totalFiltered },
           'fetchAllSymbols: no nextPageCursor found, pagination complete'
         );
         break;
@@ -448,7 +449,7 @@ async function fetchAllSymbols() {
     if (allSymbols.length === 0) {
       logger.warn(
         { totalRawInstruments, totalFiltered },
-        'fetchAllSymbols: no symbols matched USDT filter after full pagination'
+        'fetchAllSymbols: NO symbols matched USDT.P filter after full pagination (spot/dated contracts rejected)'
       );
       return [];
     }
@@ -461,7 +462,7 @@ async function fetchAllSymbols() {
         uniqueMap.set(key, {
           symbol: String(s.symbol),
           base: s.base || null,
-          quote: s.quote || 'USDT',
+          quote: 'USDT',
           status: s.status || null
         });
       }
@@ -482,7 +483,7 @@ async function fetchAllSymbols() {
         sampleFirst: unique.slice(0, 5).map(s => s.symbol),
         sampleLast: unique.slice(-5).map(s => s.symbol)
       },
-      'fetchAllSymbols: returning all unique symbols (sorted A-Z)'
+      'fetchAllSymbols: returning all unique USDT.P symbols (sorted A-Z)'
     );
 
     return unique;
@@ -497,7 +498,8 @@ async function fetchAllSymbols() {
  * getSeedSymbols(symbols) - UPDATED
  * 
  * Respects only SYMBOL_SEED_ALL flag (no topN cutting).
- * - If SYMBOL_SEED_ALL=true: return ALL symbols for seeding
+ * Also validates that all symbols are USDT.P perpetuals.
+ * - If SYMBOL_SEED_ALL=true: return ALL symbols for seeding (after USDT.P validation)
  * - If SYMBOL_SEED_ALL=false: return empty array (no seeding)
  */
 function getSeedSymbols(symbols) {
@@ -505,12 +507,21 @@ function getSeedSymbols(symbols) {
 
   const seedAll = envBool('SYMBOL_SEED_ALL', false);
 
+  // Validate all symbols are USDT.P
+  const validated = symbols.filter(s => {
+    if (!isUsdtPerpetual(s.symbol)) {
+      logger.warn({ symbol: s.symbol }, 'getSeedSymbols: rejecting non-USDT.P symbol from seed list');
+      return false;
+    }
+    return true;
+  });
+
   if (seedAll) {
     logger.info(
-      { totalSymbols: symbols.length },
-      'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL symbols'
+      { totalSymbols: validated.length, totalRaw: symbols.length },
+      'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL USDT.P symbols'
     );
-    return symbols.slice(); // return copy of all
+    return validated;
   }
 
   logger.warn(
@@ -915,5 +926,6 @@ module.exports = {
   getSeedSymbols,
   getLastProbeInfo,
   reprobe,
-  envBool
+  envBool,
+  isUsdtPerpetual  // Export for use in signalManager
 };
