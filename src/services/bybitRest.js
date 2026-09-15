@@ -238,6 +238,7 @@ async function probeHosts(timeoutMs = 5000) {
 /** Helper: fetch symbols from CoinGecko markets as a fallback */
 async function fetchSymbolsFromCoinGecko(perPage = 500) {
   try {
+    logger.info({ perPage }, 'fetchSymbolsFromCoinGecko: attempting CoinGecko fallback');
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
     const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
     if (!res.ok) {
@@ -245,7 +246,10 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
       return [];
     }
     const arr = await res.json().catch(() => null);
-    if (!Array.isArray(arr)) return [];
+    if (!Array.isArray(arr)) {
+      logger.warn('CoinGecko fallback: response not an array');
+      return [];
+    }
     const mapped = [];
     const seen = new Set();
     for (const it of arr) {
@@ -254,13 +258,13 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
       const candidate = `${base}USDT.P`;
       if (!seen.has(candidate)) {
         seen.add(candidate);
-        mapped.push({ symbol: candidate, base, quote: 'USDT.P', status: 'unknown' });
+        mapped.push({ symbol: candidate, base, quote: 'USDT.P', status: 'active' });
       }
     }
     logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared (USDT.P only)');
     return mapped;
   } catch (err) {
-    logger.debug({ err }, 'fetchSymbolsFromCoinGecko: failed');
+    logger.warn({ err: err && err.message ? err.message : String(err) }, 'fetchSymbolsFromCoinGecko: failed');
     return [];
   }
 }
@@ -290,8 +294,8 @@ async function fetchAllSymbols() {
 
   const base = getBase();
   if (!base) {
-    logger.warn('fetchAllSymbols: no base available (getBase returned null)');
-    return [];
+    logger.warn('fetchAllSymbols: no base available (getBase returned null), attempting CoinGecko fallback');
+    return await fetchSymbolsFromCoinGecko();
   }
 
   const allSymbols = [];
@@ -300,6 +304,7 @@ async function fetchAllSymbols() {
   let pageNum = 0;
   let totalRawInstruments = 0;
   let totalFiltered = 0;
+  let restError = false;
 
   try {
     // ===== CURSOR PAGINATION LOOP =====
@@ -324,7 +329,7 @@ async function fetchAllSymbols() {
       });
 
       logger.info(
-        { page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() },
+        { page: pageNum, cursor: cursor || 'initial', limit },
         'fetchAllSymbols: fetching page'
       );
 
@@ -347,9 +352,10 @@ async function fetchAllSymbols() {
       // Handle HTTP errors
       if (!res.ok) {
         logger.warn(
-          { status: res.status, page: pageNum, url: url.toString() },
-          'fetchAllSymbols: HTTP error, stopping pagination'
+          { status: res.status, page: pageNum },
+          'fetchAllSymbols: HTTP error, stopping pagination and will attempt CoinGecko fallback'
         );
+        restError = true;
         break;
       }
 
@@ -357,8 +363,9 @@ async function fetchAllSymbols() {
       if (!json) {
         logger.warn(
           { page: pageNum, snippet: bodyText ? bodyText.slice(0, 200) : null },
-          'fetchAllSymbols: invalid JSON response, stopping pagination'
+          'fetchAllSymbols: invalid JSON response, stopping pagination and will attempt CoinGecko fallback'
         );
+        restError = true;
         break;
       }
 
@@ -369,8 +376,9 @@ async function fetchAllSymbols() {
         if (rc !== 0) {
           logger.warn(
             { retCode: rc, retMsg: rm, page: pageNum },
-            'fetchAllSymbols: API returned non-zero retCode, stopping pagination'
+            'fetchAllSymbols: API returned non-zero retCode, stopping pagination and will attempt CoinGecko fallback'
           );
+          restError = true;
           break;
         }
       }
@@ -381,7 +389,7 @@ async function fetchAllSymbols() {
       // Process page
       if (instruments.length > 0) {
         totalRawInstruments += instruments.length;
-        logger.info(
+        logger.debug(
           { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
           'fetchAllSymbols: page fetched, applying USDT.P filter'
         );
@@ -408,13 +416,13 @@ async function fetchAllSymbols() {
             symbol: it.symbol,
             base: it.baseCoin || it.base || null,
             quote: 'USDT.P',
-            status: it.status || null
+            status: it.status || 'active'
           }));
 
         allSymbols.push(...filtered);
         totalFiltered += filtered.length;
 
-        logger.info(
+        logger.debug(
           {
             page: pageNum,
             pageSize: instruments.length,
@@ -423,15 +431,21 @@ async function fetchAllSymbols() {
           },
           'fetchAllSymbols: page filtered and accumulated'
         );
+
+        // Log sample of raw symbols on first page for debugging
+        if (pageNum === 1 && instruments.length > 0) {
+          const sampleSymbols = instruments.slice(0, 3).map(i => i.symbol);
+          logger.debug({ sampleSymbols, totalPageSize: instruments.length }, 'fetchAllSymbols: sample raw symbols from API (first page)');
+        }
       } else {
-        logger.info({ page: pageNum }, 'fetchAllSymbols: empty page received');
+        logger.debug({ page: pageNum }, 'fetchAllSymbols: empty page received');
       }
 
       // Check for next page cursor
       cursor = result.nextPageCursor;
       if (!cursor) {
         logger.info(
-          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments },
+          { totalFetched: allSymbols.length, totalRaw: totalRawInstruments, totalFiltered },
           'fetchAllSymbols: no nextPageCursor found, pagination complete'
         );
         break;
@@ -443,9 +457,15 @@ async function fetchAllSymbols() {
 
     if (allSymbols.length === 0) {
       logger.warn(
-        { totalRawInstruments, totalFiltered },
-        'fetchAllSymbols: no USDT.P symbols matched filter after full pagination'
+        { totalRawInstruments, totalFiltered, restError },
+        'fetchAllSymbols: no USDT.P symbols after full pagination. Attempting CoinGecko fallback...'
       );
+      const fallback = await fetchSymbolsFromCoinGecko();
+      if (fallback.length > 0) {
+        logger.info({ count: fallback.length }, 'fetchAllSymbols: successfully obtained symbols from CoinGecko fallback');
+        return fallback;
+      }
+      logger.error('fetchAllSymbols: CoinGecko fallback also returned no symbols');
       return [];
     }
 
@@ -458,7 +478,7 @@ async function fetchAllSymbols() {
           symbol: String(s.symbol),
           base: s.base || null,
           quote: 'USDT.P',
-          status: s.status || null
+          status: s.status || 'active'
         });
       }
     }
@@ -484,8 +504,8 @@ async function fetchAllSymbols() {
     return unique;
 
   } catch (e) {
-    logger.error({ e }, 'fetchAllSymbols: exception during pagination');
-    return [];
+    logger.error({ e: e && e.message ? e.message : String(e) }, 'fetchAllSymbols: exception during pagination, attempting CoinGecko fallback');
+    return await fetchSymbolsFromCoinGecko();
   }
 }
 
