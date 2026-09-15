@@ -1,3 +1,4 @@
+// src/services/signalManager.js
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -5,6 +6,7 @@ const telegram = require('./telegram');
 const tradeManager = require('./tradeManager');
 const marketData = require('./marketData');
 const tradingview = require('./tradingview');
+const notificationQueue = require('./notificationQueue');
 const config = require('../config');
 const logger = require('pino')();
 
@@ -26,7 +28,7 @@ module.exports = {
 
   /**
    * handleRootSignal:
-   * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
+   * - notifyImmediately: if true (default) enqueue to notification queue; if false, return signal object for caller
    * - returns the persisted signal object
    * - ALWAYS fetches fresh market data and TV rating for complete signal block
    */
@@ -103,24 +105,10 @@ module.exports = {
         meta
       };
 
+      // ENQUEUE TO NOTIFICATION QUEUE instead of sending telegram directly
       if (notifyImmediately) {
-        // send telegram block immediately with all metrics
-        try {
-          await telegram.sendRootSignalBlock({
-            symbol,
-            root_tf,
-            alignment,
-            detected_at,
-            accept,
-            marketData: mdata || {},
-            tvScore: tv.score || 0,
-            tvSource: tv.source || 'error',
-            mtfScore
-          });
-          logger.info({ symbol, root_tf, tvScore: tv.score }, 'Telegram root signal block sent');
-        } catch (err) {
-          logger.warn({ err, symbol }, 'handleRootSignal: failed to send telegram block');
-        }
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: enqueuing realtime signal to notification queue');
+        notificationQueue.enqueueSignal(signalObj, 'realtime');
       } else {
         logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
         return signalObj;
@@ -242,34 +230,5 @@ module.exports = {
     }
 
     return { decision: 'reject', reason: 'unknown' };
-  },
-
-  /**
-   * sendStartupSummary: builds a snapshot of latest root signals and sends initial telegram message
-   */
-  async sendStartupSummary() {
-    try {
-      const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
-      const telegramSvc = require('./telegram');
-
-      await telegramSvc.sendStartupSummary({ snapshot });
-    } catch (e) {
-      logger.debug({ e }, 'sendStartupSummary failed');
-    }
-  },
-
-  /**
-   * handleNewRootCandle: Called when new root candle opens
-   */
-  async handleNewRootCandle(newRootTfs = []) {
-    try {
-      const db = dbModule;
-      const snapshot = db.getLatestSignalsSnapshot();
-      const telegramSvc = require('./telegram');
-      await telegramSvc.sendRootCandleUpdate({ snapshot, newRootTfs });
-    } catch (e) {
-      logger.debug({ e, newRootTfs }, 'handleNewRootCandle failed');
-    }
   }
 };
