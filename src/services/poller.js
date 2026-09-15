@@ -11,6 +11,8 @@ const limiter = new Bottleneck({ minTime: 50 });
 const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 
 let isRunning = false;
+let startupComplete = false;
+const processedSignalIds = new Set();
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
@@ -20,6 +22,8 @@ module.exports = {
   start() {
     if (isRunning) return;
     isRunning = true;
+    startupComplete = false;
+    processedSignalIds.clear();
 
     try { signalManager.setOpenTradesAllowed(false); } catch (e) { /* ignore */ }
 
@@ -224,19 +228,22 @@ module.exports = {
   },
 
   async scanAllForStartup() {
+    if (startupComplete) {
+      logger.info('scanAllForStartup: already completed, skipping');
+      return;
+    }
+
     try {
-      logger.info('scanAllForStartup: starting full startup pass (will send telegram summary + sorted signals)');
+      logger.info('scanAllForStartup: starting full startup pass');
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
       // Validate all symbols are USDT or USDT.P (non-expiry)
       const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
-        // Reject if it's a dated variant
         if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
           return true;
         }
-        // Accept USDT and USDT.P
         return !(/USDT(\.P)?$/.test(sym));
       });
 
@@ -255,11 +262,9 @@ module.exports = {
         const tasks = page
           .filter(r => {
             const sym = String(r.symbol || '').toUpperCase();
-            // Reject if it's a dated variant
             if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
               return false;
             }
-            // Accept USDT and USDT.P
             return /USDT(\.P)?$/.test(sym);
           })
           .map(r => this.scanSymbolRoots(r.symbol));
@@ -272,56 +277,41 @@ module.exports = {
         }
       }
 
+      // Deduplicate signals by symbol_timeframe
+      const uniqueSignals = newSignals.filter(sig => {
+        const sigId = `${sig.symbol}_${sig.root_tf}`;
+        if (processedSignalIds.has(sigId)) {
+          logger.debug({ signal: sigId }, 'Skipping duplicate signal');
+          return false;
+        }
+        processedSignalIds.add(sigId);
+        return true;
+      });
+
       // Sort signals by symbol (A-Z)
-      newSignals.sort((a, b) => {
+      uniqueSignals.sort((a, b) => {
         const symA = String(a.symbol || '').toUpperCase();
         const symB = String(b.symbol || '').toUpperCase();
         return symA.localeCompare(symB);
       });
 
-      // Send Telegram notifications in correct order:
-      // 1. Summary block first
-      // 2. Individual signal blocks (sorted A-Z)
-      // 3. Recommended blocks
-
-      if (newSignals.length > 0) {
-        logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: new signals found, sending telegram flow');
+      // === SINGLE CALL TO sendStartupSummary ===
+      // This sends: summary header + individual signal blocks + recommended trades
+      if (uniqueSignals.length > 0) {
+        logger.info({ newSignals: uniqueSignals.length }, 'scanAllForStartup: sending telegram startup summary');
 
         const telegram = require('./telegram');
-
-        // STEP 1: Send startup summary block (one time only)
         try {
-          await telegram.sendStartupSummary({ snapshot: newSignals });
-          logger.info('scanAllForStartup: startup summary block sent');
+          await telegram.sendStartupSummary({ snapshot: uniqueSignals });
+          logger.info('scanAllForStartup: startup summary completed via telegram');
         } catch (e) {
-          logger.debug({ e }, 'scanAllForStartup: failed to send startup summary block');
-        }
-
-        await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-
-        // STEP 2: Send individual signal blocks (sorted A-Z)
-        for (let i = 0; i < newSignals.length; i++) {
-          const s = newSignals[i];
-          try {
-            await telegram.sendNewSignalSingleBlock(s);
-            logger.info({ symbol: s.symbol, index: i + 1, total: newSignals.length }, 'scanAllForStartup: signal block sent');
-          } catch (e) {
-            logger.debug({ e, symbol: s.symbol }, 'scanAllForStartup: failed to send signal block');
-          }
-          await sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
-        }
-
-        // STEP 3: Send recommended blocks
-        try {
-          await telegram.sendRecommendedBlocks({ signals: newSignals });
-          logger.info({ signalCount: newSignals.length }, 'scanAllForStartup: recommended blocks sent');
-        } catch (e) {
-          logger.debug({ e }, 'scanAllForStartup: failed to send recommended blocks');
+          logger.error({ e }, 'scanAllForStartup: failed to send startup summary');
         }
       } else {
         logger.info('scanAllForStartup: no new signals found');
       }
 
+      startupComplete = true;
       logger.info('scanAllForStartup: completed full startup pass (USDT perpetuals only)');
     } catch (err) {
       logger.error({ err }, 'scanAllForStartup: unexpected error');
