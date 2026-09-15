@@ -129,7 +129,7 @@ module.exports = {
         return;
       }
 
-      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow');
+      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow (ONCE)');
 
       // STEP 1: Send startup header with summary counts
       const tfCounts = {};
@@ -163,6 +163,7 @@ module.exports = {
         return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
       });
 
+      logger.info({ signalCount: signals.length }, 'Telegram: sending individual signal blocks');
       for (let i = 0; i < signals.length; i++) {
         try {
           await this.sendNewSignalSingleBlock(signals[i]);
@@ -174,6 +175,7 @@ module.exports = {
       }
 
       // STEP 3: Send recommended trades block
+      logger.info('Telegram: compiling recommended trades');
       let openCount = 0;
       try {
         const row = dbModule.get().prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
@@ -206,7 +208,9 @@ module.exports = {
 
       if (recommended.length === 0) {
         await bot.sendMessage(config.TELEGRAM_CHAT_ID, 'No recommended signals (all rejections or filtered)');
+        logger.info('Telegram: no recommended signals to send');
       } else {
+        logger.info({ count: recommended.length }, 'Telegram: sending recommended trades');
         for (let i = 0; i < recommended.length; i++) {
           const r = recommended[i];
           const label = this.getLabel(i, { lowercase: true });
@@ -220,7 +224,7 @@ module.exports = {
         }
       }
 
-      logger.info('Telegram: startup summary flow completed');
+      logger.info('Telegram: startup summary flow completed successfully');
     } catch (err) {
       logger.error({ err }, 'Telegram: startup summary flow failed');
     } finally {
