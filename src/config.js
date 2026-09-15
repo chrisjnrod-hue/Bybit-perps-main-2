@@ -64,8 +64,10 @@ module.exports = {
   BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
   BREAK_EVEN_TRAILING: (process.env.BREAK_EVEN_TRAILING === 'true'),
 
-  // Symbol filtering - STRICT PERPETUALS ONLY
-  SYMBOL_FILTER: process.env.SYMBOL_FILTER || '^[A-Z0-9]+USDT[Pp]$',
+  // Symbol filtering - USDT.P PERPETUALS ONLY (non-expiry contracts)
+  // Matches: BTCUSDT.P, ETHUSDT.P, etc.
+  // Rejects: BTCUSDTQ (quarterly), BTCUSDTH (monthly), any other variants with dates
+  SYMBOL_FILTER: process.env.SYMBOL_FILTER || '^[A-Z0-9]+USDT\\.P$',
   
   // Close least profitable trade feature
   CLOSE_LEAST_PROFITABLE_ENABLED: envBool('CLOSE_LEAST_PROFITABLE_ENABLED', false),
