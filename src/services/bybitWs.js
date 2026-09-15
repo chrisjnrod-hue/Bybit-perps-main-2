@@ -43,6 +43,7 @@ class WSManager extends EventEmitter {
     this.maxSockets = config.MAX_CONCURRENT_WS || 20;
     this.batchSize = config.BATCH_WS_SIZE || 20;
     this.klineBuffer = new Map();
+    this.failedSubscriptions = new Map();
   }
 
   start() {
@@ -81,12 +82,16 @@ class WSManager extends EventEmitter {
       ready: false,
       retryDelayMs: WS_SUBSCRIBE_RETRY_BASE_MS,
       _retryTimer: null,
-      connectionAttempts: 0
+      connectionAttempts: 0,
+      authFailure: false,
+      errorCount: 0
     };
 
     ws.on('open', () => {
       conn.ready = true;
       conn.connectionAttempts = 0;
+      conn.errorCount = 0;
+      conn.authFailure = false;
       logger.info({ connId: conn.id, wsUrl, topics: conn._topics.size }, 'WS connection opened successfully');
 
       if (conn.pendingTopics && conn.pendingTopics.size > 0) {
@@ -160,8 +165,53 @@ class WSManager extends EventEmitter {
         if (typeof data.ret_code !== 'undefined') {
           const retCode = data.ret_code;
           if (retCode !== 0) {
-            logger.warn({ connId: conn.id, retCode, retMsg: data.ret_msg || 'unknown', op: data.op }, 'WS API error response');
+            logger.error({ 
+              connId: conn.id, 
+              retCode, 
+              retMsg: data.ret_msg || 'unknown', 
+              op: data.op,
+              statusDescription: this._getStatusDescription(retCode)
+            }, 'WS API error response');
+
+            // Handle authentication/permission failures
+            if (retCode === 403 || retCode === 401) {
+              conn.authFailure = true;
+              conn.errorCount++;
+              logger.error({ connId: conn.id, retCode }, 'Authentication/permission failure - will stop retrying');
+              
+              // Mark pending topics as failed
+              for (const topic of conn.pendingTopics) {
+                if (!this.failedSubscriptions.has(topic)) {
+                  this.failedSubscriptions.set(topic, { retCode, attempts: 1, lastAttempt: Date.now() });
+                }
+              }
+              conn.pendingTopics.clear();
+              
+              // Close connection on auth failure
+              if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+                try {
+                  conn.ws.close(1008, 'Auth failure');
+                } catch (e) { /* ignore */ }
+              }
+              return;
+            }
+
+            // Handle rate limiting
+            if (retCode === 429) {
+              logger.warn({ connId: conn.id, retCode }, 'Rate limited - backing off');
+              conn.retryDelayMs = Math.min(conn.retryDelayMs * 3, WS_SUBSCRIBE_RETRY_MAX_MS);
+              this._scheduleFlushRetry(conn);
+              return;
+            }
+
+            // Handle other errors with retry
+            conn.errorCount++;
+            if (conn.errorCount > 5) {
+              logger.error({ connId: conn.id, errorCount: conn.errorCount }, 'Too many errors - backing off');
+              conn.retryDelayMs = Math.min(conn.retryDelayMs * 2, WS_SUBSCRIBE_RETRY_MAX_MS);
+            }
           } else {
+            conn.errorCount = 0;
             logger.debug({ connId: conn.id, op: data.op || 'unknown' }, 'WS operation successful');
           }
           return;
@@ -178,13 +228,39 @@ class WSManager extends EventEmitter {
     });
 
     ws.on('error', (err) => {
-      logger.warn({ err: err.message, code: err.code, connId: conn.id }, 'WS error event');
+      conn.errorCount++;
+      const errorInfo = {
+        err: err.message,
+        code: err.code,
+        statusCode: err.statusCode,
+        connId: conn.id,
+        errorCount: conn.errorCount
+      };
+
+      logger.warn(errorInfo, 'WS error event');
+
+      // Handle specific error codes
+      if (err.code === 'ECONNREFUSED' || err.statusCode === 403) {
+        logger.error(errorInfo, 'Connection refused or forbidden - may indicate auth issue');
+        conn.authFailure = true;
+        
+        try {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close(1008, 'Auth error');
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      if (err.statusCode === 401 || err.statusCode === 403) {
+        logger.error({ statusCode: err.statusCode, connId: conn.id }, 'Authentication error - check credentials');
+        conn.authFailure = true;
+      }
     });
 
     ws.on('close', (code, reason) => {
-      logger.info({ connId: conn.id, code, reason: reason ? reason.toString() : 'no reason' }, 'WS connection closed');
+      logger.info({ connId: conn.id, code, reason: reason ? reason.toString() : 'no reason', authFailure: conn.authFailure }, 'WS connection closed');
 
-      // Recover symbols
+      // Recover symbols (but not if auth failure)
       const symbolsToRecover = Array.from(conn.symbols || []);
       for (const s of conn.symbols) {
         this.symbolToConn.delete(s);
@@ -193,7 +269,7 @@ class WSManager extends EventEmitter {
       this.connections = this.connections.filter(c => c !== conn);
       this.openSockets = Math.max(0, this.openSockets - 1);
 
-      if (symbolsToRecover && symbolsToRecover.length > 0) {
+      if (symbolsToRecover && symbolsToRecover.length > 0 && !conn.authFailure) {
         logger.info({ connId: conn.id, recoverCount: symbolsToRecover.length }, 'Re-queueing symbols from closed connection');
         setTimeout(() => {
           for (const sym of symbolsToRecover) {
@@ -204,6 +280,8 @@ class WSManager extends EventEmitter {
             }
           }
         }, 1000);
+      } else if (conn.authFailure) {
+        logger.warn({ recoveredCount: symbolsToRecover.length }, 'Skipping recovery due to auth failure');
       }
 
       // Clear timers
@@ -219,6 +297,20 @@ class WSManager extends EventEmitter {
     return conn;
   }
 
+  _getStatusDescription(retCode) {
+    const statusMap = {
+      0: 'SUCCESS',
+      1: 'INVALID_PARAM',
+      400: 'BAD_REQUEST',
+      401: 'UNAUTHORIZED',
+      403: 'FORBIDDEN',
+      404: 'NOT_FOUND',
+      429: 'RATE_LIMITED',
+      500: 'INTERNAL_ERROR'
+    };
+    return statusMap[retCode] || `UNKNOWN_${retCode}`;
+  }
+
   _sendTopicsBatch(conn, topicsArray, op = 'subscribe') {
     if (!conn || !conn.ws) {
       return Promise.reject(new Error('Invalid connection'));
@@ -226,6 +318,12 @@ class WSManager extends EventEmitter {
 
     if (!Array.isArray(topicsArray) || topicsArray.length === 0) {
       return Promise.resolve();
+    }
+
+    // Skip if auth has failed
+    if (conn.authFailure) {
+      logger.debug({ connId: conn.id, batchSize: topicsArray.length }, 'Skipping send due to auth failure');
+      return Promise.reject(new Error('Connection auth failed'));
     }
 
     return new Promise((resolve, reject) => {
@@ -274,6 +372,11 @@ class WSManager extends EventEmitter {
       return;
     }
 
+    if (conn.authFailure) {
+      logger.debug({ connId: conn.id }, 'Skipping flush due to auth failure');
+      return;
+    }
+
     if (!conn.ready || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
       logger.debug({ connId: conn.id, pending: conn.pendingTopics.size }, 'Socket not ready, scheduling retry');
       this._scheduleFlushRetry(conn);
@@ -301,6 +404,10 @@ class WSManager extends EventEmitter {
           sendNextChunk(index + 1);
         })
         .catch((err) => {
+          if (conn.authFailure) {
+            logger.error({ connId: conn.id, err: err.message }, 'Stopping flush - auth failed');
+            return;
+          }
           logger.warn({ connId: conn.id, err: err.message, chunkIndex: index, retryIn: conn.retryDelayMs }, 'Chunk send failed, scheduling retry');
           this._scheduleFlushRetry(conn);
         });
@@ -312,11 +419,20 @@ class WSManager extends EventEmitter {
   _scheduleFlushRetry(conn) {
     if (!conn) return;
     if (conn._retryTimer) return;
+    if (conn.authFailure) {
+      logger.debug({ connId: conn.id }, 'Not scheduling retry - auth failed');
+      return;
+    }
 
     const delay = Math.min(conn.retryDelayMs || WS_SUBSCRIBE_RETRY_BASE_MS, WS_SUBSCRIBE_RETRY_MAX_MS);
     conn._retryTimer = setTimeout(() => {
       conn._retryTimer = null;
       conn.retryDelayMs = Math.min((conn.retryDelayMs || WS_SUBSCRIBE_RETRY_BASE_MS) * 2, WS_SUBSCRIBE_RETRY_MAX_MS);
+
+      if (conn.authFailure) {
+        logger.debug({ connId: conn.id }, 'Not retrying - auth failed');
+        return;
+      }
 
       if (conn.ws && conn.ws.readyState === WebSocket.OPEN && conn.pendingTopics.size > 0) {
         logger.debug({ connId: conn.id, delayMs: delay, retryDelayMs: conn.retryDelayMs }, 'Retrying flush');
@@ -330,7 +446,12 @@ class WSManager extends EventEmitter {
   }
 
   _getOrCreateTargetConnection() {
-    let target = this.connections.find(c => c.symbols.size < this.batchSize && c.ws && c.ws.readyState === WebSocket.OPEN);
+    let target = this.connections.find(c => 
+      c.symbols.size < this.batchSize && 
+      c.ws && 
+      c.ws.readyState === WebSocket.OPEN &&
+      !c.authFailure
+    );
     if (!target) {
       target = this._createConnection();
     }
@@ -353,6 +474,15 @@ class WSManager extends EventEmitter {
       if (this.symbolToConn.has(symTrimmed)) {
         logger.debug({ symbol: symTrimmed }, 'Symbol already subscribed');
         return this.symbolToConn.get(symTrimmed);
+      }
+
+      // Check for recent failed subscription attempts
+      if (this.failedSubscriptions.has(symTrimmed)) {
+        const failedInfo = this.failedSubscriptions.get(symTrimmed);
+        if (failedInfo.retCode === 403 || failedInfo.retCode === 401) {
+          logger.warn({ symbol: symTrimmed, retCode: failedInfo.retCode }, 'Symbol failed auth - skipping');
+          return null;
+        }
       }
 
       const timeframes = (tfs || config.MTF_TFS || ['5', '15', '60', 'D']).map(t => String(t).trim());
@@ -412,7 +542,7 @@ class WSManager extends EventEmitter {
         conn.pendingTopics.delete(t);
       }
 
-      if (topicsToRemove.length > 0 && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+      if (topicsToRemove.length > 0 && conn.ws && conn.ws.readyState === WebSocket.OPEN && !conn.authFailure) {
         const chunks = [];
         for (let i = 0; i < topicsToRemove.length; i += WS_SUBSCRIBE_CHUNK) {
           chunks.push(topicsToRemove.slice(i, i + WS_SUBSCRIBE_CHUNK));
@@ -436,6 +566,7 @@ class WSManager extends EventEmitter {
       conn.symbols.delete(symTrimmed);
       this.symbolToConn.delete(symTrimmed);
       this.klineBuffer.delete(symTrimmed);
+      this.failedSubscriptions.delete(symTrimmed);
 
       logger.info({ symbol: symTrimmed, connId: conn.id }, 'Symbol unsubscribed');
 
@@ -543,6 +674,7 @@ class WSManager extends EventEmitter {
       this.connections = [];
       this.symbolToConn = new Map();
       this.klineBuffer = new Map();
+      this.failedSubscriptions = new Map();
       this.openSockets = 0;
       logger.info('WSManager: all connections closed');
     } catch (err) {
