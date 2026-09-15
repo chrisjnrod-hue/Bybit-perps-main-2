@@ -26,11 +26,19 @@ module.exports = {
 
   /**
    * handleRootSignal:
+   * - USDT.P PERPETUAL VALIDATION: rejects spot USDT and dated contracts
    * - notifyImmediately: if true (default) send telegram block immediately; otherwise persist signal and return it for caller to notify later
    * - returns the persisted signal object
    * - ALWAYS fetches fresh market data and TV rating for complete signal block
    */
   async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+    // ✅ PERPETUAL-ONLY VALIDATION: Reject spot USDT and dated contracts
+    const bybit = require('./bybitRest');
+    if (!bybit.isUsdtPerpetual(symbol)) {
+      logger.warn({ symbol }, 'handleRootSignal: rejecting non-USDT.P symbol (spot USDT or dated contract)');
+      return null;
+    }
+
     const key = `${symbol}:${root_tf}`;
     if (inProgress.has(key)) {
       logger.debug({ key }, 'handleRootSignal: already in progress');
@@ -38,7 +46,7 @@ module.exports = {
     }
     inProgress.set(key, true);
     try {
-      logger.info({ symbol, root_tf }, 'Root signal received');
+      logger.info({ symbol, root_tf }, 'Root signal received (USDT.P perpetual)');
 
       // ALWAYS fetch fresh market data (best-effort, with fallbacks)
       let mdata = null;
