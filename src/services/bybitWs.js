@@ -15,13 +15,13 @@ const MAINNET = envBool('MAINNET', true);
 function getWsUrl() {
   const explicit = process.env.BYBIT_WS_PUBLIC || (config && config.BYBIT_WS_PUBLIC);
   if (explicit) return String(explicit);
-  // Use realtime_public endpoint from config (which is 'wss://stream.bybit.com/realtime_public')
+  // Fallback to realtime_public (not v5)
   return MAINNET ? 'wss://stream.bybit.com/realtime_public' : 'wss://stream-testnet.bybit.com/realtime_public';
 }
 
 function validateSymbol(symbol) {
   if (!symbol || typeof symbol !== 'string') return false;
-  if (!config.SYMBOL_FILTER) return true; // no filter = allow all
+  if (!config.SYMBOL_FILTER) return true;
   try {
     const regex = new RegExp(config.SYMBOL_FILTER);
     return regex.test(symbol);
@@ -51,7 +51,24 @@ class WSManager extends EventEmitter {
   }
 
   intervalToTopicPart(tf) {
-    return tf === 'D' ? 'D' : String(tf);
+    // realtime_public format: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, M, W, Y
+    const tfMap = {
+      '1': '1',
+      '3': '3',
+      '5': '5',
+      '15': '15',
+      '30': '30',
+      '60': '60',
+      '120': '120',
+      '240': '240',
+      '360': '360',
+      '720': '720',
+      'D': 'D',
+      'M': 'M',
+      'W': 'W',
+      'Y': 'Y'
+    };
+    return tfMap[String(tf)] || String(tf);
   }
 
   _createConnection() {
@@ -91,63 +108,58 @@ class WSManager extends EventEmitter {
           return;
         }
 
+        // Handle kline data (realtime_public format)
         if (data && data.topic && Array.isArray(data.data) && data.data.length > 0) {
           const topic = String(data.topic);
-          const topicParts = topic.split('.');
           
-          if ((topicParts[0] === 'kline' || topicParts[0] === 'klineV2') && topicParts.length >= 3) {
-            const tf = topicParts[1];
-            const sym = topicParts.slice(2).join('.');
-            
-            if (!validateSymbol(sym)) {
-              logger.debug({ symbol: sym }, 'Kline received for filtered-out symbol, ignoring');
-              return;
-            }
-            
-            if (data.data[0]) {
-              const d = data.data[0];
-              const k = this.normalizeKlinePayload(d, tf, sym);
+          // realtime_public format: "candle.{interval}.{symbol}"
+          if (topic.startsWith('candle.')) {
+            const parts = topic.split('.');
+            if (parts.length >= 3) {
+              const tf = parts[1];
+              const sym = parts.slice(2).join('.');
               
-              if (!this.klineBuffer.has(sym)) {
-                this.klineBuffer.set(sym, {});
+              if (!sym || !validateSymbol(sym)) {
+                logger.debug({ symbol: sym }, 'Kline received for filtered-out symbol, ignoring');
+                return;
               }
-              this.klineBuffer.get(sym)[tf] = k;
               
-              this.emit('kline', { symbol: sym, timeframe: tf, data: k, raw: data });
-              logger.debug({ symbol: sym, timeframe: tf, close: k.close }, 'Kline received');
-            }
-          }
-        } else if (data && typeof data.ret_code !== 'undefined') {
-          if (data.ret_code !== 0) {
-            logger.error({ 
-              connId: conn.id, 
-              retCode: data.ret_code, 
-              retMsg: data.ret_msg,
-              op: data.op,
-              req_id: data.req_id
-            }, 'WS subscription error response');
-            
-            // Log the entire response for debugging
-            logger.debug({ fullResponse: data }, 'Full error response from Bybit');\n            \n            // Handle specific error codes
-            if (data.ret_code === 403 || data.ret_code === 401) {
-              logger.error({ connId: conn.id, retCode: data.ret_code }, 'Auth/permission error - closing connection');
-              try {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                  ws.close(1008, 'Auth error');
+              const d = data.data[0];
+              if (d) {
+                try {
+                  const k = this.normalizeKlinePayload(d, tf, sym);
+                  
+                  if (!this.klineBuffer.has(sym)) {
+                    this.klineBuffer.set(sym, {});
+                  }
+                  this.klineBuffer.get(sym)[tf] = k;
+                  
+                  this.emit('kline', { symbol: sym, timeframe: tf, data: k, raw: data });
+                  logger.debug({ symbol: sym, timeframe: tf, close: k.close }, 'Kline received');
+                } catch (normErr) {
+                  logger.debug({ err: normErr.message, symbol: sym, tf }, 'Failed to normalize kline');
                 }
-              } catch (e) { /* ignore */ }
-              return;
+              }
             }
-            
-            if (data.ret_code === 429) {
-              logger.warn({ connId: conn.id }, 'Rate limited - backing off');
-              conn.retryDelayMs = Math.min(conn.retryDelayMs * 3, WS_SUBSCRIBE_RETRY_MAX_MS);
-              this._scheduleFlushRetry(conn);
-              return;
-            }
-          } else {
-            logger.debug({ connId: conn.id, op: data.op, req_id: data.req_id }, 'WS operation successful');
           }
+          return;
+        }
+
+        // Handle subscription responses
+        if (data && (data.success !== undefined || data.ret_code !== undefined)) {
+          const success = data.success !== false && data.ret_code === 0;
+          if (!success) {
+            logger.warn({ 
+              connId: conn.id, 
+              success: data.success,
+              retCode: data.ret_code,
+              retMsg: data.ret_msg || data.msg || 'unknown',
+              type: data.type
+            }, 'WS subscription error response');
+          } else {
+            logger.debug({ connId: conn.id, type: data.type }, 'WS subscription successful');
+          }
+          return;
         }
       } catch (err) {
         logger.debug({ err: err && err.message ? err.message : err }, 'Failed to parse WS message');
@@ -156,15 +168,6 @@ class WSManager extends EventEmitter {
 
     ws.on('error', (err) => {
       logger.error({ err: err && err.message ? err.message : err, code: err.code, connId: conn.id }, 'WS error');
-      
-      if (err.code === 'ECONNREFUSED' || err.statusCode === 403) {
-        logger.error({ connId: conn.id }, 'Connection refused or forbidden - check endpoint URL');
-        try {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.close(1008, 'Connection error');
-          }
-        } catch (e) { /* ignore */ }
-      }
     });
 
     ws.on('close', (code, reason) => {
@@ -207,17 +210,16 @@ class WSManager extends EventEmitter {
       }
 
       try {
-        const req_id = Date.now() + '-' + Math.random().toString(16).slice(2);
-        const payload = { op, args: topicsArray, req_id };
+        // realtime_public format: { "op": "subscribe", "args": ["candle.60.BTCUSDT"] }
+        const payload = { op, args: topicsArray };
         const payloadStr = JSON.stringify(payload);
         
         logger.debug({ 
           connId: conn.id, 
-          payload: payloadStr,
           op, 
-          topics: topicsArray,
-          batchSize: topicsArray.length 
-        }, 'Sending batch to Bybit WebSocket');
+          batchSize: topicsArray.length,
+          payload: payloadStr
+        }, 'Sending subscription batch');
         
         conn.ws.send(payloadStr, (err) => {
           if (err) {
@@ -319,17 +321,163 @@ class WSManager extends EventEmitter {
       return null;
     }
 
-    const tfParts = timeframes.map(tf => this.intervalToTopicPart(tf));
     const topics = [];
-    for (const tfp of tfParts) {
-      topics.push(`kline.${tfp}.${symbol}`);\n    }\n\n    for (const t of topics) {\n      target._topics.add(t);\n      target.pendingTopics.add(t);\n    }\n\n    target.symbols.add(symbol);\n    this.symbolToConn.set(symbol, target);\n\n    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size, topics: topics }, 'Queued symbol for subscription (pending until socket OPEN)');\n    \n    if (target.ws && target.ws.readyState === WebSocket.OPEN) {\n      this._flushPendingForConn(target);\n    } else {\n      this._scheduleFlushRetry(target);\n    }\n    return target;\n  }\n\n  unsubscribeSymbol(symbol) {\n    if (!this.symbolToConn.has(symbol)) {\n      logger.debug({ symbol }, 'Symbol not found in subscriptions');\n      return;\n    }\n    \n    const conn = this.symbolToConn.get(symbol);\n    if (!conn) return;\n\n    const topicsToUnsub = Array.from(conn._topics || []).filter(t => t.endsWith(`.${symbol}`));\n\n    for (const t of topicsToUnsub) {\n      conn._topics.delete(t);\n      conn.pendingTopics.delete(t);\n    }\n\n    if (topicsToUnsub.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {\n      for (let i = 0; i < topicsToUnsub.length; i += WS_SUBSCRIBE_CHUNK) {\n        const batch = topicsToUnsub.slice(i, i + WS_SUBSCRIBE_CHUNK);\n        try {\n          this._sendTopicsBatch(conn, batch, 'unsubscribe').catch(err => {\n            logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Unsubscribe batch failed but continuing');\n          });\n        } catch (err) {\n          logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception sending unsubscribe');\n        }\n      }\n    } else {\n      logger.debug({ connId: conn.id, reason: conn.ws ? `readyState=${conn.ws.readyState}` : 'no-ws', queuedUnsubs: topicsToUnsub.length }, 'Socket not OPEN, unsubscriptions queued or removed');\n    }\n\n    conn.symbols.delete(symbol);\n    this.symbolToConn.delete(symbol);\n    this.klineBuffer.delete(symbol);\n    logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');\n\n    if (conn.symbols.size === 0) {\n      try {\n        if (conn._retryTimer) clearTimeout(conn._retryTimer);\n      } catch (e) { /* ignore */ }\n      try { if (conn.ws) conn.ws.close(); } catch (e) { /* ignore */ }\n    }\n  }\n\n  normalizeKlinePayload(d, tf, symbol) {\n    let open_time, open, high, low, close, volume;\n\n    if (Array.isArray(d)) {\n      open_time = d[0];\n      open = Number(d[1] || 0);\n      high = Number(d[2] || 0);\n      low = Number(d[3] || 0);\n      close = Number(d[4] || 0);\n      volume = Number(d[5] || 0);\n    } else if (typeof d === 'object') {\n      open_time = d.t || d.start || d.start_at || d.open_time || null;\n      open = Number(d.o || d.open || 0);\n      high = Number(d.h || d.high || 0);\n      low = Number(d.l || d.low || 0);\n      close = Number(d.c || d.close || 0);\n      volume = Number(d.v || d.volume || 0);\n    } else {\n      open_time = null;\n      open = high = low = close = volume = 0;\n    }\n\n    return { open_time, open, high, low, close, volume, timeframe: tf, symbol };\n  }\n\n  async performInitialScan() {\n    try {\n      if (this.connections.length === 0) {\n        logger.warn('performInitialScan: no active connections yet');\n        return [];\n      }\n\n      const symbols = new Set();\n      for (const conn of this.connections) {\n        for (const sym of conn.symbols) {\n          if (validateSymbol(sym)) {\n            symbols.add(sym);\n          }\n        }\n      }\n\n      const result = Array.from(symbols).map(s => ({\n        symbol: s,\n        base: s.replace(/USDT[Pp]?$/i, ''),\n        quote: 'USDT'\n      }));\n\n      logger.info({ count: result.length }, 'performInitialScan: returning subscribed symbols');\n      return result;\n    } catch (err) {\n      logger.error({ err: err && err.message ? err.message : err }, 'performInitialScan: error');\n      return [];\n    }\n  }\n\n  async closeAll() {\n    try {\n      logger.info({ connectionsCount: this.connections.length }, 'WSManager: closing all connections');\n      \n      for (const conn of this.connections.slice()) {\n        try {\n          const topics = Array.from(conn._topics || []);\n          if (topics.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {\n            try {\n              conn.ws.send(JSON.stringify({ op: 'unsubscribe', args: topics }));\n              logger.debug({ connId: conn.id, topicsCount: topics.length }, 'Unsubscribed all topics');\n            } catch (e) { \n              logger.debug({ err: e }, 'Failed to unsubscribe on close');\n            }\n          }\n          if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {\n            try { conn.ws.close(); } catch (e) { /* ignore */ }\n          }\n          if (conn._retryTimer) clearTimeout(conn._retryTimer);\n        } catch (e) {\n          logger.debug({ err: e, connId: conn.id }, 'Error closing connection');\n        }\n      }\n      this.connections = [];\n      this.symbolToConn = new Map();\n      this.klineBuffer = new Map();\n      this.openSockets = 0;\n      logger.info('WSManager: closed all connections');\n    } catch (err) {\n      logger.warn({ err: err && err.message ? err.message : err }, 'WSManager.closeAll error');\n    }\n  }\n}\n\nmodule.exports = new WSManager();\n```
+    for (const tf of timeframes) {
+      const tfPart = this.intervalToTopicPart(tf);
+      // realtime_public format: candle.{interval}.{symbol}
+      topics.push(`candle.${tfPart}.${symbol}`);
+    }
 
-## Critical Changes Made:
+    for (const t of topics) {
+      target._topics.add(t);
+      target.pendingTopics.add(t);
+    }
 
-1. **Fixed endpoint URL** - Now uses `wss://stream.bybit.com/realtime_public` from your config (was using wrong v5 endpoint)
-2. **Added `req_id`** to subscription payloads (required by Bybit)
-3. **Enhanced logging** - Now logs the exact payload being sent so you can debug
-4. **Better error logging** - Logs full response object for debugging
-5. **Maintained working retry logic** from your old version
+    target.symbols.add(symbol);
+    this.symbolToConn.set(symbol, target);
 
-**Test it now and share the logs.** The payload logging will show exactly what's being sent to Bybit, which will help identify if the topic format is still wrong.
+    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size, topics: topics }, 'Queued symbol for subscription (pending until socket OPEN)');
+    
+    if (target.ws && target.ws.readyState === WebSocket.OPEN) {
+      this._flushPendingForConn(target);
+    } else {
+      this._scheduleFlushRetry(target);
+    }
+    return target;
+  }
+
+  unsubscribeSymbol(symbol) {
+    if (!this.symbolToConn.has(symbol)) {
+      logger.debug({ symbol }, 'Symbol not found in subscriptions');
+      return;
+    }
+    
+    const conn = this.symbolToConn.get(symbol);
+    if (!conn) return;
+
+    const topicsToUnsub = Array.from(conn._topics || []).filter(t => t.endsWith(`.${symbol}`));
+
+    for (const t of topicsToUnsub) {
+      conn._topics.delete(t);
+      conn.pendingTopics.delete(t);
+    }
+
+    if (topicsToUnsub.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+      for (let i = 0; i < topicsToUnsub.length; i += WS_SUBSCRIBE_CHUNK) {
+        const batch = topicsToUnsub.slice(i, i + WS_SUBSCRIBE_CHUNK);
+        try {
+          this._sendTopicsBatch(conn, batch, 'unsubscribe').catch(err => {
+            logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Unsubscribe batch failed but continuing');
+          });
+        } catch (err) {
+          logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception sending unsubscribe');
+        }
+      }
+    } else {
+      logger.debug({ connId: conn.id, reason: conn.ws ? `readyState=${conn.ws.readyState}` : 'no-ws', queuedUnsubs: topicsToUnsub.length }, 'Socket not OPEN, unsubscriptions queued or removed');
+    }
+
+    conn.symbols.delete(symbol);
+    this.symbolToConn.delete(symbol);
+    this.klineBuffer.delete(symbol);
+    logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');
+
+    if (conn.symbols.size === 0) {
+      try {
+        if (conn._retryTimer) clearTimeout(conn._retryTimer);
+      } catch (e) { /* ignore */ }
+      try { if (conn.ws) conn.ws.close(); } catch (e) { /* ignore */ }
+    }
+  }
+
+  normalizeKlinePayload(d, tf, symbol) {
+    let open_time, open, high, low, close, volume;
+
+    if (Array.isArray(d)) {
+      // realtime_public format: [start, open, high, low, close, volume, turnover, confirm, interval]
+      open_time = Number(d[0] || 0) * 1000; // Convert to ms
+      open = Number(d[1] || 0);
+      high = Number(d[2] || 0);
+      low = Number(d[3] || 0);
+      close = Number(d[4] || 0);
+      volume = Number(d[5] || 0);
+    } else if (typeof d === 'object' && d !== null) {
+      open_time = d.t ? Number(d.t) * 1000 : (d.open_time || null);
+      open = Number(d.o || d.open || 0);
+      high = Number(d.h || d.high || 0);
+      low = Number(d.l || d.low || 0);
+      close = Number(d.c || d.close || 0);
+      volume = Number(d.v || d.volume || 0);
+    } else {
+      open_time = null;
+      open = high = low = close = volume = 0;
+    }
+
+    return { open_time, open, high, low, close, volume, timeframe: tf, symbol };
+  }
+
+  async performInitialScan() {
+    try {
+      if (this.connections.length === 0) {
+        logger.warn('performInitialScan: no active connections yet');
+        return [];
+      }
+
+      const symbols = new Set();
+      for (const conn of this.connections) {
+        for (const sym of conn.symbols) {
+          if (validateSymbol(sym)) {
+            symbols.add(sym);
+          }
+        }
+      }
+
+      const result = Array.from(symbols).map(s => ({
+        symbol: s,
+        base: s.replace(/USDT[Pp]?$/i, ''),
+        quote: 'USDT'
+      }));
+
+      logger.info({ count: result.length }, 'performInitialScan: returning subscribed symbols');
+      return result;
+    } catch (err) {
+      logger.error({ err: err && err.message ? err.message : err }, 'performInitialScan: error');
+      return [];
+    }
+  }
+
+  async closeAll() {
+    try {
+      logger.info({ connectionsCount: this.connections.length }, 'WSManager: closing all connections');
+      
+      for (const conn of this.connections.slice()) {
+        try {
+          const topics = Array.from(conn._topics || []);
+          if (topics.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
+            try {
+              conn.ws.send(JSON.stringify({ op: 'unsubscribe', args: topics }));
+              logger.debug({ connId: conn.id, topicsCount: topics.length }, 'Unsubscribed all topics');
+            } catch (e) { 
+              logger.debug({ err: e }, 'Failed to unsubscribe on close');
+            }
+          }
+          if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
+            try { conn.ws.close(); } catch (e) { /* ignore */ }
+          }
+          if (conn._retryTimer) clearTimeout(conn._retryTimer);
+        } catch (e) {
+          logger.debug({ err: e, connId: conn.id }, 'Error closing connection');
+        }
+      }
+      this.connections = [];
+      this.symbolToConn = new Map();
+      this.klineBuffer = new Map();
+      this.openSockets = 0;
+      logger.info('WSManager: closed all connections');
+    } catch (err) {
+      logger.warn({ err: err && err.message ? err.message : err }, 'WSManager.closeAll error');
+    }
+  }
+}
+
+module.exports = new WSManager();
