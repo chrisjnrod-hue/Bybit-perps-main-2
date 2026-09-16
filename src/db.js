@@ -1,10 +1,6 @@
 /**
  * SQLite wrapper to persist symbols, klines, signals, trades, market_data.
  * Adds missing columns on existing DB (migration).
- *
- * Added: close() to allow graceful shutdown.
- * Added: notification_state table and helpers, upsert/get latest signals snapshot helper.
- * Added: market_data table for storing price, volume, market cap data.
  */
 const path = require('path');
 const fs = require('fs');
@@ -68,10 +64,20 @@ module.exports = {
         market_cap REAL,
         updated_at INTEGER DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS market_data_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        price REAL DEFAULT 0,
+        volume_24h_usdt REAL DEFAULT 0,
+        volume_change_pct REAL,
+        market_cap REAL,
+        updated_at INTEGER DEFAULT 0
+      );
       CREATE INDEX IF NOT EXISTS idx_market_data_updated_at ON market_data(updated_at);
+      CREATE INDEX IF NOT EXISTS idx_market_data_history_symbol_updated_at ON market_data_history(symbol, updated_at);
     `);
 
-    // Migration: add additional columns to symbols if not present
+    // symbols migration
     const existing = db.prepare("PRAGMA table_info(symbols)").all().map(r => r.name);
     const toAdd = [
       { name: 'market_cap', type: 'REAL' },
@@ -91,7 +97,7 @@ module.exports = {
       }
     }
 
-    // Migration: ensure market_data table has all columns
+    // market_data migration
     try {
       const mdExisting = db.prepare("PRAGMA table_info(market_data)").all().map(r => r.name);
       const mdToAdd = [
@@ -120,7 +126,6 @@ module.exports = {
 
   get() { return db; },
 
-  // notification state helpers (key/value JSON)
   setState(key, value) {
     try {
       const v = JSON.stringify(value);
@@ -144,7 +149,6 @@ module.exports = {
     }
   },
 
-  // ✅ FIX: insert signal row and return it for caller
   insertSignal({ symbol, root_tf, detected_at = Date.now(), state = 'detected', meta = {} } = {}) {
     try {
       const metaStr = JSON.stringify(meta || {});
@@ -158,16 +162,14 @@ module.exports = {
     }
   },
 
-  // ✅ FIX: Return latest signals snapshot with DISTINCT to prevent duplicates
-  // One row per symbol/root_tf with the most recent detected_at
   getLatestSignalsSnapshot() {
     try {
       const rows = db.prepare(`
-        SELECT DISTINCT 
-          s1.symbol, 
-          s1.root_tf, 
-          s1.detected_at, 
-          s1.state, 
+        SELECT DISTINCT
+          s1.symbol,
+          s1.root_tf,
+          s1.detected_at,
+          s1.state,
           s1.meta
         FROM signals s1
         WHERE (s1.symbol, s1.root_tf, s1.detected_at) IN (
@@ -196,7 +198,6 @@ module.exports = {
     }
   },
 
-  // Close DB connection for graceful shutdown
   close() {
     try {
       if (db && typeof db.close === 'function') {
