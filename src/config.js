@@ -8,12 +8,15 @@ function envBool(name, defaultVal = false) {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
+const OPENTRADE = envBool('OPENTRADE', envBool('OPENTRADES', false));
+
 module.exports = {
   BYBIT_REST_BASE: process.env.BYBIT_REST_BASE || 'https://api.bybit.com',
   BYBIT_WS_PUBLIC: process.env.BYBIT_WS_PUBLIC || 'wss://stream.bybit.com/realtime_public',
   BYBIT_API_KEY: process.env.BYBIT_API_KEY,
   BYBIT_API_SECRET: process.env.BYBIT_API_SECRET,
-  OPENTRADE: (process.env.OPENTRADE === 'true') || (process.env.ENABLE_OPEN_TRADES === 'true'),
+  OPENTRADE,
+  OPENTRADES: OPENTRADE, // backward compatible alias
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
   ROOT_TFS: parseList(process.env.ROOT_TFS || '60,240,D'),
@@ -24,16 +27,13 @@ module.exports = {
   BATCH_WS_SIZE: Number(process.env.BATCH_WS_SIZE || 20),
   SEED_KLINES_LIMIT: Number(process.env.SEED_KLINES_LIMIT || 200),
 
-  // Symbol seeding (UPDATED: removed topN, now only SYMBOL_SEED_ALL flag)
   SYMBOL_SEED_ALL: envBool('SYMBOL_SEED_ALL', false),
   WS_INITIAL_SCAN_TIMEOUT: Number(process.env.WS_INITIAL_SCAN_TIMEOUT || 10000),
   BYBIT_PAGINATION_LIMIT: Number(process.env.BYBIT_PAGINATION_LIMIT || 1000),
 
-  // Seeding / WS controls
   SEED_CONCURRENCY: Number(process.env.SEED_CONCURRENCY || 6),
   USE_WS: envBool('USE_WS', false),
-  
-  // Trade controls
+
   MAX_OPEN_TRADES: Number(process.env.MAX_OPEN_TRADES || 3),
   MIN_24H_VOLUME: Number(process.env.MIN_24H_VOLUME || 100000),
   MIN_TV_RATING: Number(process.env.MIN_TV_RATING || 0.6),
@@ -44,33 +44,25 @@ module.exports = {
   SPREAD_PERCENT: Number(process.env.SPREAD_PERCENT || 0.05),
   SLIPPAGE_PERCENT: Number(process.env.SLIPPAGE_PERCENT || 0.1),
 
-  // Breakeven
   BREAK_EVEN_MODE: process.env.BREAK_EVEN_MODE || 'off',
   BREAK_EVEN_TRIGGER_PERCENT: Number(process.env.BREAK_EVEN_TRIGGER_PERCENT || 1),
   BREAK_EVEN_PERCENT: Number(process.env.BREAK_EVEN_PERCENT || 0.5),
   TRAILING_LOOKBACK: Number(process.env.TRAILING_LOOKBACK || 3),
 
-  // Market filters
   MIN_MARKET_CAP: Number(process.env.MIN_MARKET_CAP || 0),
   MIN_24H_USDT_VOLUME: Number(process.env.MIN_24H_USDT_VOLUME || 0),
   MIN_24H_VOLUME_CHANGE_PCT: Number(process.env.MIN_24H_VOLUME_CHANGE_PCT || -9999),
 
-  COINGECKO_ENABLED: (process.env.COINGECKO_ENABLED === 'true'),
+  COINGECKO_ENABLED: envBool('COINGECKO_ENABLED', false),
 
-  // NEW: notification/scan flags
   ROOT_SCAN_INTERVAL_SECS: Number(process.env.ROOT_SCAN_INTERVAL_SECS || 0),
   NEW_ROOT_CANDLE_NOTIFY: envBool('NEW_ROOT_CANDLE_NOTIFY', true),
 
-  // Legacy compatibility flags
-  BREAK_EVEN_ACTIVE: (process.env.BREAK_EVEN_ACTIVE === 'true'),
-  BREAK_EVEN_TRAILING: (process.env.BREAK_EVEN_TRAILING === 'true'),
+  BREAK_EVEN_ACTIVE: envBool('BREAK_EVEN_ACTIVE', false),
+  BREAK_EVEN_TRAILING: envBool('BREAK_EVEN_TRAILING', false),
 
-  // Symbol filtering - USDT PERPETUALS (accepts both USDT and USDT.P formats)
-  // Matches: BTCUSDT, BTCUSDT.P, ETHUSDT, ETHUSDT.P, etc.
-  // Rejects: BTCUSDTQ (quarterly), BTCUSDTH (monthly), any other variants with dates
   SYMBOL_FILTER: process.env.SYMBOL_FILTER || '^[A-Z0-9]+USDT(\\.P)?$',
-  
-  // Close least profitable trade feature
+
   CLOSE_LEAST_PROFITABLE_ENABLED: envBool('CLOSE_LEAST_PROFITABLE_ENABLED', false),
   CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY: Number(process.env.CLOSE_LEAST_PROFITABLE_MINS_BEFORE_BOUNDARY || 5),
 
@@ -79,27 +71,19 @@ module.exports = {
   LOG_LEVEL: process.env.LOG_LEVEL || 'info',
   TELEGRAM_SEND_DELAY_MS: Number(process.env.TELEGRAM_SEND_DELAY_MS || 100),
 
-  // ========== NEW FEATURES (v0.4.0) ==========
-  
-  // Feature 1: Prioritize root TFS (240, 1D, 60 weighted higher)
   PRIORITIZE_ROOT_TFS: envBool('PRIORITIZE_ROOT_TFS', true),
   ROOT_TFS_PRIORITY: parseList(process.env.ROOT_TFS_PRIORITY || '240,D,60'),
-  
-  // Feature 2: Enforce MTF flip requirement for 1D signals
+
   ENFORCE_MTF_FLIP_1D: envBool('ENFORCE_MTF_FLIP_1D', false),
   MTF_FLIP_REQUIREMENT_1D: process.env.MTF_FLIP_REQUIREMENT_1D || '1h,4h,1d',
-  
-  // Feature 3: 5-min boundary scan for root signals + MTF alignment confirmation
+
   ROOT_SCAN_5MIN_BOUNDARY: envBool('ROOT_SCAN_5MIN_BOUNDARY', true),
+  ROOT_SCAN_5MIN_BOUNDARY_INTERVAL_MS: Number(process.env.ROOT_SCAN_5MIN_BOUNDARY_INTERVAL_MS || 300000),
   ALIGNMENT_CONFIRMATION_ALERT: envBool('ALIGNMENT_CONFIRMATION_ALERT', true),
 
-  // ========== NEW FEATURES (v0.5.0) - SIGNAL FLIP VALIDATION ==========
-  
-  // NEW Feature 4: Validate signal flip occurs at open price (5-min boundary only)
   VALIDATE_SIGNAL_FLIP_AT_OPEN: envBool('VALIDATE_SIGNAL_FLIP_AT_OPEN', false),
   SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT: Number(process.env.SIGNAL_FLIP_OPEN_PRICE_TOLERANCE_PCT || 0.5),
-  
-  // NEW Feature 5: Root candle open scan (detect 2nd candle flips) - DISABLED by default
+
   ROOT_CANDLE_OPEN_SCAN_ENABLED: envBool('ROOT_CANDLE_OPEN_SCAN_ENABLED', false),
   ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS: Number(process.env.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS || 60)
 };
