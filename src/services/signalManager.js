@@ -1,4 +1,3 @@
-// src/services/signalManager.js
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -26,6 +25,21 @@ module.exports = {
 
   setOpenTradesAllowed,
 
+  async sendStartupSummary() {
+    try {
+      const snapshot = dbModule.getLatestSignalsSnapshot();
+      if (!Array.isArray(snapshot) || snapshot.length === 0) {
+        logger.info('signalManager.sendStartupSummary: no signals in snapshot');
+        return;
+      }
+
+      logger.info({ count: snapshot.length }, 'signalManager.sendStartupSummary: enqueueing startup batch');
+      notificationQueue.enqueueStartupBatch(snapshot);
+    } catch (err) {
+      logger.warn({ err }, 'signalManager.sendStartupSummary failed');
+    }
+  },
+
   /**
    * handleRootSignal:
    * - notifyImmediately: if true (default) enqueue to notification queue; if false, return signal object for caller
@@ -42,7 +56,7 @@ module.exports = {
     try {
       logger.info({ symbol, root_tf }, 'Root signal received');
 
-      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
+      // ALWAYS fetch fresh market data
       let mdata = null;
       try {
         mdata = await marketData.updateSymbolMarketData(symbol);
@@ -54,7 +68,7 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
-      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
+      // FETCH TV RATING WITH CACHING
       let tv = { score: 0, source: 'error' };
       try {
         logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
@@ -71,7 +85,7 @@ module.exports = {
         tv = { score: 0, source: 'error' };
       }
 
-      // Subscribe to MTF websockets (for alignment updates)
+      // Subscribe to MTF websockets
       try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
       // Evaluate MTF alignment
@@ -105,7 +119,6 @@ module.exports = {
         meta
       };
 
-      // ENQUEUE TO NOTIFICATION QUEUE instead of sending telegram directly
       if (notifyImmediately) {
         logger.debug({ symbol, root_tf }, 'handleRootSignal: enqueuing realtime signal to notification queue');
         notificationQueue.enqueueSignal(signalObj, 'realtime');
