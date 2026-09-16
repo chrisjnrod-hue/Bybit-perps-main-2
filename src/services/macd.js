@@ -1,149 +1,247 @@
-const { MACD } = require('technicalindicators');
 const dbModule = require('../db');
-const logger = require('pino')();
-const tradingview = require('./tradingview');
+const wsManager = require('./bybitWs');
+const macd = require('./macd');
+const telegram = require('./telegram');
+const tradeManager = require('./tradeManager');
 const marketData = require('./marketData');
+const tradingview = require('./tradingview');
+const notificationQueue = require('./notificationQueue');
+const config = require('../config');
+const logger = require('pino')();
 
-const macdOptions = { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false };
+let openTradesAllowed = true;
+
+function setOpenTradesAllowed(v) {
+  openTradesAllowed = !!v;
+  logger.info({ openTradesAllowed }, 'signalManager: openTradesAllowed set');
+}
+
+const inProgress = new Map();
 
 module.exports = {
-  async getKlineSeries(symbol, timeframe, limit = 500) {
-    const db = dbModule.get();
-    const rows = db.prepare('SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?').all(symbol, timeframe, limit);
-    return rows.map(r => ({ time: r.open_time, close: r.close }));
+  start() {
+    logger.info('SignalManager started');
   },
 
-  async computeMacdHistogram(symbol, timeframe) {
+  setOpenTradesAllowed,
+
+  async sendStartupSummary() {
     try {
-      const series = await this.getKlineSeries(symbol, timeframe, 500);
-      const closes = series.map(s => s.close);
-      if (closes.length < 35) return null;
-      const macdInput = { values: closes, ...macdOptions };
-      const out = MACD.calculate(macdInput);
-      const offset = closes.length - out.length;
-      const withTime = out.map((o, idx) => ({
-        time: series[offset + idx].time,
-        MACD: o.MACD,
-        signal: o.signal,
-        histogram: o.histogram
-      }));
-      return withTime;
+      const snapshot = dbModule.getLatestSignalsSnapshot();
+      if (!Array.isArray(snapshot) || snapshot.length === 0) {
+        logger.info('signalManager.sendStartupSummary: no signals in snapshot');
+        return;
+      }
+
+      logger.info({ count: snapshot.length }, 'signalManager.sendStartupSummary: enqueueing startup batch');
+      notificationQueue.enqueueStartupBatch(snapshot);
     } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'computeMacdHistogram error');
-      return null;
+      logger.warn({ err }, 'signalManager.sendStartupSummary failed');
     }
   },
 
   /**
-   * FIXED: isMacdFlip - Only detect FIRST candle flips (negative->positive)
-   * 
-   * Prevents false positives from 2nd+ candle behavior.
-   * Returns true ONLY if:
-   *   - Previous candle histogram was negative (< 0)
-   *   - Current candle histogram is positive (> 0)
-   *   - This is a 1st candle flip (clean transition)
+   * handleRootSignal:
+   * - notifyImmediately: if true (default) enqueue to notification queue; if false, return signal object for caller
+   * - returns the persisted signal object
+   * - ALWAYS fetches fresh market data and TV rating for complete signal block
    */
-  async isMacdFlip(symbol, timeframe) {
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+    const key = `${symbol}:${root_tf}`;
+    if (inProgress.has(key)) {
+      logger.debug({ key }, 'handleRootSignal: already in progress');
+      return null;
+    }
+    inProgress.set(key, true);
     try {
-      const hist = await this.computeMacdHistogram(symbol, timeframe);
-      if (!hist || hist.length < 2) return false;
+      logger.info({ symbol, root_tf }, 'Root signal received');
 
-      const last = hist[hist.length - 1];      // Current candle (most recent)
-      const prev = hist[hist.length - 2];      // Previous candle
-
-      // STRICT: negative -> positive (first candle flip only)
-      // Prevents 2nd candle noise from triggering signals
-      if (prev.histogram < 0 && last.histogram > 0) {
-        logger.info(
-          { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
-          'MACD flip detected (1st candle: negative->positive)'
-        );
-        return true;
+      // ALWAYS fetch fresh market data
+      let mdata = null;
+      try {
+        mdata = await marketData.updateSymbolMarketData(symbol);
+        if (!mdata) {
+          mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
+        }
+      } catch (err) {
+        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using zeros');
+        mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
-      return false;
+      // FETCH TV RATING WITH CACHING
+      let tv = { score: 0, source: 'error' };
+      try {
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
+        const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
+        if (tvRes && typeof tvRes.score === 'number') {
+          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
+          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
+        } else {
+          logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
+          tv = { score: 0, source: 'error' };
+        }
+      } catch (err) {
+        logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
+        tv = { score: 0, source: 'error' };
+      }
+
+      // Subscribe to MTF websockets
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
+
+      // Evaluate MTF alignment
+      const alignment = await this.evaluateMtfAlignment(symbol);
+      const mtfTfs = Object.keys(alignment || {});
+      const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
+      const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
+
+      // Apply decision rules
+      const accept = await this.applyDecision(alignment);
+
+      // Compose meta and persist signal to DB
+      const meta = {
+        tvScore: tv.score || 0,
+        tvSource: tv.source || 'error',
+        mtfScore,
+        alignment,
+        acceptReason: accept && accept.reason ? accept.reason : null,
+        decision: accept && accept.decision ? accept.decision : 'monitor',
+        marketData: mdata || {}
+      };
+
+      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+
+      const signalObj = {
+        key,
+        symbol,
+        root_tf,
+        detected_at,
+        state: 'detected',
+        meta
+      };
+
+      if (notifyImmediately) {
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: enqueuing realtime signal to notification queue');
+        notificationQueue.enqueueSignal(signalObj, 'realtime');
+      } else {
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
+        return signalObj;
+      }
+
+      // Only when decision is 'accept' do we attempt to open a trade
+      if (accept && accept.decision === 'accept') {
+        if (!config.OPENTRADE) {
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
+        } else if (!openTradesAllowed) {
+          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
+        } else {
+          // Apply market-level filters
+          let passFilters = true;
+          if (config.MIN_MARKET_CAP > 0) {
+            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
+              passFilters = false;
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
+            }
+          }
+          if (config.MIN_24H_USDT_VOLUME > 0) {
+            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+              passFilters = false;
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
+            }
+          }
+          if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
+            const change = mdata?.volume_change_pct;
+            if (change === null || change === undefined) {
+              if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
+                passFilters = false;
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
+            } else {
+              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+                passFilters = false;
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
+            }
+          }
+
+          if (passFilters) {
+            try {
+              await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
+              logger.info({ symbol }, 'handleRootSignal: trade opening initiated');
+            } catch (err) {
+              logger.error({ err, symbol }, 'handleRootSignal: openTrade error');
+            }
+          } else {
+            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
+          }
+        }
+      }
+
+      return signalObj;
     } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'isMacdFlip error');
-      return false;
+      logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
+      return null;
+    } finally {
+      setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
     }
   },
 
-  async getMtfStatus(symbol, tfs = []) {
-    const status = {};
-    for (const tf of tfs) {
+  /**
+   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
+   */
+  async evaluateMtfAlignment(symbol) {
+    const result = {};
+    for (const tf of config.MTF_TFS) {
       try {
-        const hist = await this.computeMacdHistogram(symbol, tf);
-        if (!hist || hist.length < 1) {
-          status[tf] = 'UNKNOWN';
+        const hist = await macd.computeMacdHistogram(symbol, tf);
+        if (!hist || hist.length === 0) {
+          result[tf] = { ok: false, positive: false };
           continue;
         }
         const last = hist[hist.length - 1];
-        if (last.histogram > 0) {
-          status[tf] = 'POSITIVE';
-        } else if (last.histogram < 0) {
-          status[tf] = 'NEGATIVE';
-        } else {
-          status[tf] = 'UNKNOWN';
-        }
+        const prev = hist[hist.length - 2] || last;
+        result[tf] = {
+          histogram: last.histogram,
+          macd: last.MACD,
+          signal: last.signal,
+          rising: last.histogram > prev.histogram,
+          positive: last.histogram > 0,
+          ok: true
+        };
       } catch (err) {
-        logger.debug({ err, symbol, tf }, 'getMtfStatus error for timeframe');
-        status[tf] = 'UNKNOWN';
+        logger.debug({ err, symbol, tf }, 'evaluateMtfAlignment error for timeframe');
+        result[tf] = { ok: false, positive: false };
       }
     }
-    return status;
+    return result;
   },
 
-  async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
-    try {
-      let tvScore = 0;
-      let tvSource = 'fallback';
-      try {
-        const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
-        tvScore = tvResult && typeof tvResult.score === 'number' ? tvResult.score : 0;
-        tvSource = tvResult && tvResult.source ? tvResult.source : 'error';
-      } catch (e) {
-        logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
-        tvScore = 0;
-        tvSource = 'error';
-      }
-
-      const mtfStatus = await this.getMtfStatus(symbol, mtfTfs);
-
-      const rootHist = await this.computeMacdHistogram(symbol, rootTf);
-      const rootMacd = rootHist && rootHist.length > 0 ? rootHist[rootHist.length - 1] : null;
-
-      let marketDataResult = null;
-      try {
-        marketDataResult = await marketData.updateSymbolMarketData(symbol);
-      } catch (e) {
-        logger.debug({ e, symbol }, 'getSignalMetrics: market data update failed');
-      }
-
-      return {
-        tv_score: tvScore,
-        tv_source: tvSource,
-        mtf_status: mtfStatus,
-        root_macd: rootMacd ? {
-          macd: rootMacd.MACD,
-          signal: rootMacd.signal,
-          histogram: rootMacd.histogram
-        } : null,
-        market_data: marketDataResult ? {
-          price: marketDataResult.price || 0,
-          volume_24h_usdt: marketDataResult.volume_24h_usdt || 0,
-          volume_change_pct: marketDataResult.volume_change_pct || null,
-          market_cap: marketDataResult.market_cap || null
-        } : null
-      };
-    } catch (err) {
-      logger.error({ err, symbol }, 'getSignalMetrics: unexpected error');
-      return {
-        tv_score: 0,
-        tv_source: 'error',
-        mtf_status: {},
-        root_macd: null,
-        market_data: null
-      };
+  /**
+   * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
+   */
+  async applyDecision(alignment) {
+    const tfList = Object.keys(alignment);
+    if (!tfList || tfList.length === 0) {
+      return { decision: 'reject', reason: 'no_mtf_data' };
     }
+
+    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    if (allPositive) return { decision: 'accept', reason: 'all_positive' };
+
+    const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
+    if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
+      const d = alignment['D'];
+      if (d && d.rising) return { decision: 'accept', reason: 'daily_rising' };
+      return { decision: 'monitor', reason: 'daily_not_rising' };
+    }
+
+    if (negatives.length >= 1) {
+      return { decision: 'monitor', reason: 'some_negative' };
+    }
+
+    return { decision: 'reject', reason: 'unknown' };
   }
 };
