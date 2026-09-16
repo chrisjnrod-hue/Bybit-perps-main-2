@@ -1,4 +1,3 @@
-// src/services/notificationQueue.js
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -13,14 +12,9 @@ class NotificationQueue {
     this.state = QUEUE_STATE.IDLE;
     this.processing = false;
     this.startupSummaryInProgress = false;
-    this.sentSignalIds = new Set(); // Global deduplication
+    this.sentSignalIds = new Set();
   }
 
-  /**
-   * Add a signal to the queue for notification
-   * @param {object} signal - Signal object with symbol, root_tf, etc.
-   * @param {string} type - 'startup', 'realtime', or 'candle_update'
-   */
   enqueueSignal(signal, type = 'realtime') {
     if (!signal || !signal.symbol || !signal.root_tf) {
       logger.warn({ signal }, 'NotificationQueue: invalid signal, skipping');
@@ -28,6 +22,8 @@ class NotificationQueue {
     }
 
     const sigId = `${signal.symbol}_${signal.root_tf}`;
+
+    // de-dupe startup signals only
     if (this.sentSignalIds.has(sigId) && type === 'startup') {
       logger.debug({ sigId }, 'NotificationQueue: signal already sent during startup, skipping duplicate');
       return false;
@@ -45,7 +41,6 @@ class NotificationQueue {
       'NotificationQueue: signal enqueued'
     );
 
-    // Trigger processing if idle
     if (!this.processing) {
       this.processQueue();
     }
@@ -53,10 +48,6 @@ class NotificationQueue {
     return true;
   }
 
-  /**
-   * Enqueue an entire startup batch
-   * @param {array} signals - Array of signal objects
-   */
   enqueueStartupBatch(signals) {
     if (!Array.isArray(signals)) {
       logger.warn('NotificationQueue: invalid startup batch');
@@ -71,7 +62,6 @@ class NotificationQueue {
     this.startupSummaryInProgress = true;
     this.state = QUEUE_STATE.STARTUP_SUMMARY;
 
-    // Deduplicate against already-sent signals
     const uniqueSignals = signals.filter(sig => {
       const sigId = `${sig.symbol}_${sig.root_tf}`;
       if (this.sentSignalIds.has(sigId)) {
@@ -89,7 +79,8 @@ class NotificationQueue {
     this.queue.push({
       type: 'startup_batch',
       signals: uniqueSignals,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      id: `startup_batch_${Date.now()}`
     });
 
     if (!this.processing) {
@@ -97,9 +88,6 @@ class NotificationQueue {
     }
   }
 
-  /**
-   * Process the queue sequentially
-   */
   async processQueue() {
     if (this.processing) {
       logger.debug('NotificationQueue: already processing');
@@ -122,8 +110,14 @@ class NotificationQueue {
             await this._processCandleUpdate(item.signal);
           }
 
-          // Mark signal as sent
-          if (item.id) {
+          // mark startup batch by symbol/root_tf so later startup batches won't repeat them
+          if (item.type === 'startup_batch' && Array.isArray(item.signals)) {
+            for (const sig of item.signals) {
+              if (sig && sig.symbol && sig.root_tf) {
+                this.sentSignalIds.add(`${sig.symbol}_${sig.root_tf}`);
+              }
+            }
+          } else if (item.id) {
             this.sentSignalIds.add(item.id);
           }
         } catch (err) {
@@ -141,16 +135,16 @@ class NotificationQueue {
     }
   }
 
-  /**
-   * Process startup batch: send summary header + individual signals + recommendations
-   */
   async _processStartupBatch(signals) {
     try {
       const telegram = require('./telegram');
 
       logger.info({ count: signals.length }, 'NotificationQueue: starting startup batch flow');
 
-      // Use telegram's sendStartupSummary which handles the full flow
+      // Use telegram's sendStartupSummary which handles:
+      // - summary header
+      // - individual signal blocks
+      // - recommended blocks
       await telegram.sendStartupSummary({ snapshot: signals });
 
       logger.info('NotificationQueue: startup batch flow completed');
@@ -160,9 +154,6 @@ class NotificationQueue {
     }
   }
 
-  /**
-   * Process realtime signal: send individual signal block immediately
-   */
   async _processRealtimeSignal(signal) {
     try {
       const telegram = require('./telegram');
@@ -181,17 +172,12 @@ class NotificationQueue {
     }
   }
 
-  /**
-   * Process candle update: send root candle update summary
-   */
   async _processCandleUpdate(signal) {
     try {
       const telegram = require('./telegram');
 
       logger.debug({ symbol: signal.symbol }, 'NotificationQueue: sending candle update');
 
-      // TODO: Implement candle update message format in telegram.js
-      // For now, log it
       logger.info(
         { symbol: signal.symbol },
         'NotificationQueue: candle update queued (not yet implemented)'
@@ -202,9 +188,6 @@ class NotificationQueue {
     }
   }
 
-  /**
-   * Get queue status
-   */
   getStatus() {
     return {
       state: this.state,
@@ -215,16 +198,12 @@ class NotificationQueue {
     };
   }
 
-  /**
-   * Clear all sent signal IDs (for testing/reset)
-   */
   resetSentSignals() {
     this.sentSignalIds.clear();
     logger.info('NotificationQueue: sent signals cache cleared');
   }
 }
 
-// Singleton instance
 const notificationQueue = new NotificationQueue();
 
 module.exports = notificationQueue;
