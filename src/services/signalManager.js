@@ -196,28 +196,34 @@ module.exports = {
 
   async evaluateMtfAlignment(symbol) {
     const result = {};
+
     for (const tf of config.MTF_TFS) {
       try {
-        const hist = await macd.computeMacdHistogram(symbol, tf);
+        const hist = await macd.getClosedMacdHistogram(symbol, tf);
+
         if (!hist || hist.length === 0) {
           result[tf] = { ok: false, positive: false };
           continue;
         }
+
         const last = hist[hist.length - 1];
         const prev = hist[hist.length - 2] || last;
+
         result[tf] = {
           histogram: last.histogram,
           macd: last.MACD,
           signal: last.signal,
           rising: last.histogram > prev.histogram,
           positive: last.histogram > 0,
-          ok: true
+          ok: true,
+          candleTime: last.time
         };
       } catch (err) {
         logger.debug({ err, symbol, tf }, 'evaluateMtfAlignment error for timeframe');
         result[tf] = { ok: false, positive: false };
       }
     }
+
     return result;
   },
 
