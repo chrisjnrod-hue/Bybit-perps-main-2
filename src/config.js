@@ -1,4 +1,4 @@
-// config.js - FULLY UPDATED
+// config.js
 const parseList = (v) => (v ? v.split(',').map(x => x.trim()) : []);
 
 /* Env boolean helper */
@@ -16,7 +16,7 @@ module.exports = {
   BYBIT_API_KEY: process.env.BYBIT_API_KEY,
   BYBIT_API_SECRET: process.env.BYBIT_API_SECRET,
   OPENTRADE,
-  OPENTRADES: OPENTRADE, // backward compatible alias
+  OPENTRADES: OPENTRADE, // backward-compatible alias
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
   ROOT_TFS: parseList(process.env.ROOT_TFS || '60,240,D'),
