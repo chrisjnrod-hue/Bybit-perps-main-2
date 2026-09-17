@@ -35,10 +35,8 @@ async function start() {
     logger.info('Starting app...');
     db.init();
 
-    // init telegram early so any immediate notifications are possible
     telegram.init();
 
-    // background bybit probe
     try {
       const bybitRest = require('./services/bybitRest');
       bybitRest.probeHosts(3000)
@@ -51,7 +49,6 @@ async function start() {
       logger.debug({ e }, 'probeHosts startup call failed');
     }
 
-    // 1) discover symbols
     try {
       logger.info('Startup: running initialScan() to populate symbols');
       await poller.initialScan();
@@ -59,7 +56,6 @@ async function start() {
       logger.warn({ e }, 'initialScan failed during startup (continuing)');
     }
 
-    // 2) targeted seeding
     try {
       const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
       let seedList = [];
@@ -81,7 +77,6 @@ async function start() {
       logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
     }
 
-    // 3) full startup pass (loop 1)
     try {
       logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
       if (typeof poller.scanAllForStartup === 'function') {
@@ -93,10 +88,9 @@ async function start() {
       logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
     }
 
-    // loop 1 startup summary is still handled by poller -> notification queue
-    // : do not call signalManager.sendStartupSummary() directly here; redundant / duplicate
+    // do not call signalManager.sendStartupSummary() here
+    // startup summary is handled by poller.scanAllForStartup() -> notificationQueue
 
-    // 4) start schedulers and managers
     poller.start();
     wsManager.start();
     signalManager.start();
