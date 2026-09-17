@@ -1,15 +1,8 @@
 /**
  * src/services/bybitRest.js
  *
- * FULLY UPDATED for cursor-based pagination and WS fallback:
- * - MAINNET / OPENTRADES aware order routing
- * - getOrderBase() chooses BYBIT_ORDER_BASE -> MAINNET -> fallback
- * - OPENTRADES=false causes order functions to dry-run (no real order HTTP calls)
- * - probeHosts is stricter: if BYBIT_REST_BASE is configured, only probe that host and don't persist
- *   a different host; require JSON/API-shaped responses before accepting a host (avoids HTML pages).
- * - fetchAllSymbols: CURSOR-BASED PAGINATION to fetch ALL USDT/USDT.P perpetuals (non-expiry only)
- * - getSeedSymbols: respects only SYMBOL_SEED_ALL flag (all or nothing, no topN cutting)
- * - SYMBOL FILTERING: Accepts USDT and USDT.P - rejects USDTQ, USDTH, and other dated variants
+ * FULLY UPDATED for cursor-based pagination and WS fallback.
+ * Includes daily interval normalization: 1d / 1D / D -> D
  */
 
 const fetch = require('node-fetch');
@@ -20,7 +13,7 @@ const path = require('path');
 const logger = require('pino')();
 const config = require('../config');
 
-// Preferred order: mainnet and testnet first
+// Preferred order
 const HOST_CANDIDATES = [
   'https://api.bybit.com',
   'https://api-testnet.bybit.com',
@@ -34,11 +27,9 @@ const HOST_CANDIDATES = [
 let chosenBase = null;
 const CHOSEN_BASE_FILE = path.join(__dirname, '..', 'data', 'chosen_bybit_base.txt');
 
-// Diagnostics: last probe host/path and last OK response text
 let lastProbeHostPath = null;
 let lastProbeResponseText = null;
 
-/* Env boolean helper */
 function envBool(name, defaultVal = false) {
   if (typeof process.env[name] === 'undefined') return defaultVal;
   const v = String(process.env[name]).toLowerCase().trim();
@@ -48,16 +39,19 @@ function envBool(name, defaultVal = false) {
 const OPENTRADES = envBool('OPENTRADES', false);
 const MAINNET = envBool('MAINNET', true);
 
-/* Configured base helper */
 function getConfiguredBase() {
   const envBase = process.env.BYBIT_REST_BASE || (config && config.BYBIT_REST_BASE);
   if (!envBase) return null;
   return String(envBase).replace(/\/$/, '');
 }
 
-/**
- * Load chosen base from disk but do not let it override an explicit BYBIT_REST_BASE or MAINNET env var.
- */
+function normalizeTf(tf) {
+  if (!tf) return tf;
+  const t = String(tf).trim();
+  if (/^1d$/i.test(t) || /^D$/i.test(t)) return 'D';
+  return t;
+}
+
 function loadChosenBaseFromDisk() {
   try {
     if (fs.existsSync(CHOSEN_BASE_FILE)) {
@@ -89,7 +83,6 @@ function saveChosenBaseToDisk(base) {
 
 loadChosenBaseFromDisk();
 
-/** Fetch wrapper with timeout using AbortController */
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
@@ -104,7 +97,6 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   }
 }
 
-/** Sign v5 request helper */
 function signV5Request(method, requestPath, body = '', apiSecret) {
   const timestamp = Date.now().toString();
   const payload = timestamp + method.toUpperCase() + requestPath + (body ? body : '');
@@ -112,7 +104,6 @@ function signV5Request(method, requestPath, body = '', apiSecret) {
   return { signature, timestamp };
 }
 
-/** Get base host: chosenBase -> configured -> first candidate */
 function getBase() {
   const configured = getConfiguredBase();
   if (chosenBase) return chosenBase;
@@ -120,21 +111,14 @@ function getBase() {
   return HOST_CANDIDATES[0];
 }
 
-/**
- * getOrderBase()
- * Prefer BYBIT_ORDER_BASE; if MAINNET env is present, obey it (MAINNET=true -> mainnet, false -> testnet).
- * Otherwise fallback to getBase().
- */
 function getOrderBase() {
   const explicit = process.env.BYBIT_ORDER_BASE;
   if (explicit) return String(explicit).replace(/\/$/, '');
 
-  // If MAINNET env is explicitly set, obey it
   if (typeof process.env.MAINNET !== 'undefined') {
     return MAINNET ? 'https://api.bybit.com' : 'https://api-testnet.bybit.com';
   }
 
-  // Backwards compatibility with BYBIT_USE_TESTNET
   const useTestnetRaw = typeof process.env.BYBIT_USE_TESTNET !== 'undefined' ? String(process.env.BYBIT_USE_TESTNET) : null;
   if (useTestnetRaw !== null) {
     const val = useTestnetRaw.toLowerCase();
@@ -146,12 +130,6 @@ function getOrderBase() {
   return getBase();
 }
 
-/**
- * probeHosts(timeoutMs)
- * - If BYBIT_REST_BASE is set, only probe that host and DO NOT persist a different host.
- * - Accept a host only if response looks like JSON or API-shaped JSON.
- * - Require retCode===0 when retCode present.
- */
 async function probeHosts(timeoutMs = 5000) {
   const configured = getConfiguredBase();
   const list = configured ? [configured] : HOST_CANDIDATES.slice();
@@ -164,7 +142,6 @@ async function probeHosts(timeoutMs = 5000) {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
-      // capture text for diagnostics
       let text = null;
       let parsed = null;
       try {
@@ -175,11 +152,8 @@ async function probeHosts(timeoutMs = 5000) {
       }
 
       if (res.ok) {
-        // Basic content-type guard:
         const ct = (res.headers && typeof res.headers.get === 'function') ? (res.headers.get('content-type') || '') : '';
         const looksLikeJson = /application\/json/i.test(ct) || (text && text.trim().startsWith('{'));
-
-        // Try to detect API-shaped JSON: has `result` or `ret_code`/`retCode` fields commonly in Bybit responses
         const parsedOkApi = parsed && (parsed.result || typeof parsed.ret_code !== 'undefined' || typeof parsed.retCode !== 'undefined');
 
         if (!looksLikeJson && !parsedOkApi) {
@@ -187,7 +161,6 @@ async function probeHosts(timeoutMs = 5000) {
           continue;
         }
 
-        // If API returned retCode/ret_code, ensure it's zero before accepting
         if (parsed && (typeof parsed.retCode !== 'undefined' || typeof parsed.ret_code !== 'undefined')) {
           const rc = typeof parsed.retCode !== 'undefined' ? parsed.retCode : parsed.ret_code;
           if (rc !== 0) {
@@ -199,28 +172,20 @@ async function probeHosts(timeoutMs = 5000) {
         lastProbeHostPath = { host, path: testUrl };
         lastProbeResponseText = text;
 
-        // If user explicitly configured BYBIT_REST_BASE, respect that and DO NOT overwrite it.
         if (configured) {
           logger.info({ configured }, 'probeHosts: configured BYBIT_REST_BASE responded OK; not persisting probe selection');
           return configured;
         }
 
-        // Otherwise accept and persist the host we probed
         chosenBase = host.replace(/\/$/, '');
         saveChosenBaseToDisk(chosenBase);
-        if (parsed) {
-          logger.info({ chosenBase }, 'probeHosts: selected host (json ok)');
-        } else {
-          logger.info({ chosenBase, note: 'accepted despite json parse detection (HTTP OK)' }, 'probeHosts: selected host');
-        }
+        logger.info({ chosenBase }, 'probeHosts: selected host');
         return chosenBase;
       } else {
         logger.debug({ host, status: res.status }, 'probeHosts: non-ok response, trying next');
-        continue;
       }
     } catch (err) {
       logger.debug({ host, err: err && err.message ? err.message : String(err) }, 'probeHosts: request failed, trying next');
-      continue;
     }
   }
 
@@ -236,7 +201,6 @@ async function probeHosts(timeoutMs = 5000) {
   return null;
 }
 
-/** Helper: fetch symbols from CoinGecko markets as a fallback */
 async function fetchSymbolsFromCoinGecko(perPage = 500) {
   try {
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
@@ -266,29 +230,9 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
   }
 }
 
-/**
- * fetchAllSymbols() - FULLY UPDATED WITH CURSOR-BASED PAGINATION & FLEXIBLE USDT FILTERING
- * 
- * Fetches ALL USDT/USDT.P perpetual pairs (non-expiry only) using cursor-based pagination.
- * This replaces the old topN limiting approach and ensures comprehensive symbol discovery.
- * 
- * SYMBOL FILTERING: ACCEPTS BOTH FORMATS
- * - ACCEPTS: BTCUSDT, ETHUSDT, BTCUSDT.P, ETHUSDT.P (perpetuals)
- * - REJECTS: BTCUSDTQ, BTCUSDTH, BTCUSDT0 (quarterly, monthly, dated variants)
- * 
- * Algorithm:
- * 1. Use getBase() for single authoritative host
- * 2. Loop with cursor pagination (limit: 1000 per page, respecting BYBIT_PAGINATION_LIMIT)
- * 3. Filter by USDT or USDT.P suffix
- * 4. Reject any contracts with date variants (Q, H, Z, or numbers after USDT)
- * 5. Accumulate ALL matching symbols
- * 6. Remove duplicates and sort A->Z
- * 7. Fall back to CoinGecko if REST fails
- */
 async function fetchAllSymbols() {
   logger.info('bybitRest.fetchAllSymbols: starting cursor-based pagination for USDT perpetuals');
 
-  // Accept both USDT and USDT.P, but reject dated variants
   const DEFAULT_SYMBOL_FILTER = process.env.SYMBOL_FILTER_REGEX
     ? new RegExp(process.env.SYMBOL_FILTER_REGEX)
     : /usdt(\.p)?$/i;
@@ -308,75 +252,45 @@ async function fetchAllSymbols() {
   let rejectedDateVariants = 0;
 
   try {
-    // ===== CURSOR PAGINATION LOOP =====
     while (true) {
       pageNum++;
-      
-      // Build request params
       const params = {
         category: 'linear',
         instrumentType: 'PERPETUAL',
         limit: String(limit)
       };
+      if (cursor) params.cursor = cursor;
 
-      if (cursor) {
-        params.cursor = cursor;
-      }
-
-      // Build URL
       const url = new URL(`${base.replace(/\/$/, '')}/v5/market/instruments-info`);
       Object.entries(params).forEach(([k, v]) => {
         url.searchParams.append(k, String(v));
       });
 
-      logger.info(
-        { page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() },
-        'fetchAllSymbols: fetching page'
-      );
-
-      // Fetch with timeout
+      logger.info({ page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() }, 'fetchAllSymbols: fetching page');
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 10000);
       let json = null;
       let bodyText = null;
 
       try {
         bodyText = await res.text();
-        try {
-          json = JSON.parse(bodyText);
-        } catch (e) {
-          json = null;
-        }
-      } catch (e) {
-        bodyText = null;
-      }
+        try { json = JSON.parse(bodyText); } catch (e) { json = null; }
+      } catch (e) { bodyText = null; }
 
-      // Handle HTTP errors
       if (!res.ok) {
-        logger.warn(
-          { status: res.status, page: pageNum, url: url.toString() },
-          'fetchAllSymbols: HTTP error, stopping pagination'
-        );
+        logger.warn({ status: res.status, page: pageNum, url: url.toString() }, 'fetchAllSymbols: HTTP error, stopping pagination');
         break;
       }
 
-      // Handle invalid JSON
       if (!json) {
-        logger.warn(
-          { page: pageNum, snippet: bodyText ? bodyText.slice(0, 200) : null },
-          'fetchAllSymbols: invalid JSON response, stopping pagination'
-        );
+        logger.warn({ page: pageNum, snippet: bodyText ? bodyText.slice(0, 200) : null }, 'fetchAllSymbols: invalid JSON response, stopping pagination');
         break;
       }
 
-      // Check for API error codes (ret_code or retCode)
       if (typeof json.ret_code !== 'undefined' || typeof json.retCode !== 'undefined') {
         const rc = typeof json.ret_code !== 'undefined' ? json.ret_code : json.retCode;
         const rm = json.ret_msg || json.retMsg || null;
         if (rc !== 0) {
-          logger.warn(
-            { retCode: rc, retMsg: rm, page: pageNum },
-            'fetchAllSymbols: API returned non-zero retCode, stopping pagination'
-          );
+          logger.warn({ retCode: rc, retMsg: rm, page: pageNum }, 'fetchAllSymbols: API returned non-zero retCode, stopping pagination');
           break;
         }
       }
@@ -384,15 +298,10 @@ async function fetchAllSymbols() {
       const result = json.result || {};
       const instruments = result.list || [];
 
-      // Process page
       if (instruments.length > 0) {
         totalRawInstruments += instruments.length;
-        logger.info(
-          { page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments },
-          'fetchAllSymbols: page fetched, applying USDT filter'
-        );
+        logger.info({ page: pageNum, pageSize: instruments.length, totalRawSoFar: totalRawInstruments }, 'fetchAllSymbols: page fetched, applying USDT filter');
 
-        // FILTER: Accept USDT and USDT.P perpetuals, reject dated variants
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
@@ -401,9 +310,7 @@ async function fetchAllSymbols() {
               const su = sym.toUpperCase();
               const quote = String(it.quoteCoin || it.quote || '').toUpperCase();
 
-              // PRIMARY: Regex match (accepts USDT and USDT.P)
               if (DEFAULT_SYMBOL_FILTER.test(sym)) {
-                // But reject if it's a dated variant
                 if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
                   rejectedDateVariants++;
                   return false;
@@ -411,9 +318,7 @@ async function fetchAllSymbols() {
                 return true;
               }
 
-              // SECONDARY: Explicit quote field check
               if (quote === 'USDT') {
-                // But reject if it's a dated variant
                 if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
                   rejectedDateVariants++;
                   return false;
@@ -421,9 +326,7 @@ async function fetchAllSymbols() {
                 return true;
               }
 
-              // TERTIARY: Symbol suffix check (USDT or USDT.P)
               if (su.endsWith('USDT') || su.endsWith('USDT.P')) {
-                // But reject if it's a dated variant
                 if (/USDT[QHUZ0-9]/.test(su.slice(-6))) {
                   rejectedDateVariants++;
                   return false;
@@ -447,20 +350,13 @@ async function fetchAllSymbols() {
         totalFiltered += filtered.length;
 
         logger.info(
-          {
-            page: pageNum,
-            pageSize: instruments.length,
-            filtered: filtered.length,
-            totalAccumulated: allSymbols.length,
-            rejectedDateVariants
-          },
+          { page: pageNum, pageSize: instruments.length, filtered: filtered.length, totalAccumulated: allSymbols.length, rejectedDateVariants },
           'fetchAllSymbols: page filtered and accumulated'
         );
       } else {
         logger.info({ page: pageNum }, 'fetchAllSymbols: empty page received');
       }
 
-      // Check for next page cursor
       cursor = result.nextPageCursor;
       if (!cursor) {
         logger.info(
@@ -470,7 +366,6 @@ async function fetchAllSymbols() {
         break;
       }
 
-      // Small delay between pages to avoid hammering API
       await new Promise(resolve => setTimeout(resolve, 100));
     }
 
@@ -482,7 +377,6 @@ async function fetchAllSymbols() {
       return [];
     }
 
-    // ===== DEDUP & SORT =====
     const uniqueMap = new Map();
     for (const s of allSymbols) {
       const key = String(s.symbol).toUpperCase();
@@ -506,45 +400,27 @@ async function fetchAllSymbols() {
     });
 
     logger.info(
-      {
-        totalUnique: unique.length,
-        sampleFirst: unique.slice(0, 5).map(s => s.symbol),
-        sampleLast: unique.slice(-5).map(s => s.symbol)
-      },
+      { totalUnique: unique.length, sampleFirst: unique.slice(0, 5).map(s => s.symbol), sampleLast: unique.slice(-5).map(s => s.symbol) },
       'fetchAllSymbols: returning all unique USDT symbols (sorted A-Z)'
     );
 
     return unique;
-
   } catch (e) {
     logger.error({ e }, 'fetchAllSymbols: exception during pagination');
     return [];
   }
 }
 
-/**
- * getSeedSymbols(symbols) - UPDATED
- * 
- * Respects only SYMBOL_SEED_ALL flag (no topN cutting).
- * Validates that all symbols are USDT/USDT.P (non-expiry).
- * - If SYMBOL_SEED_ALL=true: return ALL symbols for seeding (after validation)
- * - If SYMBOL_SEED_ALL=false: return empty array (no seeding)
- */
 function getSeedSymbols(symbols) {
   if (!Array.isArray(symbols)) return [];
 
   const seedAll = envBool('SYMBOL_SEED_ALL', false);
 
   if (seedAll) {
-    // Validate that all seed symbols are USDT or USDT.P (not dated variants)
     const invalidSymbols = symbols.filter(s => {
       const sym = String(s.symbol || '').toUpperCase();
-      // Reject if it's a dated variant (USDTQ, USDTH, etc.)
-      if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
-        return true;
-      }
-      // Accept USDT and USDT.P
-      return !(/USDT(\.P)?$/.test(sym));
+      if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return true;
+      return !/USDT(\.P)?$/.test(sym);
     });
 
     if (invalidSymbols.length > 0) {
@@ -552,14 +428,9 @@ function getSeedSymbols(symbols) {
         { count: invalidSymbols.length, samples: invalidSymbols.slice(0, 5).map(s => s.symbol) },
         'getSeedSymbols: WARNING - found invalid symbols in seed list! These will be filtered out.'
       );
-      // Filter out invalid symbols
       const filtered = symbols.filter(s => {
         const sym = String(s.symbol || '').toUpperCase();
-        // Reject if it's a dated variant
-        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
-          return false;
-        }
-        // Accept USDT and USDT.P
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return false;
         return /USDT(\.P)?$/.test(sym);
       });
       logger.info(
@@ -573,7 +444,7 @@ function getSeedSymbols(symbols) {
       { totalSymbols: symbols.length },
       'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding ALL symbols (all are valid USDT)'
     );
-    return symbols.slice(); // return copy of all
+    return symbols.slice();
   }
 
   logger.warn(
@@ -583,10 +454,6 @@ function getSeedSymbols(symbols) {
   return [];
 }
 
-/**
- * fetchKlines(symbol, interval, limit)
- * Uses single base (getBase()) only.
- */
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
   if (!base) {
@@ -594,10 +461,12 @@ async function fetchKlines(symbol, interval, limit = 200) {
     return [];
   }
 
+  const normalizedInterval = normalizeTf(interval);
+
   const candidates = [
-    { path: '/v5/market/kline', params: { category: 'linear', symbol, interval, limit: String(limit) } },
-    { path: '/v2/public/kline', params: { symbol, interval, limit: String(limit) } },
-    { path: '/v2/public/kline/list', params: { symbol, interval, limit: String(limit) } }
+    { path: '/v5/market/kline', params: { category: 'linear', symbol, interval: normalizedInterval, limit: String(limit) } },
+    { path: '/v2/public/kline', params: { symbol, interval: normalizedInterval, limit: String(limit) } },
+    { path: '/v2/public/kline/list', params: { symbol, interval: normalizedInterval, limit: String(limit) } }
   ];
 
   for (const c of candidates) {
@@ -683,10 +552,6 @@ async function fetchKlines(symbol, interval, limit = 200) {
   return [];
 }
 
-/**
- * fetchTicker24h(symbol)
- * Uses single base (getBase()) only.
- */
 async function fetchTicker24h(symbol) {
   const base = getBase();
   if (!base) {
@@ -745,12 +610,6 @@ async function fetchTicker24h(symbol) {
   return null;
 }
 
-/**
- * Signed/private endpoints:
- * - getWalletBalance, fetchOpenOrders, fetchOpenPositions: read-only but use getOrderBase()
- * - placeMarketOrderV5, setPositionTradingStop: order-mutating endpoints; if OPENTRADES=false they simulate/dry-run
- */
-
 async function getWalletBalance(coin = 'USDT') {
   const apiKey = process.env.BYBIT_API_KEY;
   const apiSecret = process.env.BYBIT_API_SECRET;
@@ -804,7 +663,6 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
   if (tp) bodyObj.takeProfit = String(tp);
   if (sl) bodyObj.stopLoss = String(sl);
 
-  // Dry-run when OPENTRADES is disabled
   if (!OPENTRADES) {
     logger.info({ op: 'DRY_RUN_ORDER', body: bodyObj }, 'placeMarketOrderV5: OPENTRADES disabled — not sending real order');
     return {
@@ -847,7 +705,6 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
   const bodyObj = { category, symbol };
   if (typeof stopLoss !== 'undefined' && stopLoss !== null) bodyObj.stopLoss = String(stopLoss);
 
-  // Dry-run when OPENTRADES is disabled
   if (!OPENTRADES) {
     logger.info({ op: 'DRY_RUN_TRADING_STOP', body: bodyObj }, 'setPositionTradingStop: OPENTRADES disabled — not sending real request');
     return {
@@ -944,7 +801,6 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
   return json;
 }
 
-/** Diagnostics helpers */
 function getLastProbeInfo() {
   return {
     chosenBase,
@@ -962,7 +818,6 @@ async function reprobe(timeoutMs = 5000) {
   return base;
 }
 
-// ===== EXPORTS =====
 module.exports = {
   probeHosts,
   getBase,
