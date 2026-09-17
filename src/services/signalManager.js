@@ -1,3 +1,4 @@
+// src/services/signalManager.js
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
@@ -17,6 +18,12 @@ function setOpenTradesAllowed(v) {
 }
 
 const inProgress = new Map();
+
+function normalizeEventId(symbol, root_tf, eventId, candleTime) {
+  if (eventId) return eventId;
+  if (!symbol || !root_tf) return null;
+  return `${String(symbol)}_${String(root_tf)}_${Number(candleTime || Date.now())}`;
+}
 
 module.exports = {
   start() {
@@ -40,21 +47,25 @@ module.exports = {
     }
   },
 
-  /**
-   * handleRootSignal:
-   * - notifyImmediately: if true (default) enqueue to notification queue; if false, return signal object for caller
-   * - returns the persisted signal object
-   * - ALWAYS fetches fresh market data and TV rating for complete signal block
-   */
-  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+  async handleRootSignal({
+    symbol,
+    root_tf,
+    detected_at = Date.now(),
+    notifyImmediately = true,
+    eventId = null,
+    candleTime = null
+  } = {}) {
     const key = `${symbol}:${root_tf}`;
     if (inProgress.has(key)) {
       logger.debug({ key }, 'handleRootSignal: already in progress');
       return null;
     }
     inProgress.set(key, true);
+
+    const finalEventId = normalizeEventId(symbol, root_tf, eventId, candleTime);
+
     try {
-      logger.info({ symbol, root_tf }, 'Root signal received');
+      logger.info({ symbol, root_tf, eventId: finalEventId }, 'Root signal received');
 
       // ALWAYS fetch fresh market data
       let mdata = null;
@@ -68,10 +79,10 @@ module.exports = {
         mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
-      // FETCH TV RATING WITH CACHING
+      // TV rating
       let tv = { score: 0, source: 'error' };
       try {
-        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating');
         const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
         if (tvRes && typeof tvRes.score === 'number') {
           tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
@@ -85,20 +96,18 @@ module.exports = {
         tv = { score: 0, source: 'error' };
       }
 
-      // Subscribe to MTF websockets
       try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
-      // Evaluate MTF alignment
       const alignment = await this.evaluateMtfAlignment(symbol);
       const mtfTfs = Object.keys(alignment || {});
       const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
       const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-      // Apply decision rules
       const accept = await this.applyDecision(alignment);
 
-      // Compose meta and persist signal to DB
       const meta = {
+        eventId: finalEventId,
+        candleTime: Number(candleTime || detected_at || Date.now()),
         tvScore: tv.score || 0,
         tvSource: tv.source || 'error',
         mtfScore,
@@ -116,25 +125,25 @@ module.exports = {
         root_tf,
         detected_at,
         state: 'detected',
+        eventId: finalEventId,
+        candleTime: Number(candleTime || detected_at || Date.now()),
         meta
       };
 
       if (notifyImmediately) {
-        logger.debug({ symbol, root_tf }, 'handleRootSignal: enqueuing realtime signal to notification queue');
+        logger.debug({ symbol, root_tf, eventId: finalEventId }, 'handleRootSignal: enqueuing realtime signal to notification queue');
         notificationQueue.enqueueSignal(signalObj, 'realtime');
       } else {
-        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
+        logger.debug({ symbol, root_tf, eventId: finalEventId }, 'handleRootSignal: notifyImmediately=false, returning signal object');
         return signalObj;
       }
 
-      // Only when decision is 'accept' do we attempt to open a trade
       if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
           logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
         } else if (!openTradesAllowed) {
           logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
         } else {
-          // Apply market-level filters
           let passFilters = true;
           if (config.MIN_MARKET_CAP > 0) {
             if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
@@ -185,9 +194,6 @@ module.exports = {
     }
   },
 
-  /**
-   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
-   */
   async evaluateMtfAlignment(symbol) {
     const result = {};
     for (const tf of config.MTF_TFS) {
@@ -215,13 +221,6 @@ module.exports = {
     return result;
   },
 
-  /**
-   * applyDecision: Determine signal acceptance based on alignment
-   * - All positive: accept
-   * - Only daily negative and rising: accept
-   * - Some negative: monitor
-   * - Otherwise: reject
-   */
   async applyDecision(alignment) {
     const tfList = Object.keys(alignment);
     if (!tfList || tfList.length === 0) {
