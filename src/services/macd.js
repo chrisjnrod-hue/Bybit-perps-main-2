@@ -47,10 +47,14 @@ module.exports = {
 
     const rows = db.prepare(`
       SELECT open_time, close
-      FROM klines
-      WHERE symbol = ? AND timeframe = ?
+      FROM (
+        SELECT open_time, close
+        FROM klines
+        WHERE symbol = ? AND timeframe = ?
+        ORDER BY open_time DESC
+        LIMIT ?
+      )
       ORDER BY open_time ASC
-      LIMIT ?
     `).all(symbol, normalizedTf, limit);
 
     return rows
@@ -74,11 +78,15 @@ module.exports = {
         ...macdOptions
       });
 
+      if (!Array.isArray(output) || output.length === 0) {
+        return null;
+      }
+
       const offset = closes.length - output.length;
 
       return output
         .map((item, index) => ({
-          time: series[offset + index].time,
+          time: series[offset + index] ? series[offset + index].time : null,
           MACD: item.MACD,
           signal: item.signal,
           histogram: item.histogram
