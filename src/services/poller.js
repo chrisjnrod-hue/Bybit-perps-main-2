@@ -58,6 +58,11 @@ function stableAlignmentSignature(alignment = {}) {
   return JSON.stringify(out);
 }
 
+function processedEventKey(eventId) {
+  if (!eventId) return null;
+  return `macd_event_processed:${eventId}`;
+}
+
 module.exports = {
   start() {
     if (isRunning) return;
@@ -123,8 +128,6 @@ module.exports = {
       300000
     );
 
-    logger.info({ intervalMs }, 'poller: starting 5m root boundary scan loop');
-
     const run = async () => {
       if (this._boundaryScanRunning) {
         logger.debug('poller: boundary scan already running; skipping overlapping run');
@@ -142,8 +145,27 @@ module.exports = {
       }
     };
 
-    this._boundaryScanLoopTimer = setInterval(run, intervalMs);
+    const scheduleNext = () => {
+      const now = Date.now();
+      const nextBoundary = Math.floor(now / intervalMs) * intervalMs + intervalMs;
+      const delay = Math.max(0, nextBoundary - now);
+
+      this._boundaryScanLoopTimer = setTimeout(async () => {
+        try {
+          await run();
+        } finally {
+          scheduleNext();
+        }
+      }, delay);
+    };
+
+    logger.info(
+      { intervalMs },
+      'poller: starting aligned 5m root boundary scan loop'
+    );
+
     run().catch(() => {});
+    scheduleNext();
   },
 
   startRootCandleOpenScanLoop() {
@@ -227,8 +249,8 @@ module.exports = {
       const event = await macdUtil.getMacdFlipEvent(symbol, normalizedTf);
       if (!event) return false;
 
-      const eventKey = `root_flip_sent:${event.eventId}`;
-      if (dbModule.getState(eventKey)) {
+      const eventKey = processedEventKey(event.eventId);
+      if (!eventKey || dbModule.getState(eventKey)) {
         return false;
       }
 
@@ -373,16 +395,14 @@ module.exports = {
         return null;
       }
 
-      dbModule.setState(stateKey, latestOpenTime);
-
       const event = await macdUtil.getMacdFlipEvent(symbol, normalizedTf);
       if (!event) {
         logger.debug({ symbol, tf: normalizedTf, latestOpenTime }, 'scanRootCandleOpenForSymbol: no MACD flip on current candle');
         return null;
       }
 
-      const eventKey = `root_open_signal:${event.eventId}`;
-      if (dbModule.getState(eventKey)) {
+      const eventKey = processedEventKey(event.eventId);
+      if (!eventKey || dbModule.getState(eventKey)) {
         logger.debug({ symbol, tf: normalizedTf, eventId: event.eventId }, 'scanRootCandleOpenForSymbol: event already processed');
         return null;
       }
@@ -401,6 +421,7 @@ module.exports = {
       }
 
       dbModule.setState(eventKey, true);
+      dbModule.setState(stateKey, latestOpenTime);
 
       logger.info({ symbol, root_tf: normalizedTf, eventId: event.eventId, latestOpenTime }, 'poller: new root candle-open signal detected');
       return signal;
@@ -719,9 +740,8 @@ module.exports = {
 
         const event = await macdUtil.getMacdFlipEvent(symbol, tf);
         if (event) {
-          const eventKey = `startup_root_flip:${event.eventId}`;
-          if (dbModule.getState(eventKey)) continue;
-          dbModule.setState(eventKey, true);
+          const eventKey = processedEventKey(event.eventId);
+          if (!eventKey || dbModule.getState(eventKey)) continue;
 
           const sig = await require('./signalManager').handleRootSignal({
             symbol,
@@ -732,7 +752,10 @@ module.exports = {
             candleTime: event.candleTime
           });
 
-          if (sig) results.push(sig);
+          if (sig) {
+            dbModule.setState(eventKey, true);
+            results.push(sig);
+          }
         }
       } catch (err) {
         logger.debug({ err, symbol, tf }, 'scanSymbolRoots: error checking flip');
