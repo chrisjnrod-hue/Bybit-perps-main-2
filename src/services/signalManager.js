@@ -25,6 +25,11 @@ function normalizeEventId(symbol, root_tf, eventId, candleTime) {
   return `${String(symbol)}_${String(root_tf)}_${Number(candleTime || Date.now())}`;
 }
 
+function processedEventKey(eventId) {
+  if (!eventId) return null;
+  return `macd_event_processed:${eventId}`;
+}
+
 module.exports = {
   start() {
     logger.info('SignalManager started');
@@ -63,8 +68,14 @@ module.exports = {
     inProgress.set(key, true);
 
     const finalEventId = normalizeEventId(symbol, root_tf, eventId, candleTime);
+    const persistKey = processedEventKey(finalEventId);
 
     try {
+      if (persistKey && dbModule.getState(persistKey)) {
+        logger.debug({ symbol, root_tf, eventId: finalEventId }, 'handleRootSignal: event already processed');
+        return null;
+      }
+
       logger.info({ symbol, root_tf, eventId: finalEventId }, 'Root signal received');
 
       // ALWAYS fetch fresh market data
@@ -118,6 +129,10 @@ module.exports = {
       };
 
       dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
+
+      if (persistKey) {
+        dbModule.setState(persistKey, true);
+      }
 
       const signalObj = {
         key,
