@@ -77,7 +77,7 @@ module.exports = {
       CREATE INDEX IF NOT EXISTS idx_market_data_history_symbol_updated_at ON market_data_history(symbol, updated_at);
     `);
 
-    // symbols migration
+    // Migration: add additional columns to symbols if not present
     const existing = db.prepare("PRAGMA table_info(symbols)").all().map(r => r.name);
     const toAdd = [
       { name: 'market_cap', type: 'REAL' },
@@ -97,7 +97,7 @@ module.exports = {
       }
     }
 
-    // market_data migration
+    // Migration: ensure market_data table has all columns
     try {
       const mdExisting = db.prepare("PRAGMA table_info(market_data)").all().map(r => r.name);
       const mdToAdd = [
