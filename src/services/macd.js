@@ -34,32 +34,41 @@ module.exports = {
     }
   },
 
-  /**
-   * First-candle flip detection only.
-   * Prevents false positives from second-candle re-triggering.
-   * We must compare the last closed candle(s), not the currently forming candle.
-   */
-  async isMacdFlip(symbol, timeframe) {
+  // Returns a strict first-candle flip event object for the last closed candle
+  async getMacdFlipEvent(symbol, timeframe) {
     try {
       const hist = await this.computeMacdHistogram(symbol, timeframe);
-      if (!hist || hist.length < 4) return false;
+      if (!hist || hist.length < 4) return null;
 
-      // Use last CLOSED candle and previous CLOSED candle
+      // Use last closed candle and previous closed candle
       const lastClosed = hist[hist.length - 2];
       const prevClosed = hist[hist.length - 3] || hist[hist.length - 2];
 
-      if (!lastClosed || !prevClosed) return false;
+      if (!lastClosed || !prevClosed) return null;
 
-      // Strict: negative -> positive transition on the last closed candle
       if (prevClosed.histogram < 0 && lastClosed.histogram > 0) {
-        logger.info(
-          { symbol, timeframe, prevHistogram: prevClosed.histogram, lastHistogram: lastClosed.histogram },
-          'MACD flip detected (first closed candle: negative->positive)'
-        );
-        return true;
+        const eventTime = Number(lastClosed.time || Date.now());
+        return {
+          symbol,
+          timeframe,
+          eventId: `${symbol}_${timeframe}_${eventTime}`,
+          candleTime: eventTime,
+          prevHistogram: prevClosed.histogram,
+          lastHistogram: lastClosed.histogram
+        };
       }
 
-      return false;
+      return null;
+    } catch (err) {
+      logger.debug({ err, symbol, timeframe }, 'getMacdFlipEvent error');
+      return null;
+    }
+  },
+
+  async isMacdFlip(symbol, timeframe) {
+    try {
+      const event = await this.getMacdFlipEvent(symbol, timeframe);
+      return !!event;
     } catch (err) {
       logger.debug({ err, symbol, timeframe }, 'isMacdFlip error');
       return false;
@@ -68,23 +77,8 @@ module.exports = {
 
   async isMacdFlipAtOpen(symbol, timeframe) {
     try {
-      const hist = await this.computeMacdHistogram(symbol, timeframe);
-      if (!hist || hist.length < 4) return false;
-
-      const prevClosed = hist[hist.length - 3];
-      const lastClosed = hist[hist.length - 2];
-      if (!prevClosed || !lastClosed) return false;
-
-      // strict first-candle open flip detection
-      if (prevClosed.histogram < 0 && lastClosed.histogram > 0) {
-        logger.info(
-          { symbol, timeframe, prevHistogram: prevClosed.histogram, lastHistogram: lastClosed.histogram },
-          'MACD flip at open detected (closed-candle first transition)'
-        );
-        return true;
-      }
-
-      return false;
+      const event = await this.getMacdFlipEvent(symbol, timeframe);
+      return !!event;
     } catch (err) {
       logger.debug({ err, symbol, timeframe }, 'isMacdFlipAtOpen error');
       return false;
