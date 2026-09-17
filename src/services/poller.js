@@ -24,6 +24,13 @@ function validUsdtSymbol(symbol) {
   return /USDT(\.P)?$/.test(sym) && !/USDT[QHUZ0-9]/.test(sym.slice(-6));
 }
 
+function normalizeTf(tf) {
+  if (!tf) return tf;
+  const t = String(tf).trim();
+  if (/^1d$/i.test(t) || /^1D$/i.test(t) || /^D$/i.test(t)) return 'D';
+  return t;
+}
+
 function stableAlignmentSignature(alignment = {}) {
   const out = {};
   for (const key of Object.keys(alignment).sort()) {
@@ -73,10 +80,18 @@ module.exports = {
         }
 
         // Loop 2: 5m boundary scan + MTF alignment change alerts
-        this.startBoundaryScanLoop();
+        if (config.ROOT_SCAN_5MIN_BOUNDARY) {
+          this.startBoundaryScanLoop();
+        } else {
+          logger.info('poller: ROOT_SCAN_5MIN_BOUNDARY disabled; boundary loop skipped');
+        }
 
-        // Loop 3: root candle open scan (startup-like batch)
-        this.startRootCandleOpenScanLoop();
+        // Loop 3: root candle open scan
+        if (config.ROOT_CANDLE_OPEN_SCAN_ENABLED) {
+          this.startRootCandleOpenScanLoop();
+        } else {
+          logger.info('poller: ROOT_CANDLE_OPEN_SCAN_ENABLED disabled; root open scan loop skipped');
+        }
 
       } catch (err) {
         logger.error({ err }, 'poller: initialScan failed');
@@ -84,7 +99,6 @@ module.exports = {
     })();
   },
 
-  // -------- LOOP 2: 5-minute boundary scan + MTF alignment alert --------
   startBoundaryScanLoop() {
     if (this._boundaryScanLoopTimer) return;
 
@@ -98,7 +112,6 @@ module.exports = {
       });
     }, intervalMs);
 
-    // initial run
     this.runBoundaryScanLoop().catch((err) => {
       logger.error({ err }, 'poller: initial boundary scan failed');
     });
@@ -113,16 +126,14 @@ module.exports = {
       .filter(validUsdtSymbol);
 
     for (const symbol of validSymbols) {
-      for (const tf of config.ROOT_TFS || []) {
+      for (const tf of (config.ROOT_TFS || []).map(normalizeTf)) {
         try {
-          // refresh seed data for root tf before evaluation
           await this.ensureKlinesReady(symbol, tf);
 
           const key = `boundary_scan:${symbol}:${tf}`;
           const lastSeen = Number(dbModule.getState(key) || 0);
           const now = Date.now();
 
-          // prevent duplicate boundary scans too close together
           if (lastSeen && (now - lastSeen) < 5 * 60 * 1000) {
             continue;
           }
@@ -132,11 +143,8 @@ module.exports = {
             dbModule.setState(key, now);
           }
 
-          // MTF alignment alert for active/monitored root signal
-          const alertSent = await this.checkMtfAlignmentAlert(symbol, tf);
-          if (alertSent) {
-            dbModule.setState(`mtf_alert:${symbol}:${tf}`, now);
-          }
+          // MTF alignment change alert
+          await this.checkMtfAlignmentAlert(symbol, tf);
         } catch (err) {
           logger.debug({ err, symbol, tf }, 'poller: boundary scan symbol iteration failed');
         }
@@ -155,20 +163,26 @@ module.exports = {
         return false;
       }
 
-      // strict: only first closed-candle flip
-      const flip = await macdUtil.isMacdFlip(symbol, tf);
-      if (!flip) return false;
+      const event = await macdUtil.getMacdFlipEvent(symbol, tf);
+      if (!event) return false;
 
-      // IMPORTANT: this loop must send one single block per new signal only
+      const eventKey = `root_flip_sent:${event.eventId}`;
+      if (dbModule.getState(eventKey)) {
+        return false;
+      }
+
       const signalObj = await require('./signalManager').handleRootSignal({
         symbol,
         root_tf: tf,
         detected_at: Date.now(),
-        notifyImmediately: true
+        notifyImmediately: true,
+        eventId: event.eventId,
+        candleTime: event.candleTime
       });
 
       if (signalObj) {
-        logger.info({ symbol, root_tf: tf }, 'poller: boundary scan emitted new signal block');
+        dbModule.setState(eventKey, true);
+        logger.info({ symbol, root_tf: tf, eventId: event.eventId }, 'poller: boundary scan emitted new signal block');
         return true;
       }
 
@@ -181,7 +195,6 @@ module.exports = {
 
   async checkMtfAlignmentAlert(symbol, tf) {
     try {
-      // Only evaluate active/monitored root signals for this symbol+root_tf
       const db = dbModule.get();
       const row = db.prepare(`
         SELECT symbol, root_tf, meta, detected_at
@@ -191,9 +204,7 @@ module.exports = {
         LIMIT 1
       `).get(symbol, tf);
 
-      if (!row) {
-        return false;
-      }
+      if (!row) return false;
 
       let meta = {};
       try { meta = row.meta ? JSON.parse(row.meta) : {}; } catch (e) { meta = {}; }
@@ -206,7 +217,6 @@ module.exports = {
         return false;
       }
 
-      // persist new signature
       dbModule.setState(`mtf_align_sig:${symbol}:${tf}`, newSignature);
 
       const alertMeta = {
@@ -227,10 +237,12 @@ module.exports = {
         root_tf: tf,
         detected_at: Date.now(),
         state: 'monitor',
+        eventId: `mtf_alert_${symbol}_${tf}_${Date.now()}`,
+        candleTime: Date.now(),
         meta: alertMeta
       };
 
-      // Loop 2: send only a single signal block; no summary, no recommended blocks
+      // Loop 2: single signal block only
       notificationQueue.enqueueSignal(signalObj, 'realtime');
 
       logger.info({ symbol, root_tf: tf, signature: newSignature }, 'poller: MTF alignment alert sent');
@@ -241,7 +253,6 @@ module.exports = {
     }
   },
 
-  // -------- LOOP 3: root candle open scan --------
   startRootCandleOpenScanLoop() {
     if (this._rootCandleOpenLoopTimer) return;
 
@@ -255,7 +266,6 @@ module.exports = {
       });
     }, intervalMs);
 
-    // initial run
     this.runRootCandleOpenScanLoop().catch((err) => {
       logger.error({ err }, 'poller: initial root candle open scan failed');
     });
@@ -269,7 +279,7 @@ module.exports = {
       .map(r => String(r.symbol || '').trim())
       .filter(validUsdtSymbol);
 
-    const rootTfs = Array.isArray(config.ROOT_TFS) ? config.ROOT_TFS.map(String) : ['60', '240', 'D'];
+    const rootTfs = Array.isArray(config.ROOT_TFS) ? config.ROOT_TFS.map(normalizeTf) : ['60', '240', 'D'];
 
     const signals = [];
 
@@ -284,7 +294,6 @@ module.exports = {
       }
     }
 
-    // Loop 3: same startup-like bundle format as loop 1
     if (signals.length > 0) {
       logger.info({ signalCount: signals.length }, 'poller: queueing root candle open startup-like batch');
       notificationQueue.enqueueStartupBatch(signals);
@@ -303,15 +312,26 @@ module.exports = {
         if (!retry || retry.length < 3) return null;
       }
 
-      const flip = await macdUtil.isMacdFlipAtOpen(symbol, tf);
-      if (!flip) return null;
+      const event = await macdUtil.getMacdFlipEvent(symbol, tf);
+      if (!event) return null;
+
+      const eventKey = `root_open_scan_sent:${event.eventId}`;
+      if (dbModule.getState(eventKey)) {
+        return null;
+      }
 
       const sig = await require('./signalManager').handleRootSignal({
         symbol,
         root_tf: tf,
         detected_at: Date.now(),
-        notifyImmediately: false
+        notifyImmediately: false,
+        eventId: event.eventId,
+        candleTime: event.candleTime
       });
+
+      if (sig) {
+        dbModule.setState(eventKey, true);
+      }
 
       return sig;
     } catch (err) {
@@ -320,7 +340,6 @@ module.exports = {
     }
   },
 
-  // -------- existing startup/seed logic --------
   async initialScan() {
     logger.info('poller.initialScan: starting');
 
@@ -423,12 +442,13 @@ module.exports = {
 
   async ensureKlinesReady(symbol, tf) {
     const db = dbModule.get();
+    const normalizedTf = normalizeTf(tf);
     const selectStmt = db.prepare('SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 3');
-    let rows = selectStmt.all(symbol, tf);
+    let rows = selectStmt.all(symbol, normalizedTf);
 
     if (!rows || rows.length < 3) {
-      await this.seedKlinesForSymbol(symbol, tf);
-      rows = selectStmt.all(symbol, tf);
+      await this.seedKlinesForSymbol(symbol, normalizedTf);
+      rows = selectStmt.all(symbol, normalizedTf);
     }
 
     return rows || [];
@@ -447,8 +467,8 @@ module.exports = {
         return;
       }
 
-      const rootTfs = timeframe ? [String(timeframe)] : (config.ROOT_TFS || []);
-      const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
+      const rootTfs = timeframe ? [normalizeTf(timeframe)] : (config.ROOT_TFS || []).map(normalizeTf);
+      const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(normalizeTf) : [];
       const tfsSet = new Set([...(rootTfs || []), ...(mtfTfs || [])]);
       const tfs = Array.from(tfsSet);
 
@@ -550,7 +570,7 @@ module.exports = {
   },
 
   async scanSymbolRoots(symbol) {
-    const tfList = config.ROOT_TFS || [];
+    const tfList = (config.ROOT_TFS || []).map(normalizeTf);
     const results = [];
 
     if (!validUsdtSymbol(symbol)) {
@@ -577,13 +597,21 @@ module.exports = {
           }
         }
 
-        const flip = await require('./macd').isMacdFlip(symbol, tf);
-        if (flip) {
+        const event = await macdUtil.getMacdFlipEvent(symbol, tf);
+        if (event) {
+          const eventKey = `startup_root_flip:${event.eventId}`;
+          if (dbModule.getState(eventKey)) {
+            continue;
+          }
+          dbModule.setState(eventKey, true);
+
           const sig = await require('./signalManager').handleRootSignal({
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
-            notifyImmediately: false
+            notifyImmediately: false,
+            eventId: event.eventId,
+            candleTime: event.candleTime
           });
           if (sig) results.push(sig);
         }
