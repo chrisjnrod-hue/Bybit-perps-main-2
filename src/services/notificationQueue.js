@@ -1,3 +1,4 @@
+// src/services/notificationQueue.js
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -5,6 +6,12 @@ const QUEUE_STATE = {
   STARTUP_SUMMARY: 'startup_summary',
   PROCESSING: 'processing'
 };
+
+function signalKey(signal) {
+  if (!signal || !signal.symbol || !signal.root_tf) return null;
+  if (signal.eventId) return String(signal.eventId);
+  return `${String(signal.symbol)}_${String(signal.root_tf)}_${Number(signal.candleTime || Date.now())}`;
+}
 
 class NotificationQueue {
   constructor() {
@@ -21,11 +28,10 @@ class NotificationQueue {
       return false;
     }
 
-    const sigId = `${signal.symbol}_${signal.root_tf}`;
+    const sigId = signalKey(signal);
 
-    // de-dupe startup signals only
-    if (this.sentSignalIds.has(sigId) && type === 'startup') {
-      logger.debug({ sigId }, 'NotificationQueue: signal already sent during startup, skipping duplicate');
+    if (this.sentSignalIds.has(sigId)) {
+      logger.debug({ sigId, type }, 'NotificationQueue: signal already sent or queued, skipping duplicate');
       return false;
     }
 
@@ -36,10 +42,7 @@ class NotificationQueue {
       id: sigId
     });
 
-    logger.debug(
-      { sigId, type, queueLength: this.queue.length },
-      'NotificationQueue: signal enqueued'
-    );
+    logger.debug({ sigId, type, queueLength: this.queue.length }, 'NotificationQueue: signal enqueued');
 
     if (!this.processing) {
       this.processQueue();
@@ -63,9 +66,10 @@ class NotificationQueue {
     this.state = QUEUE_STATE.STARTUP_SUMMARY;
 
     const uniqueSignals = signals.filter(sig => {
-      const sigId = `${sig.symbol}_${sig.root_tf}`;
+      const sigId = signalKey(sig);
+      if (!sigId) return false;
       if (this.sentSignalIds.has(sigId)) {
-        logger.debug({ sigId }, 'NotificationQueue: filtering duplicate from startup batch');
+        logger.debug({ sigId }, 'NotificationQueue: filtering duplicate startup signal');
         return false;
       }
       return true;
@@ -110,12 +114,10 @@ class NotificationQueue {
             await this._processCandleUpdate(item.signal);
           }
 
-          // mark startup batch by symbol/root_tf so later startup batches won't repeat them
           if (item.type === 'startup_batch' && Array.isArray(item.signals)) {
             for (const sig of item.signals) {
-              if (sig && sig.symbol && sig.root_tf) {
-                this.sentSignalIds.add(`${sig.symbol}_${sig.root_tf}`);
-              }
+              const key = signalKey(sig);
+              if (key) this.sentSignalIds.add(key);
             }
           } else if (item.id) {
             this.sentSignalIds.add(item.id);
@@ -140,13 +142,7 @@ class NotificationQueue {
       const telegram = require('./telegram');
 
       logger.info({ count: signals.length }, 'NotificationQueue: starting startup batch flow');
-
-      // Use telegram's sendStartupSummary which handles:
-      // - summary header
-      // - individual signal blocks
-      // - recommended blocks
       await telegram.sendStartupSummary({ snapshot: signals });
-
       logger.info('NotificationQueue: startup batch flow completed');
     } catch (err) {
       logger.error({ err }, 'NotificationQueue: startup batch processing failed');
