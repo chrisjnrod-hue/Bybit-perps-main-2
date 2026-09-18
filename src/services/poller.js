@@ -18,6 +18,36 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms || 0));
 }
 
+function normalizeRootTf(tf) {
+  if (tf === null || tf === undefined) return null;
+  const value = String(tf).trim().toUpperCase();
+  if (value === '1D' || value === 'D') return 'D';
+  if (value === '1H' || value === 'H') return '60';
+  return value;
+}
+
+function buildRootTfs() {
+  const raw = Array.isArray(config.ROOT_TFS) ? config.ROOT_TFS : ['60', '240', 'D'];
+  const seen = new Set();
+  const out = [];
+
+  for (const tf of raw) {
+    const norm = normalizeRootTf(tf);
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    out.push(norm);
+  }
+
+  return out.length ? out : ['60', '240', 'D'];
+}
+
+function isUsdtSymbol(symbol) {
+  const s = String(symbol || '').toUpperCase();
+  if (!s) return false;
+  if (/USDT[QHUZ0-9]/.test(s.slice(-6))) return false;
+  return /USDT(\.P)?$/.test(s);
+}
+
 module.exports = {
   start() {
     if (isRunning) return;
@@ -43,7 +73,6 @@ module.exports = {
         await this.initialScan();
         logger.info('poller: initialScan completed');
 
-        // Full startup scan
         try {
           await this.scanAllForStartup();
           logger.info('poller: startup full scan completed');
@@ -51,13 +80,18 @@ module.exports = {
           logger.error({ err }, 'poller: scanAllForStartup error');
         }
 
-        // Enable open trades after initial scan completes
         try {
           signalManager.setOpenTradesAllowed(true);
           logger.info('poller: open trades enabled after initial scan');
         } catch (e) {
           logger.debug({ e }, 'poller: failed to enable open trades');
         }
+
+        // LOOP 2: 5m boundary scan
+        this.startBoundaryScanLoop();
+
+        // LOOP 3: exact root candle open scan
+        this.startRootCandleOpenLoop();
       } catch (err) {
         logger.error({ err }, 'poller: initialScan failed');
       }
@@ -113,15 +147,10 @@ module.exports = {
 
     const seedSymbols = bybit.getSeedSymbols(allSymbols);
     if (seedSymbols && seedSymbols.length) {
-      // Validate that all seed symbols are USDT or USDT.P
       const invalidSymbols = seedSymbols.filter(s => {
         const sym = String(s.symbol || '').toUpperCase();
-        // Reject if it's a dated variant
-        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
-          return true;
-        }
-        // Accept USDT and USDT.P
-        return !(/USDT(\.P)?$/.test(sym));
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return true;
+        return !/USDT(\.P)?$/.test(sym);
       });
 
       if (invalidSymbols.length > 0) {
@@ -171,14 +200,12 @@ module.exports = {
 
   async seedKlinesForSymbol(symbol, timeframe = null) {
     try {
-      // Validate symbol is USDT or USDT.P
       const symUpper = String(symbol || '').toUpperCase();
-      if (!/USDT(\.P)?$/.test(symUpper)) {
+      if (!isUsdtSymbol(symbol)) {
         logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is not valid USDT, skipping');
         return;
       }
 
-      // Reject if it's a dated variant
       if (/USDT[QHUZ0-9]/.test(symUpper.slice(-6))) {
         logger.warn({ symbol }, 'seedKlinesForSymbol: symbol is a dated variant, skipping');
         return;
@@ -190,7 +217,7 @@ module.exports = {
       const tfs = Array.from(tfsSet);
 
       for (const tf of tfs) {
-        const interval = String(tf) === 'D' ? 'D' : String(tf);
+        const interval = normalizeRootTf(tf) === 'D' ? 'D' : String(tf);
         try {
           const klines = await limiter.schedule(() => bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT));
           if (!klines || klines.length === 0) {
@@ -237,15 +264,10 @@ module.exports = {
       const db = dbModule.get();
       const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
 
-      // Validate all symbols are USDT or USDT.P (non-expiry)
       const invalidSymbols = rows.filter(r => {
         const sym = String(r.symbol || '').toUpperCase();
-        // Reject if it's a dated variant
-        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
-          return true;
-        }
-        // Accept USDT and USDT.P
-        return !(/USDT(\.P)?$/.test(sym));
+        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return true;
+        return !isUsdtSymbol(r.symbol);
       });
 
       if (invalidSymbols.length > 0) {
@@ -255,21 +277,12 @@ module.exports = {
         );
       }
 
-      // Collect all signals
       const newSignals = [];
 
       for (let i = 0; i < rows.length; i += config.PAGE_SIZE) {
         const page = rows.slice(i, i + config.PAGE_SIZE);
         const tasks = page
-          .filter(r => {
-            const sym = String(r.symbol || '').toUpperCase();
-            // Reject if it's a dated variant
-            if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
-              return false;
-            }
-            // Accept USDT and USDT.P
-            return /USDT(\.P)?$/.test(sym);
-          })
+          .filter(r => isUsdtSymbol(r.symbol))
           .map(r => this.scanSymbolRoots(r.symbol));
 
         try {
@@ -280,14 +293,12 @@ module.exports = {
         }
       }
 
-      // Sort signals by symbol (A-Z)
       newSignals.sort((a, b) => {
         const symA = String(a.symbol || '').toUpperCase();
         const symB = String(b.symbol || '').toUpperCase();
         return symA.localeCompare(symB);
       });
 
-      // ENQUEUE STARTUP BATCH TO NOTIFICATION QUEUE (instead of directly calling telegram)
       if (newSignals.length > 0) {
         logger.info({ newSignals: newSignals.length }, 'scanAllForStartup: enqueuing startup batch to notification queue');
         notificationQueue.enqueueStartupBatch(newSignals);
@@ -303,19 +314,11 @@ module.exports = {
   },
 
   async scanSymbolRoots(symbol) {
-    const tfList = config.ROOT_TFS || [];
+    const tfList = buildRootTfs();
     const results = [];
 
-    // Validate symbol is USDT or USDT.P
-    const symUpper = String(symbol || '').toUpperCase();
-    if (!/USDT(\.P)?$/.test(symUpper)) {
+    if (!isUsdtSymbol(symbol)) {
       logger.warn({ symbol }, 'scanSymbolRoots: symbol is not valid USDT, skipping');
-      return results;
-    }
-
-    // Reject if it's a dated variant
-    if (/USDT[QHUZ0-9]/.test(symUpper.slice(-6))) {
-      logger.warn({ symbol }, 'scanSymbolRoots: symbol is a dated variant, skipping');
       return results;
     }
 
@@ -333,8 +336,6 @@ module.exports = {
           if (!rows || rows.length < 2) {
             logger.debug({ symbol, tf }, 'scanSymbolRoots: still insufficient klines after seeding, skipping tf');
             continue;
-          } else {
-            logger.info({ symbol, tf }, 'scanSymbolRoots: klines seeded and available, re-checking flip');
           }
         }
 
@@ -344,7 +345,7 @@ module.exports = {
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
-            notifyImmediately: false // Signal goes to queue, not immediate telegram
+            notifyImmediately: false
           });
           if (sig) results.push(sig);
         }
@@ -354,5 +355,253 @@ module.exports = {
     }
 
     return results;
+  },
+
+  // ===========================================================
+  // LOOP 2: 5-minute boundary scan.
+  // Behavior:
+  // - refresh / seed same as loop 1
+  // - check new root signals
+  // - alert only on new root signals and MTF alignment changes
+  // - send only one signal block per signal
+  // - NO summary, NO recommended blocks
+  // ===========================================================
+  startBoundaryScanLoop() {
+    setImmediate(() => {
+      this.runBoundaryScanLoop().catch((err) => {
+        logger.error({ err }, 'poller: boundary scan loop crashed');
+      });
+    });
+  },
+
+  async runBoundaryScanLoop() {
+    while (isRunning) {
+      try {
+        // Refresh/seed data like initial deploy before scanning
+        await this.initialScan();
+
+        const db = dbModule.get();
+        const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+        const validRows = rows.filter(r => isUsdtSymbol(r.symbol));
+        const rootTfs = buildRootTfs();
+
+        const seenState = dbModule.getState('poller.loop2.seen') || {};
+        const seen = new Map(Object.entries(seenState));
+
+        const newSignals = [];
+        const alignmentAlerts = [];
+
+        for (const row of validRows) {
+          const symbol = row.symbol;
+
+          for (const tf of rootTfs) {
+            const key = `${symbol}:${tf}`;
+
+            try {
+              // Always seed fresh root data before scanning for this symbol/tf
+              await this.seedKlinesForSymbol(symbol, tf);
+
+              // Only process a new signal per symbol+tf once in this loop
+              if (!seen.has(key)) {
+                const flip = await require('./macd').isMacdFlip(symbol, tf);
+                if (flip) {
+                  const sig = await signalManager.handleRootSignal({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    notifyImmediately: false
+                  });
+
+                  if (sig) {
+                    newSignals.push(sig);
+                    seen.set(key, Date.now());
+                  } else {
+                    seen.set(key, Date.now());
+                  }
+                } else {
+                  seen.set(key, Date.now());
+                }
+              }
+
+              // MTF alignment alerts for monitored/active signals
+              const latestSignals = dbModule.getLatestSignalsSnapshot();
+              const active = latestSignals.filter(s => s.symbol === symbol && s.root_tf === tf);
+
+              if (active.length > 0) {
+                const alignment = await signalManager.evaluateMtfAlignment(symbol);
+                const alignmentStateKey = `poller.loop2.alignment.${symbol}.${tf}`;
+                const prevAlignment = dbModule.getState(alignmentStateKey);
+
+                const nextAlignmentJson = JSON.stringify(alignment || {});
+                if (prevAlignment !== nextAlignmentJson) {
+                  dbModule.setState(alignmentStateKey, alignment || {});
+                  alignmentAlerts.push({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    state: 'monitor',
+                    meta: {
+                      alignment: alignment || {},
+                      decision: 'monitor',
+                      acceptReason: 'mtf_alignment_alert',
+                      tvScore: 0,
+                      tvSource: 'loop2',
+                      mtfScore: Object.keys(alignment || {}).length
+                        ? (Object.values(alignment || {}).filter(v => v && v.positive).length / Object.keys(alignment || {}).length)
+                        : 0
+                    }
+                  });
+                }
+              }
+            } catch (e) {
+              logger.debug({ e, symbol, tf }, 'poller.loop2: root check failed');
+            }
+          }
+        }
+
+        dbModule.setState('poller.loop2.seen', Object.fromEntries(seen));
+
+        // IMPORTANT: loop 2 sends only single-signal telegram blocks
+        for (const sig of newSignals) {
+          try {
+            notificationQueue.enqueueSignal(sig, 'realtime');
+            logger.info({ symbol: sig.symbol, root_tf: sig.root_tf }, 'poller.loop2: enqueued new root signal block');
+          } catch (e) {
+            logger.warn({ e, sig }, 'poller.loop2: failed to enqueue new root signal');
+          }
+        }
+
+        for (const al of alignmentAlerts) {
+          try {
+            notificationQueue.enqueueSignal(al, 'realtime');
+            logger.info({ symbol: al.symbol, root_tf: al.root_tf }, 'poller.loop2: enqueued MTF alignment alert block');
+          } catch (e) {
+            logger.warn({ e, al }, 'poller.loop2: failed to enqueue alignment alert');
+          }
+        }
+      } catch (err) {
+        logger.error({ err }, 'poller.loop2: unexpected error');
+      }
+
+      await sleep(300000); // 5 minutes
+    }
+  },
+
+  // ===========================================================
+  // LOOP 3: precise root candle open scan.
+  // Behavior:
+  // - exact root candle open detection for 60 / 240 / D
+  // - only scans on relevant open boundaries
+  // - when a relevant signal appears, uses the existing full
+  //   startup summary layout (summary + per-signal blocks + recommended blocks)
+  // ===========================================================
+  startRootCandleOpenLoop() {
+    setImmediate(() => {
+      this.runRootCandleOpenLoop().catch((err) => {
+        logger.error({ err }, 'poller: root candle open loop crashed');
+      });
+    });
+  },
+
+  getNextRootCandleOpenMs(tf) {
+    const now = new Date();
+    const ts = now.getTime();
+
+    if (normalizeRootTf(tf) === 'D') {
+      const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0));
+      return next.getTime();
+    }
+
+    if (normalizeRootTf(tf) === '60') {
+      const next = new Date(now);
+      next.setUTCMinutes(0, 0, 0);
+      next.setUTCHours(next.getUTCHours() + 1);
+      return next.getTime();
+    }
+
+    if (normalizeRootTf(tf) === '240') {
+      const next = new Date(now);
+      const currentHour = next.getUTCHours();
+      const alignedHour = Math.floor(currentHour / 4) * 4;
+      const candidate = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate(), alignedHour + 4, 0, 0, 0));
+      if (candidate.getTime() <= ts) {
+        const shifted = new Date(Date.UTC(next.getUTCFullYear(), next.getUTCMonth(), next.getUTCDate() + 1, 0, 0, 0, 0));
+        return shifted.getTime();
+      }
+      return candidate.getTime();
+    }
+
+    return ts + 60000;
+  },
+
+  getProcessedCandleKey(symbol, tf) {
+    return `poller.loop3.lastRootOpen.${symbol}.${tf}`;
+  },
+
+  async runRootCandleOpenLoop() {
+    while (isRunning) {
+      try {
+        const rootTfs = buildRootTfs();
+        const db = dbModule.get();
+        const symbols = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+
+        const candidateSignals = [];
+
+        for (const symbolRow of symbols) {
+          const symbol = symbolRow.symbol;
+          if (!isUsdtSymbol(symbol)) continue;
+
+          for (const tf of rootTfs) {
+            try {
+              // Refresh seed data before checking exact open
+              await this.seedKlinesForSymbol(symbol, tf);
+
+              const latestRows = db.prepare(
+                'SELECT open_time, close, open FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time DESC LIMIT 2'
+              ).all(symbol, tf);
+
+              if (!latestRows || latestRows.length < 2) continue;
+
+              const latestOpen = Number(latestRows[0].open_time);
+              const processedOpen = Number(dbModule.getState(this.getProcessedCandleKey(symbol, tf)) || 0);
+
+              // Only scan when the newest root candle is newer than the last processed one
+              if (latestOpen > processedOpen) {
+                const flip = await require('./macd').isMacdFlip(symbol, tf);
+                if (flip) {
+                  const sig = await signalManager.handleRootSignal({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    notifyImmediately: false
+                  });
+
+                  if (sig) {
+                    candidateSignals.push(sig);
+                  }
+                }
+
+                dbModule.setState(this.getProcessedCandleKey(symbol, tf), latestOpen);
+              }
+            } catch (e) {
+              logger.debug({ e, symbol, tf }, 'poller.loop3: root candle check failed');
+            }
+          }
+        }
+
+        // Full startup-style telegram output, but only for relevant open tf(s)
+        if (candidateSignals.length > 0) {
+          notificationQueue.enqueueStartupBatch(candidateSignals);
+          logger.info(
+            { count: candidateSignals.length },
+            'poller.loop3: enqueued full startup-style summary/recommended telegram flow'
+          );
+        }
+      } catch (err) {
+        logger.error({ err }, 'poller.loop3: unexpected error');
+      }
+
+      await sleep(60000);
+    }
   }
 };
