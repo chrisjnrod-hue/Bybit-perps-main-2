@@ -28,12 +28,15 @@ module.exports = {
     return lowercase ? label.toLowerCase() : label;
   },
 
-  _sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms || 0)); },
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms || 0));
+  },
 
   buildAlignmentLines(alignment) {
     const lines = [];
     let positiveCount = 0;
     let total = 0;
+
     for (const tf of Object.keys(alignment || {})) {
       const info = alignment[tf];
       total++;
@@ -44,6 +47,7 @@ module.exports = {
       const rise = ok ? (info.rising ? '↑' : '↓') : '';
       lines.push(`${tf}: ${posSym} ${ok ? (info.positive ? 'POS' : 'NEG') : 'unknown'} ${hist} ${rise}`.trim());
     }
+
     const mtfScore = total ? (positiveCount / total) : 0;
     return { lines: lines.join('\n'), mtfScore, positiveCount, total };
   },
@@ -100,12 +104,34 @@ module.exports = {
 
   async sendNewSignalSingleBlock(signal) {
     if (!bot) return;
+
     try {
       const baseMsg = this.buildSignalMessage(signal);
+
+      logger.debug(
+        {
+          symbol: signal?.symbol,
+          root_tf: signal?.root_tf,
+          eventId: signal?.eventId
+        },
+        'Telegram: preparing to send single signal block'
+      );
+
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, baseMsg);
-      logger.debug({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram: signal detail block sent');
+
+      logger.info(
+        {
+          symbol: signal?.symbol,
+          root_tf: signal?.root_tf,
+          eventId: signal?.eventId
+        },
+        'Telegram: signal detail block sent'
+      );
     } catch (err) {
-      logger.warn({ err }, 'Telegram: failed to send signal detail block');
+      logger.warn(
+        { err, signal },
+        'Telegram: failed to send signal detail block'
+      );
     }
   },
 
@@ -120,11 +146,15 @@ module.exports = {
         return;
       }
 
-      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow');
+      logger.info(
+        { signalCount: signals.length },
+        'Telegram: starting startup summary flow'
+      );
 
       // STEP 1: Send startup header with summary counts
       const tfCounts = {};
       const symbolSet = new Set();
+
       for (const s of signals) {
         const tf = String(s.root_tf || 'unknown');
         tfCounts[tf] = (tfCounts[tf] || 0) + 1;
@@ -134,6 +164,7 @@ module.exports = {
       const orderedRootTfs = Array.isArray(config.ROOT_TFS) && config.ROOT_TFS.length
         ? config.ROOT_TFS.map(String)
         : Object.keys(tfCounts);
+
       for (const tf of Object.keys(tfCounts)) {
         if (!orderedRootTfs.includes(tf)) orderedRootTfs.push(tf);
       }
@@ -154,15 +185,62 @@ module.exports = {
         return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
       });
 
+      logger.info(
+        {
+          totalSignals: signals.length,
+          firstSignal: signals[0]?.symbol || null,
+          lastSignal: signals[signals.length - 1]?.symbol || null
+        },
+        'Telegram: about to send per-signal blocks'
+      );
+
       for (let i = 0; i < signals.length; i++) {
+        const signal = signals[i];
+
         try {
-          await this.sendNewSignalSingleBlock(signals[i]);
-          logger.debug({ symbol: signals[i].symbol, index: i + 1, total: signals.length }, 'Telegram: signal block sent');
+          logger.debug(
+            {
+              index: i + 1,
+              total: signals.length,
+              symbol: signal?.symbol,
+              root_tf: signal?.root_tf,
+              eventId: signal?.eventId
+            },
+            'Telegram: sending signal block'
+          );
+
+          await this.sendNewSignalSingleBlock(signal);
+
+          logger.info(
+            {
+              index: i + 1,
+              total: signals.length,
+              symbol: signal?.symbol,
+              root_tf: signal?.root_tf,
+              eventId: signal?.eventId
+            },
+            'Telegram: signal block completed'
+          );
         } catch (e) {
-          logger.warn({ err: e, symbol: signals[i].symbol }, 'Telegram: failed to send signal block');
+          logger.warn(
+            {
+              err: e,
+              index: i + 1,
+              total: signals.length,
+              symbol: signal?.symbol,
+              root_tf: signal?.root_tf
+            },
+            'Telegram: failed to send signal block'
+          );
         }
+
         await this._sleep(config.TELEGRAM_SEND_DELAY_MS || 100);
       }
+
+      logger.info(
+        { totalSignals: signals.length },
+        'Telegram: completed per-signal block loop'
+      );
 
       // STEP 3: Send recommended trades block
       let openCount = 0;
@@ -173,6 +251,7 @@ module.exports = {
         logger.debug({ e }, 'Telegram: failed to read open trades count');
         openCount = 0;
       }
+
       const maxSlots = Math.max(0, config.MAX_OPEN_TRADES - openCount);
       const recHeader = `📈 Recommended to Open (${maxSlots} slots available):`;
       await bot.sendMessage(config.TELEGRAM_CHAT_ID, recHeader);
