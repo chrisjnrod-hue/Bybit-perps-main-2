@@ -1,8 +1,7 @@
 /**
  * src/services/bybitRest.js
  *
- * FULLY UPDATED for cursor-based pagination and WS fallback.
- * Includes daily interval normalization: 1d / 1D / D -> D
+ * Cursor-based pagination + robust kline normalization.
  */
 
 const fetch = require('node-fetch');
@@ -86,6 +85,7 @@ loadChosenBaseFromDisk();
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 7000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeoutMs);
+
   try {
     const merged = { ...opts, signal: controller.signal };
     const res = await fetch(url, merged);
@@ -119,7 +119,10 @@ function getOrderBase() {
     return MAINNET ? 'https://api.bybit.com' : 'https://api-testnet.bybit.com';
   }
 
-  const useTestnetRaw = typeof process.env.BYBIT_USE_TESTNET !== 'undefined' ? String(process.env.BYBIT_USE_TESTNET) : null;
+  const useTestnetRaw = typeof process.env.BYBIT_USE_TESTNET !== 'undefined'
+    ? String(process.env.BYBIT_USE_TESTNET)
+    : null;
+
   if (useTestnetRaw !== null) {
     const val = useTestnetRaw.toLowerCase();
     if (val === '1' || val === 'true' || val === 'yes') return 'https://api-testnet.bybit.com';
@@ -138,12 +141,14 @@ async function probeHosts(timeoutMs = 5000) {
 
   for (const host of list) {
     const testUrl = `${host.replace(/\/$/, '')}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=1`;
+
     try {
       const res = await fetchWithTimeout(testUrl, { method: 'GET' }, timeoutMs);
       logger.info({ host, status: res.status }, 'probeHosts: host responded');
 
       let text = null;
       let parsed = null;
+
       try {
         text = await res.text();
         try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
@@ -152,7 +157,10 @@ async function probeHosts(timeoutMs = 5000) {
       }
 
       if (res.ok) {
-        const ct = (res.headers && typeof res.headers.get === 'function') ? (res.headers.get('content-type') || '') : '';
+        const ct = (res.headers && typeof res.headers.get === 'function')
+          ? (res.headers.get('content-type') || '')
+          : '';
+
         const looksLikeJson = /application\/json/i.test(ct) || (text && text.trim().startsWith('{'));
         const parsedOkApi = parsed && (parsed.result || typeof parsed.ret_code !== 'undefined' || typeof parsed.retCode !== 'undefined');
 
@@ -205,14 +213,18 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
   try {
     const qUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${perPage}&page=1&sparkline=false`;
     const res = await fetchWithTimeout(qUrl, { method: 'GET' }, 8000);
+
     if (!res.ok) {
       logger.warn({ status: res.status }, 'CoinGecko fallback: non-ok response');
       return [];
     }
+
     const arr = await res.json().catch(() => null);
     if (!Array.isArray(arr)) return [];
+
     const mapped = [];
     const seen = new Set();
+
     for (const it of arr) {
       if (!it || !it.symbol) continue;
       const base = String(it.symbol).toUpperCase();
@@ -222,6 +234,7 @@ async function fetchSymbolsFromCoinGecko(perPage = 500) {
         mapped.push({ symbol: candidate, base, quote: 'USDT', status: 'unknown' });
       }
     }
+
     logger.info({ count: mapped.length }, 'fetchSymbolsFromCoinGecko: fallback symbols prepared');
     return mapped;
   } catch (err) {
@@ -259,6 +272,7 @@ async function fetchAllSymbols() {
         instrumentType: 'PERPETUAL',
         limit: String(limit)
       };
+
       if (cursor) params.cursor = cursor;
 
       const url = new URL(`${base.replace(/\/$/, '')}/v5/market/instruments-info`);
@@ -268,13 +282,16 @@ async function fetchAllSymbols() {
 
       logger.info({ page: pageNum, cursor: cursor || 'initial', limit, url: url.toString() }, 'fetchAllSymbols: fetching page');
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 10000);
+
       let json = null;
       let bodyText = null;
 
       try {
         bodyText = await res.text();
         try { json = JSON.parse(bodyText); } catch (e) { json = null; }
-      } catch (e) { bodyText = null; }
+      } catch (e) {
+        bodyText = null;
+      }
 
       if (!res.ok) {
         logger.warn({ status: res.status, page: pageNum, url: url.toString() }, 'fetchAllSymbols: HTTP error, stopping pagination');
@@ -289,6 +306,7 @@ async function fetchAllSymbols() {
       if (typeof json.ret_code !== 'undefined' || typeof json.retCode !== 'undefined') {
         const rc = typeof json.ret_code !== 'undefined' ? json.ret_code : json.retCode;
         const rm = json.ret_msg || json.retMsg || null;
+
         if (rc !== 0) {
           logger.warn({ retCode: rc, retMsg: rm, page: pageNum }, 'fetchAllSymbols: API returned non-zero retCode, stopping pagination');
           break;
@@ -305,6 +323,7 @@ async function fetchAllSymbols() {
         const filtered = instruments
           .filter(it => {
             if (!it || !it.symbol) return false;
+
             try {
               const sym = String(it.symbol);
               const su = sym.toUpperCase();
@@ -428,11 +447,13 @@ function getSeedSymbols(symbols) {
         { count: invalidSymbols.length, samples: invalidSymbols.slice(0, 5).map(s => s.symbol) },
         'getSeedSymbols: WARNING - found invalid symbols in seed list! These will be filtered out.'
       );
+
       const filtered = symbols.filter(s => {
         const sym = String(s.symbol || '').toUpperCase();
         if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return false;
         return /USDT(\.P)?$/.test(sym);
       });
+
       logger.info(
         { totalSymbols: symbols.length, validSymbols: filtered.length },
         'getSeedSymbols: SYMBOL_SEED_ALL=true, seeding valid USDT symbols only'
@@ -454,6 +475,100 @@ function getSeedSymbols(symbols) {
   return [];
 }
 
+function normalizeKlineTimestamp(value) {
+  const timestamp = Number(value);
+
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return null;
+  }
+
+  // Bybit v5 returns milliseconds. Some legacy endpoints return seconds.
+  if (timestamp < 100000000000) {
+    return timestamp * 1000;
+  }
+
+  return timestamp;
+}
+
+function normalizeKlineRow(row) {
+  if (!row) return null;
+
+  const rawTime = Array.isArray(row)
+    ? row[0]
+    : (
+        row.start ??
+        row.start_at ??
+        row.open_time ??
+        row.openTime ??
+        row.t
+      );
+
+  const openTime = normalizeKlineTimestamp(rawTime);
+
+  if (!Number.isFinite(openTime)) {
+    return null;
+  }
+
+  const open = Array.isArray(row)
+    ? row[1]
+    : (row.open ?? row.o);
+
+  const high = Array.isArray(row)
+    ? row[2]
+    : (row.high ?? row.h);
+
+  const low = Array.isArray(row)
+    ? row[3]
+    : (row.low ?? row.l);
+
+  const close = Array.isArray(row)
+    ? row[4]
+    : (row.close ?? row.c);
+
+  const volume = Array.isArray(row)
+    ? row[5]
+    : (row.volume ?? row.v);
+
+  const normalized = {
+    open_time: openTime,
+    open: Number(open),
+    high: Number(high),
+    low: Number(low),
+    close: Number(close),
+    volume: Number(volume)
+  };
+
+  if (
+    !Number.isFinite(normalized.open) ||
+    !Number.isFinite(normalized.high) ||
+    !Number.isFinite(normalized.low) ||
+    !Number.isFinite(normalized.close)
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function normalizeKlineList(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+
+  const unique = new Map();
+
+  for (const row of list) {
+    const normalized = normalizeKlineRow(row);
+
+    if (normalized) {
+      unique.set(normalized.open_time, normalized);
+    }
+  }
+
+  return Array.from(unique.values())
+    .sort((a, b) => a.open_time - b.open_time);
+}
+
 async function fetchKlines(symbol, interval, limit = 200) {
   const base = getBase();
   if (!base) {
@@ -464,87 +579,73 @@ async function fetchKlines(symbol, interval, limit = 200) {
   const normalizedInterval = normalizeTf(interval);
 
   const candidates = [
-    { path: '/v5/market/kline', params: { category: 'linear', symbol, interval: normalizedInterval, limit: String(limit) } },
-    { path: '/v2/public/kline', params: { symbol, interval: normalizedInterval, limit: String(limit) } },
-    { path: '/v2/public/kline/list', params: { symbol, interval: normalizedInterval, limit: String(limit) } }
+    {
+      path: '/v5/market/kline',
+      params: {
+        category: 'linear',
+        symbol,
+        interval: normalizedInterval,
+        limit: String(limit)
+      }
+    },
+    {
+      path: '/v2/public/kline',
+      params: {
+        symbol,
+        interval: normalizedInterval,
+        limit: String(limit)
+      }
+    },
+    {
+      path: '/v2/public/kline/list',
+      params: {
+        symbol,
+        interval: normalizedInterval,
+        limit: String(limit)
+      }
+    }
   ];
 
-  for (const c of candidates) {
+  for (const candidate of candidates) {
     try {
-      const url = new URL(`${base.replace(/\/$/, '')}${c.path}`);
-      Object.entries(c.params || {}).forEach(([k, v]) => {
+      const url = new URL(`${base.replace(/\/$/, '')}${candidate.path}`);
+      Object.entries(candidate.params || {}).forEach(([k, v]) => {
         if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
       });
 
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       let json = null;
-      try { json = await res.json(); } catch (e) { json = null; }
+
+      try {
+        json = await res.json();
+      } catch (e) {
+        json = null;
+      }
 
       if (!res.ok) {
-        logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchKlines: HTTP error on base');
+        logger.debug({ base, path: candidate.path, status: res.status, body: json }, 'fetchKlines: HTTP error on base');
         continue;
       }
 
+      let rawList = [];
+
       if (json && json.result && Array.isArray(json.result.list)) {
-        const list = json.result.list;
-        return list.map(r => ({
-          open_time: r.start || r.t || r.open_time || r[0],
-          open: Number(r.open || r.o || r[1] || 0),
-          high: Number(r.high || r.h || r[2] || 0),
-          low: Number(r.low || r.l || r[3] || 0),
-          close: Number(r.close || r.c || r[4] || 0),
-          volume: Number(r.volume || r.v || r[5] || 0)
-        }));
+        rawList = json.result.list;
+      } else if (json && json.result && Array.isArray(json.result)) {
+        rawList = json.result;
+      } else if (Array.isArray(json)) {
+        rawList = json;
       }
 
-      if (json && json.result && Array.isArray(json.result)) {
-        const arr = json.result;
-        if (arr.length && Array.isArray(arr[0])) {
-          return arr.map(r => ({
-            open_time: r[0],
-            open: Number(r[1]),
-            high: Number(r[2]),
-            low: Number(r[3]),
-            close: Number(r[4]),
-            volume: Number(r[5])
-          }));
-        } else if (arr.length && typeof arr[0] === 'object') {
-          return arr.map(r => ({
-            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-            open: Number(r.open || r.o || r[1] || 0),
-            high: Number(r.high || r.h || r[2] || 0),
-            low: Number(r.low || r.l || r[3] || 0),
-            close: Number(r.close || r.c || r[4] || 0),
-            volume: Number(r.volume || r.v || r[5] || 0)
-          }));
-        }
+      const normalized = normalizeKlineList(rawList);
+
+      if (normalized.length > 0) {
+        return normalized;
       }
 
-      if (Array.isArray(json)) {
-        if (json.length && Array.isArray(json[0])) {
-          return json.map(r => ({
-            open_time: r[0],
-            open: Number(r[1]),
-            high: Number(r[2]),
-            low: Number(r[3]),
-            close: Number(r[4]),
-            volume: Number(r[5])
-          }));
-        } else if (json.length && typeof json[0] === 'object') {
-          return json.map(r => ({
-            open_time: r.start || r.start_at || r.t || r.open_time || r[0],
-            open: Number(r.open || r.o || r[1] || 0),
-            high: Number(r.high || r.h || r[2] || 0),
-            low: Number(r.low || r.l || r[3] || 0),
-            close: Number(r.close || r.c || r[4] || 0),
-            volume: Number(r.volume || r.v || r[5] || 0)
-          }));
-        }
-      }
-
-      logger.debug({ base, path: c.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate endpoint');
+      logger.debug({ base, path: candidate.path, body: json }, 'fetchKlines: unexpected shape, trying next candidate endpoint');
     } catch (err) {
-      logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
+      logger.debug({ base, path: candidate.path, err: err && err.message ? err.message : String(err) }, 'fetchKlines: candidate threw');
     }
   }
 
@@ -570,8 +671,10 @@ async function fetchTicker24h(symbol) {
       Object.entries(c.params || {}).forEach(([k, v]) => {
         if (v !== undefined && v !== null) url.searchParams.append(k, String(v));
       });
+
       const res = await fetchWithTimeout(url.toString(), { method: 'GET' }, 8000);
       const json = await res.json().catch(() => null);
+
       if (!res.ok) {
         logger.debug({ base, path: c.path, status: res.status, body: json }, 'fetchTicker24h: HTTP error on base');
         continue;
@@ -607,6 +710,7 @@ async function fetchTicker24h(symbol) {
       logger.debug({ base, path: c.path, err: err && err.message ? err.message : String(err) }, 'fetchTicker24h: candidate threw');
     }
   }
+
   return null;
 }
 
@@ -622,6 +726,7 @@ async function getWalletBalance(coin = 'USDT') {
   logger.debug({ base, coin }, 'getWalletBalance: using order base for wallet balance');
   const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
   const url = `${base}${requestPath}`;
+
   const headers = {
     'Content-Type': 'application/json',
     'X-BAPI-API-KEY': apiKey,
@@ -632,6 +737,7 @@ async function getWalletBalance(coin = 'USDT') {
 
   const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
+
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'getWalletBalance HTTP error');
     throw new Error(`getWalletBalance HTTP ${res.status}`);
@@ -642,6 +748,7 @@ async function getWalletBalance(coin = 'USDT') {
     if (json.result[coin]) return json.result[coin];
     return json.result;
   }
+
   return json;
 }
 
@@ -660,6 +767,7 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
     qty: String(qty),
     reduceOnly: Boolean(reduceOnly)
   };
+
   if (tp) bodyObj.takeProfit = String(tp);
   if (sl) bodyObj.stopLoss = String(sl);
 
@@ -673,11 +781,13 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
   }
 
   const bodyStr = JSON.stringify(bodyObj);
-  const requestPath = `/v5/order/create`;
+  const requestPath = '/v5/order/create';
   const base = getOrderBase();
   logger.info({ base, symbol, qty, side }, 'placeMarketOrderV5: placing order (real)');
+
   const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
   const url = `${base}${requestPath}`;
+
   const headers = {
     'Content-Type': 'application/json',
     'X-BAPI-API-KEY': apiKey,
@@ -688,10 +798,12 @@ async function placeMarketOrderV5({ category = 'linear', symbol, side = 'Buy', q
 
   const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
   const json = await res.json().catch(() => null);
+
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'placeMarketOrderV5 HTTP error');
     throw new Error(`placeMarketOrderV5 HTTP ${res.status}`);
   }
+
   return json;
 }
 
@@ -715,11 +827,13 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
   }
 
   const bodyStr = JSON.stringify(bodyObj);
-  const requestPath = `/v5/position/trading-stop`;
+  const requestPath = '/v5/position/trading-stop';
   const base = getOrderBase();
   logger.info({ base, symbol }, 'setPositionTradingStop: sending real trading stop');
+
   const { signature, timestamp } = signV5Request('POST', requestPath, bodyStr, apiSecret);
   const url = `${base}${requestPath}`;
+
   const headers = {
     'Content-Type': 'application/json',
     'X-BAPI-API-KEY': apiKey,
@@ -730,10 +844,12 @@ async function setPositionTradingStop({ category = 'linear', symbol, stopLoss })
 
   const res = await fetchWithTimeout(url, { method: 'POST', body: bodyStr, headers }, 9000);
   const json = await res.json().catch(() => null);
+
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'setPositionTradingStop HTTP error');
     throw new Error(`setPositionTradingStop HTTP ${res.status}`);
   }
+
   return json;
 }
 
@@ -745,13 +861,14 @@ async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
   const params = new URLSearchParams();
   if (category) params.append('category', category);
   if (symbol) params.append('symbol', symbol);
-  const requestPath = `/v5/order/realtime${params.toString() ? `?${params.toString()}` : ''}`;
 
+  const requestPath = `/v5/order/realtime${params.toString() ? `?${params.toString()}` : ''}`;
   const base = getOrderBase();
   logger.debug({ base }, 'fetchOpenOrders: using order base');
-  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
 
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
   const url = `${base}${requestPath}`;
+
   const headers = {
     'Content-Type': 'application/json',
     'X-BAPI-API-KEY': apiKey,
@@ -762,10 +879,12 @@ async function fetchOpenOrders({ category = 'linear', symbol = null } = {}) {
 
   const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
+
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'fetchOpenOrders HTTP error');
     throw new Error(`fetchOpenOrders HTTP ${res.status}`);
   }
+
   return json;
 }
 
@@ -777,13 +896,14 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
   const params = new URLSearchParams();
   if (category) params.append('category', category);
   if (symbol) params.append('symbol', symbol);
-  const requestPath = `/v5/position/list${params.toString() ? `?${params.toString()}` : ''}`;
 
+  const requestPath = `/v5/position/list${params.toString() ? `?${params.toString()}` : ''}`;
   const base = getOrderBase();
   logger.debug({ base }, 'fetchOpenPositions: using order base');
-  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
 
+  const { signature, timestamp } = signV5Request('GET', requestPath, '', apiSecret);
   const url = `${base}${requestPath}`;
+
   const headers = {
     'Content-Type': 'application/json',
     'X-BAPI-API-KEY': apiKey,
@@ -794,10 +914,12 @@ async function fetchOpenPositions({ category = 'linear', symbol = null } = {}) {
 
   const res = await fetchWithTimeout(url, { method: 'GET', headers }, 9000);
   const json = await res.json().catch(() => null);
+
   if (!res.ok) {
     logger.warn({ url, status: res.status, body: json }, 'fetchOpenPositions HTTP error');
     throw new Error(`fetchOpenPositions HTTP ${res.status}`);
   }
+
   return json;
 }
 
