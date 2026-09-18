@@ -22,14 +22,27 @@ function normalizeTimeframe(timeframe) {
 function timeframeMs(timeframe) {
   const tf = normalizeTimeframe(timeframe);
 
-  if (tf === 'D') return 24 * 60 * 60 * 1000;
-  if (tf === 'W') return 7 * 24 * 60 * 60 * 1000;
-  if (tf === 'M') return 30 * 24 * 60 * 60 * 1000;
+  if (tf === 'D' || tf === '1D' || tf === '1d') return 24 * 60 * 60 * 1000;
+  if (tf === 'W' || tf === '1W' || tf === '1w') return 7 * 24 * 60 * 60 * 1000;
+  if (tf === 'M' || tf === '1M' || tf === '1m' && tf.toUpperCase() === '1M') return 30 * 24 * 60 * 60 * 1000;
 
-  const minutes = Number(tf);
-  return Number.isFinite(minutes) && minutes > 0
-    ? minutes * 60 * 1000
-    : null;
+  // Handles strings like "15", "15m", "1h", "4h", "240", "60", "D", etc.
+  const match = String(tf).trim().match(/^(\d+)([mhdwMHDW]?)$/);
+  if (match) {
+    const val = Number(match[1]);
+    const unit = (match[2] || 'm').toLowerCase();
+    if (unit === 'm') return val * 60 * 1000;
+    if (unit === 'h') return val * 60 * 60 * 1000;
+    if (unit === 'd') return val * 24 * 60 * 60 * 1000;
+    if (unit === 'w') return val * 7 * 24 * 60 * 60 * 1000;
+  }
+
+  const numeric = Number(tf);
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric * 60 * 1000;
+  }
+
+  return null;
 }
 
 function currentCandleOpenTime(timeframe, now = Date.now()) {
@@ -45,6 +58,7 @@ module.exports = {
     const db = dbModule.get();
     const normalizedTf = normalizeTimeframe(timeframe);
 
+    // Fetch the LATEST rows using DESC order in a subquery, then order ASC for indicator math
     const rows = db.prepare(`
       SELECT open_time, close
       FROM (
@@ -58,10 +72,16 @@ module.exports = {
     `).all(symbol, normalizedTf, limit);
 
     return rows
-      .map(row => ({
-        time: Number(row.open_time),
-        close: Number(row.close)
-      }))
+      .map(row => {
+        let t = Number(row.open_time);
+        if (Number.isFinite(t) && t < 1e11) {
+          t = t * 1000; // Normalize seconds to milliseconds
+        }
+        return {
+          time: t,
+          close: Number(row.close)
+        };
+      })
       .filter(row => Number.isFinite(row.time) && Number.isFinite(row.close));
   },
 
@@ -78,15 +98,11 @@ module.exports = {
         ...macdOptions
       });
 
-      if (!Array.isArray(output) || output.length === 0) {
-        return null;
-      }
-
       const offset = closes.length - output.length;
 
       return output
         .map((item, index) => ({
-          time: series[offset + index] ? series[offset + index].time : null,
+          time: series[offset + index].time,
           MACD: item.MACD,
           signal: item.signal,
           histogram: item.histogram
@@ -106,7 +122,7 @@ module.exports = {
    *
    * If the database contains the currently forming candle, it is excluded.
    * If the database contains only closed candles, the latest row is treated
-   * as closed. This prevents the signal from being delayed by one candle.
+   * as closed.
    */
   async getClosedMacdHistogram(symbol, timeframe) {
     const normalizedTf = normalizeTimeframe(timeframe);
@@ -151,6 +167,7 @@ module.exports = {
 
         return {
           symbol,
+          root_tf: normalizedTf,
           timeframe: normalizedTf,
           candleTime,
           eventId: `${symbol}_${normalizedTf}_${candleTime}`,
@@ -171,10 +188,6 @@ module.exports = {
     return Boolean(event);
   },
 
-  /**
-   * Loop 3 uses the same closed-candle transition, but poller.js ensures
-   * that the event is evaluated only once when a new root candle opens.
-   */
   async isMacdFlipAtOpen(symbol, timeframe) {
     const event = await this.getMacdFlipEvent(symbol, timeframe);
     return Boolean(event);
