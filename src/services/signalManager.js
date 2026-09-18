@@ -25,9 +25,9 @@ function normalizeEventId(symbol, root_tf, eventId, candleTime) {
   return `${String(symbol)}_${String(root_tf)}_${Number(candleTime || Date.now())}`;
 }
 
-function processedEventKey(eventId) {
+function persistentEventKey(eventId) {
   if (!eventId) return null;
-  return `macd_event_processed:${eventId}`;
+  return `macd_event_claimed:${eventId}`;
 }
 
 module.exports = {
@@ -61,24 +61,38 @@ module.exports = {
     candleTime = null
   } = {}) {
     const key = `${symbol}:${root_tf}`;
+
     if (inProgress.has(key)) {
       logger.debug({ key }, 'handleRootSignal: already in progress');
       return null;
     }
+
     inProgress.set(key, true);
 
     const finalEventId = normalizeEventId(symbol, root_tf, eventId, candleTime);
-    const persistKey = processedEventKey(finalEventId);
+    const persistKey = persistentEventKey(finalEventId);
 
     try {
-      if (persistKey && dbModule.getState(persistKey)) {
-        logger.debug({ symbol, root_tf, eventId: finalEventId }, 'handleRootSignal: event already processed');
-        return null;
+      if (persistKey) {
+        const claimed = dbModule.claimState(persistKey, {
+          symbol,
+          root_tf,
+          eventId: finalEventId,
+          claimedAt: Date.now()
+        });
+
+        if (!claimed) {
+          logger.debug(
+            { symbol, root_tf, eventId: finalEventId },
+            'handleRootSignal: event already claimed'
+          );
+          return null;
+        }
       }
 
       logger.info({ symbol, root_tf, eventId: finalEventId }, 'Root signal received');
 
-      // ALWAYS fetch fresh market data
+      // Always fetch fresh market data
       let mdata = null;
       try {
         mdata = await marketData.updateSymbolMarketData(symbol);
@@ -130,10 +144,6 @@ module.exports = {
 
       dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
 
-      if (persistKey) {
-        dbModule.setState(persistKey, true);
-      }
-
       const signalObj = {
         key,
         symbol,
@@ -160,18 +170,21 @@ module.exports = {
           logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
         } else {
           let passFilters = true;
+
           if (config.MIN_MARKET_CAP > 0) {
             if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
               passFilters = false;
               logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
+
           if (config.MIN_24H_USDT_VOLUME > 0) {
             if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
               passFilters = false;
               logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
+
           if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
             const change = mdata?.volume_change_pct;
             if (change === null || change === undefined) {
@@ -202,10 +215,14 @@ module.exports = {
 
       return signalObj;
     } catch (err) {
+      if (persistKey) {
+        dbModule.releaseState(persistKey);
+      }
+
       logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
       return null;
     } finally {
-      setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
+      inProgress.delete(key);
     }
   },
 
@@ -248,10 +265,11 @@ module.exports = {
       return { decision: 'reject', reason: 'no_mtf_data' };
     }
 
-    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    const allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
     if (allPositive) return { decision: 'accept', reason: 'all_positive' };
 
     const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
+
     if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
       const d = alignment['D'];
       if (d && d.rising) return { decision: 'accept', reason: 'daily_rising' };
