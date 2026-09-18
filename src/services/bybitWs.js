@@ -1,3 +1,4 @@
+// src/services/bybitWs.js
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const config = require('../config');
@@ -11,16 +12,10 @@ function envBool(name, defaultVal = false) {
 
 const MAINNET = envBool('MAINNET', true);
 
-function normalizeTf(tf) {
-  if (!tf) return tf;
-  const t = String(tf).trim();
-  if (/^1d$/i.test(t) || /^D$/i.test(t)) return 'D';
-  return t;
-}
-
 function getWsUrl() {
   const explicit = process.env.BYBIT_WS_PUBLIC || (config && config.BYBIT_WS_PUBLIC);
   if (explicit) return String(explicit);
+  // Fallback to realtime_public (not v5)
   return MAINNET ? 'wss://stream.bybit.com/realtime_public' : 'wss://stream-testnet.bybit.com/realtime_public';
 }
 
@@ -60,7 +55,7 @@ class WSManager extends EventEmitter {
   }
 
   intervalToTopicPart(tf) {
-    const normalized = normalizeTf(tf);
+    // realtime_public format: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, M, W, Y
     const tfMap = {
       '1': '1',
       '3': '3',
@@ -77,7 +72,7 @@ class WSManager extends EventEmitter {
       'W': 'W',
       'Y': 'Y'
     };
-    return tfMap[String(normalized)] || String(normalized);
+    return tfMap[String(tf)] || String(tf);
   }
 
   _createConnection() {
@@ -103,7 +98,7 @@ class WSManager extends EventEmitter {
 
     ws.on('open', () => {
       conn.ready = true;
-      conn.reconnectRetries = 0;
+      conn.reconnectRetries = 0; // Reset reconnect counter on successful connection
       logger.info({ connId: conn.id, wsUrl }, 'WS connection opened');
       if (conn.pendingTopics && conn.pendingTopics.size) {
         logger.info({ connId: conn.id, pending: conn.pendingTopics.size }, 'Flushing pending subscribe topics on open');
@@ -114,34 +109,38 @@ class WSManager extends EventEmitter {
     ws.on('message', (msg) => {
       try {
         const data = JSON.parse(msg);
-
+        
         if (data && data.op === 'ping') {
           try { ws.send(JSON.stringify({ op: 'pong' })); } catch (e) { /* ignore */ }
           return;
         }
 
+        // Handle kline data (realtime_public format)
         if (data && data.topic && Array.isArray(data.data) && data.data.length > 0) {
           const topic = String(data.topic);
-
+          
+          // realtime_public format: "candle.{interval}.{symbol}"
           if (topic.startsWith('candle.')) {
             const parts = topic.split('.');
             if (parts.length >= 3) {
-              const tf = normalizeTf(parts[1]);
+              const tf = parts[1];
               const sym = parts.slice(2).join('.');
-
+              
               if (!sym || !validateSymbol(sym)) {
                 logger.debug({ symbol: sym }, 'Kline received for filtered-out symbol, ignoring');
                 return;
               }
-
+              
               const d = data.data[0];
               if (d) {
                 try {
                   const k = this.normalizeKlinePayload(d, tf, sym);
-
-                  if (!this.klineBuffer.has(sym)) this.klineBuffer.set(sym, {});
+                  
+                  if (!this.klineBuffer.has(sym)) {
+                    this.klineBuffer.set(sym, {});
+                  }
                   this.klineBuffer.get(sym)[tf] = k;
-
+                  
                   this.emit('kline', { symbol: sym, timeframe: tf, data: k, raw: data });
                   logger.debug({ symbol: sym, timeframe: tf, close: k.close }, 'Kline received');
                 } catch (normErr) {
@@ -153,11 +152,12 @@ class WSManager extends EventEmitter {
           return;
         }
 
+        // Handle subscription responses
         if (data && (data.success !== undefined || data.ret_code !== undefined)) {
           const success = data.success !== false && data.ret_code === 0;
           if (!success) {
-            logger.warn({
-              connId: conn.id,
+            logger.warn({ 
+              connId: conn.id, 
               success: data.success,
               retCode: data.ret_code,
               retMsg: data.ret_msg || data.msg || 'unknown',
@@ -186,30 +186,41 @@ class WSManager extends EventEmitter {
       this.connections = this.connections.filter(c => c !== conn);
       this.openSockets = Math.max(0, this.openSockets - 1);
 
-      if (conn._retryTimer) { clearTimeout(conn._retryTimer); conn._retryTimer = null; }
-      if (conn._reconnectTimer) { clearTimeout(conn._reconnectTimer); conn._reconnectTimer = null; }
+      // Clear any pending timers
+      if (conn._retryTimer) {
+        clearTimeout(conn._retryTimer);
+        conn._retryTimer = null;
+      }
+      if (conn._reconnectTimer) {
+        clearTimeout(conn._reconnectTimer);
+        conn._reconnectTimer = null;
+      }
 
+      // Re-subscribe symbols with exponential backoff (only if not too many retries)
       if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries < 5) {
         logger.info({ connId: conn.id, recoverCount: symbolsToRecover.length, retryAttempt: conn.reconnectRetries + 1 }, 'Re-queueing symbols from closed connection');
-
+        
         const recoveryDelay = Math.min(
           WS_RECONNECT_DELAY_MS * Math.pow(WS_RECONNECT_BACKOFF_FACTOR, conn.reconnectRetries),
           WS_RECONNECT_MAX_MS
         );
         conn.reconnectRetries++;
-
+        
         conn._reconnectTimer = setTimeout(() => {
           conn._reconnectTimer = null;
           for (const sym of symbolsToRecover) {
             try {
+              // Only re-subscribe if symbol is not already in another connection
               const existing = this.symbolToConn.get(sym);
-              if (!existing) this.subscribeSymbolMTF(sym);
+              if (!existing) {
+                this.subscribeSymbolMTF(sym);
+              }
             } catch (e) {
               logger.debug({ err: e, symbol: sym }, 'Error re-subscribing symbol');
             }
           }
         }, recoveryDelay);
-
+        
         logger.debug({ connId: conn.id, recoveryDelayMs: recoveryDelay }, 'Scheduled symbol recovery for connection');
       } else if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries >= 5) {
         logger.warn({ connId: conn.id, recoverCount: symbolsToRecover.length, retries: conn.reconnectRetries }, 'Max reconnect retries reached, abandoning symbol recovery');
@@ -233,25 +244,27 @@ class WSManager extends EventEmitter {
       }
 
       try {
+        // realtime_public format: { "op": "subscribe", "args": ["candle.60.BTCUSDT"] }
         const payload = { op, args: topicsArray };
         const payloadStr = JSON.stringify(payload);
-
-        logger.debug({ connId: conn.id, op, batchSize: topicsArray.length, payload: payloadStr }, 'Sending subscription batch');
-
+        
+        logger.debug({ 
+          connId: conn.id, 
+          op, 
+          batchSize: topicsArray.length,
+          payload: payloadStr
+        }, 'Sending subscription batch');
+        
         conn.ws.send(payloadStr, (err) => {
           if (err) {
             for (const t of topicsArray) conn.pendingTopics.add(t);
             logger.warn({ err: err && err.message ? err.message : err, connId: conn.id, op, batchSize: topicsArray.length }, 'Failed to send batch; queued for retry');
             return reject(err);
           }
-
           for (const t of topicsArray) {
             conn.pendingTopics.delete(t);
-
-            if (op === 'subscribe') conn._topics.add(t);
-            else conn._topics.delete(t);
+            conn._topics.add(t);
           }
-
           conn.retryDelayMs = WS_SUBSCRIBE_RETRY_BASE_MS;
           logger.debug({ connId: conn.id, op, batchSize: topicsArray.length }, 'Batch sent successfully');
           return resolve();
@@ -319,7 +332,9 @@ class WSManager extends EventEmitter {
 
   _getOrCreateTargetConnection() {
     let target = this.connections.find(c => c.symbols.size < this.batchSize);
-    if (!target) target = this._createConnection();
+    if (!target) {
+      target = this._createConnection();
+    }
     return target;
   }
 
@@ -333,7 +348,7 @@ class WSManager extends EventEmitter {
       return this.symbolToConn.get(symbol);
     }
 
-    const timeframes = (tfs || config.MTF_TFS || ['5', '15', '60', '240', 'D']).map(normalizeTf);
+    const timeframes = tfs || config.MTF_TFS || ['5', '15', '60', '240', 'D'];
     const target = this._getOrCreateTargetConnection();
     if (!target) {
       logger.warn({ symbol }, 'No available WS connection could be created for subscription');
@@ -343,6 +358,7 @@ class WSManager extends EventEmitter {
     const topics = [];
     for (const tf of timeframes) {
       const tfPart = this.intervalToTopicPart(tf);
+      // realtime_public format: candle.{interval}.{symbol}
       topics.push(`candle.${tfPart}.${symbol}`);
     }
 
@@ -355,7 +371,7 @@ class WSManager extends EventEmitter {
     this.symbolToConn.set(symbol, target);
 
     logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size }, 'Queued symbol for subscription (pending until socket OPEN)');
-
+    
     if (target.ws && target.ws.readyState === WebSocket.OPEN) {
       this._flushPendingForConn(target);
     } else {
@@ -369,7 +385,7 @@ class WSManager extends EventEmitter {
       logger.debug({ symbol }, 'Symbol not found in subscriptions');
       return;
     }
-
+    
     const conn = this.symbolToConn.get(symbol);
     if (!conn) return;
 
@@ -391,6 +407,8 @@ class WSManager extends EventEmitter {
           logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception sending unsubscribe');
         }
       }
+    } else {
+      logger.debug({ connId: conn.id, reason: conn.ws ? `readyState=${conn.ws.readyState}` : 'no-ws', queuedUnsubs: topicsToUnsub.length }, 'Socket not OPEN, unsubscriptions queued or removed');
     }
 
     conn.symbols.delete(symbol);
@@ -398,6 +416,7 @@ class WSManager extends EventEmitter {
     this.klineBuffer.delete(symbol);
     logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');
 
+    // Close connection if no more symbols
     if (conn.symbols.size === 0) {
       try {
         if (conn._retryTimer) clearTimeout(conn._retryTimer);
@@ -411,7 +430,8 @@ class WSManager extends EventEmitter {
     let open_time, open, high, low, close, volume;
 
     if (Array.isArray(d)) {
-      open_time = Number(d[0] || 0) * 1000;
+      // realtime_public format: [start, open, high, low, close, volume, turnover, confirm, interval]
+      open_time = Number(d[0] || 0) * 1000; // Convert to ms
       open = Number(d[1] || 0);
       high = Number(d[2] || 0);
       low = Number(d[3] || 0);
@@ -429,7 +449,7 @@ class WSManager extends EventEmitter {
       open = high = low = close = volume = 0;
     }
 
-    return { open_time, open, high, low, close, volume, timeframe: normalizeTf(tf), symbol };
+    return { open_time, open, high, low, close, volume, timeframe: tf, symbol };
   }
 
   async performInitialScan() {
@@ -442,7 +462,9 @@ class WSManager extends EventEmitter {
       const symbols = new Set();
       for (const conn of this.connections) {
         for (const sym of conn.symbols) {
-          if (validateSymbol(sym)) symbols.add(sym);
+          if (validateSymbol(sym)) {
+            symbols.add(sym);
+          }
         }
       }
 
@@ -463,22 +485,31 @@ class WSManager extends EventEmitter {
   async closeAll() {
     try {
       logger.info({ connectionsCount: this.connections.length }, 'WSManager: closing all connections');
-
+      
       for (const conn of this.connections.slice()) {
         try {
-          if (conn._retryTimer) { clearTimeout(conn._retryTimer); conn._retryTimer = null; }
-          if (conn._reconnectTimer) { clearTimeout(conn._reconnectTimer); conn._reconnectTimer = null; }
+          // Clear all timers
+          if (conn._retryTimer) {
+            clearTimeout(conn._retryTimer);
+            conn._retryTimer = null;
+          }
+          if (conn._reconnectTimer) {
+            clearTimeout(conn._reconnectTimer);
+            conn._reconnectTimer = null;
+          }
 
+          // Unsubscribe all topics
           const topics = Array.from(conn._topics || []);
           if (topics.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
             try {
               conn.ws.send(JSON.stringify({ op: 'unsubscribe', args: topics }));
               logger.debug({ connId: conn.id, topicsCount: topics.length }, 'Unsubscribed all topics');
-            } catch (e) {
+            } catch (e) { 
               logger.debug({ err: e }, 'Failed to unsubscribe on close');
             }
           }
 
+          // Close websocket
           if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
             try { conn.ws.close(); } catch (e) { /* ignore */ }
           }
@@ -486,7 +517,6 @@ class WSManager extends EventEmitter {
           logger.debug({ err: e, connId: conn.id }, 'Error closing connection');
         }
       }
-
       this.connections = [];
       this.symbolToConn = new Map();
       this.klineBuffer = new Map();
