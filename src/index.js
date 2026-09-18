@@ -1,6 +1,16 @@
 /**
  * Entrypoint - starts Express server and the poller/scanner
+ *
+ * Startup flow:
+ *  - db.init()
+ *  - telegram.init()
+ *  - poller.initialScan()
+ *  - targeted seeding (optional)
+ *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
+ *  - signalManager.sendStartupSummary()
+ *  - poller.start(), wsManager.start(), signalManager.start()
  */
+
 require('dotenv').config();
 const express = require('express');
 const pino = require('pino');
@@ -35,8 +45,10 @@ async function start() {
     logger.info('Starting app...');
     db.init();
 
+    // init telegram early so any immediate notifications are possible
     telegram.init();
 
+    // background bybit probe (non-blocking)
     try {
       const bybitRest = require('./services/bybitRest');
       bybitRest.probeHosts(3000)
@@ -49,6 +61,7 @@ async function start() {
       logger.debug({ e }, 'probeHosts startup call failed');
     }
 
+    // 1) Discover symbols
     try {
       logger.info('Startup: running initialScan() to populate symbols');
       await poller.initialScan();
@@ -56,6 +69,7 @@ async function start() {
       logger.warn({ e }, 'initialScan failed during startup (continuing)');
     }
 
+    // 2) targeted synchronous seeding for a limited number of symbols so klines + MACD are available.
     try {
       const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
       let seedList = [];
@@ -77,19 +91,28 @@ async function start() {
       logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
     }
 
+    // 3) Full iteration across all fetched symbols to detect flips (silent)
     try {
       logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
       if (typeof poller.scanAllForStartup === 'function') {
         await poller.scanAllForStartup();
       } else {
+        // fallback: silent scanOnce if scanAllForStartup not present
         await poller.scanOnce({ notifyNewSignals: false });
       }
     } catch (e) {
       logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
     }
 
-    // startup summary is handled by poller.scanAllForStartup() -> notificationQueue
+    // 4) send startup summary now that snapshot should be populated
+    try {
+      logger.info('Startup: sending startup summary (after full flip pass)');
+      await signalManager.sendStartupSummary();
+    } catch (e) {
+      logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
+    }
 
+    // 5) start schedulers and managers
     poller.start();
     wsManager.start();
     signalManager.start();
