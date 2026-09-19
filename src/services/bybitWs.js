@@ -1,531 +1,807 @@
-// src/services/bybitWs.js
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const config = require('../config');
 const logger = require('pino')();
 
-function envBool(name, defaultVal = false) {
-  if (typeof process.env[name] === 'undefined') return defaultVal;
-  const v = String(process.env[name]).toLowerCase().trim();
-  return v === '1' || v === 'true' || v === 'yes';
-}
-
-const MAINNET = envBool('MAINNET', true);
-
-function getWsUrl() {
-  const explicit = process.env.BYBIT_WS_PUBLIC || (config && config.BYBIT_WS_PUBLIC);
-  if (explicit) return String(explicit);
-  // Fallback to realtime_public (not v5)
-  return MAINNET ? 'wss://stream.bybit.com/realtime_public' : 'wss://stream-testnet.bybit.com/realtime_public';
-}
-
 function validateSymbol(symbol) {
-  if (!symbol || typeof symbol !== 'string') return false;
-  if (!config.SYMBOL_FILTER) return true;
+  if (!symbol || typeof symbol !== 'string') {
+    return false;
+  }
+
+  if (!config.SYMBOL_FILTER) {
+    return true;
+  }
+
   try {
-    const regex = new RegExp(config.SYMBOL_FILTER);
-    return regex.test(symbol);
-  } catch (e) {
-    logger.warn({ filter: config.SYMBOL_FILTER, err: e.message }, 'Invalid SYMBOL_FILTER regex');
+    return new RegExp(config.SYMBOL_FILTER).test(symbol);
+  } catch (err) {
+    logger.warn(
+      {
+        filter: config.SYMBOL_FILTER,
+        err: err.message
+      },
+      'Invalid SYMBOL_FILTER regex'
+    );
+
     return true;
   }
 }
 
-const WS_SUBSCRIBE_CHUNK = config.WS_SUBSCRIBE_CHUNK || (process.env.WS_SUBSCRIBE_CHUNK ? Number(process.env.WS_SUBSCRIBE_CHUNK) : 50);
-const WS_SUBSCRIBE_RETRY_BASE_MS = config.WS_SUBSCRIBE_RETRY_BASE_MS || (process.env.WS_SUBSCRIBE_RETRY_BASE_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_BASE_MS) : 1000);
-const WS_SUBSCRIBE_RETRY_MAX_MS = config.WS_SUBSCRIBE_RETRY_MAX_MS || (process.env.WS_SUBSCRIBE_RETRY_MAX_MS ? Number(process.env.WS_SUBSCRIBE_RETRY_MAX_MS) : 60000);
-const WS_RECONNECT_DELAY_MS = config.WS_RECONNECT_DELAY_MS || 500;
-const WS_RECONNECT_BACKOFF_FACTOR = config.WS_RECONNECT_BACKOFF_FACTOR || 1.5;
-const WS_RECONNECT_MAX_MS = config.WS_RECONNECT_MAX_MS || 30000;
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getWsUrl() {
+  const configured =
+    process.env.BYBIT_WS_PUBLIC ||
+    config.BYBIT_WS_PUBLIC;
+
+  if (configured) {
+    return String(configured);
+  }
+
+  const testnet =
+    String(process.env.MAINNET || 'true').toLowerCase() === 'false';
+
+  return testnet
+    ? 'wss://stream-testnet.bybit.com/v5/public/linear'
+    : 'wss://stream.bybit.com/v5/public/linear';
+}
 
 class WSManager extends EventEmitter {
   constructor() {
     super();
+
     this.connections = [];
     this.symbolToConn = new Map();
-    this.openSockets = 0;
-    this.maxSockets = config.MAX_CONCURRENT_WS || 20;
-    this.batchSize = config.BATCH_WS_SIZE || 20;
+    this.desiredSymbols = new Map();
     this.klineBuffer = new Map();
-    this.reconnectDelayMs = WS_RECONNECT_DELAY_MS;
+
+    this.started = false;
+    this.shuttingDown = false;
+    this.connectionSequence = 0;
+
+    this.maxSockets = Math.max(
+      1,
+      Number(config.MAX_CONCURRENT_WS || 20)
+    );
+
+    this.batchSize = Math.max(
+      1,
+      Number(config.BATCH_WS_SIZE || 10)
+    );
+
+    this.subscribeChunk = Math.max(
+      1,
+      Number(config.WS_SUBSCRIBE_CHUNK || 10)
+    );
+
+    this.connectTimeoutMs = Number(
+      config.WS_CONNECT_TIMEOUT_MS || 15000
+    );
+
+    this.reconnectDelayMs = Number(
+      config.WS_RECONNECT_DELAY_MS || 1000
+    );
+
+    this.reconnectBackoffFactor = Number(
+      config.WS_RECONNECT_BACKOFF_FACTOR || 2
+    );
+
+    this.reconnectMaxMs = Number(
+      config.WS_RECONNECT_MAX_MS || 30000
+    );
+
+    this.maxReconnectAttempts = Number(
+      config.WS_MAX_RECONNECT_ATTEMPTS || 10
+    );
   }
 
   start() {
-    logger.info({ wsUrl: getWsUrl(), maxSockets: this.maxSockets, batchSize: this.batchSize, symbolFilter: config.SYMBOL_FILTER }, 'WS Manager ready (batched, filtered)');
+    if (this.started) {
+      return;
+    }
+
+    this.started = true;
+    this.shuttingDown = false;
+
+    logger.info(
+      {
+        wsUrl: getWsUrl(),
+        maxSockets: this.maxSockets,
+        batchSize: this.batchSize,
+        subscribeChunk: this.subscribeChunk,
+        connectTimeoutMs: this.connectTimeoutMs
+      },
+      'WS Manager starting'
+    );
+
+    this._createConnection();
   }
 
-  intervalToTopicPart(tf) {
-    // realtime_public format: 1, 3, 5, 15, 30, 60, 120, 240, 360, 720, D, M, W, Y
-    const tfMap = {
-      '1': '1',
-      '3': '3',
-      '5': '5',
-      '15': '15',
-      '30': '30',
-      '60': '60',
-      '120': '120',
-      '240': '240',
-      '360': '360',
-      '720': '720',
-      'D': 'D',
-      'M': 'M',
-      'W': 'W',
-      'Y': 'Y'
-    };
-    return tfMap[String(tf)] || String(tf);
+  intervalToTopicPart(timeframe) {
+    const value = String(timeframe).toUpperCase();
+
+    if (value === '1H' || value === 'H') {
+      return '60';
+    }
+
+    if (value === '1D') {
+      return 'D';
+    }
+
+    return value;
   }
 
   _createConnection() {
-    if (this.openSockets >= this.maxSockets) {
-      logger.warn({ maxSockets: this.maxSockets }, 'Max WS connections reached; cannot create new connection');
+    if (this.shuttingDown) {
+      return null;
+    }
+
+    if (this.connections.length >= this.maxSockets) {
+      logger.warn(
+        { maxSockets: this.maxSockets },
+        'Maximum WS connection count reached'
+      );
+
       return null;
     }
 
     const wsUrl = getWsUrl();
-    const ws = new WebSocket(wsUrl);
+
+    let ws;
+
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      logger.error(
+        { err, wsUrl },
+        'Failed to create WebSocket'
+      );
+
+      return null;
+    }
+
     const conn = {
       ws,
+      id: `${Date.now()}-${++this.connectionSequence}`,
       symbols: new Set(),
-      id: Date.now() + '-' + Math.random().toString(16).slice(2),
-      _topics: new Set(),
+      topics: new Set(),
       pendingTopics: new Set(),
       ready: false,
-      retryDelayMs: WS_SUBSCRIBE_RETRY_BASE_MS,
-      _retryTimer: null,
-      reconnectRetries: 0,
-      _reconnectTimer: null
+      closed: false,
+      reconnectAttempts: 0,
+      reconnectTimer: null,
+      connectTimer: null,
+      flushTimer: null
     };
 
+    this.connections.push(conn);
+
+    conn.connectTimer = setTimeout(() => {
+      if (
+        !conn.ready &&
+        conn.ws.readyState !== WebSocket.OPEN
+      ) {
+        logger.warn(
+          {
+            connId: conn.id,
+            timeoutMs: this.connectTimeoutMs
+          },
+          'WS connection timed out before OPEN'
+        );
+
+        try {
+          conn.ws.terminate();
+        } catch (err) {
+          logger.debug({ err }, 'Failed to terminate timed-out WS');
+        }
+      }
+    }, this.connectTimeoutMs);
+
     ws.on('open', () => {
+      if (conn.closed) {
+        return;
+      }
+
       conn.ready = true;
-      conn.reconnectRetries = 0; // Reset reconnect counter on successful connection
-      logger.info({ connId: conn.id, wsUrl }, 'WS connection opened');
-      if (conn.pendingTopics && conn.pendingTopics.size) {
-        logger.info({ connId: conn.id, pending: conn.pendingTopics.size }, 'Flushing pending subscribe topics on open');
-        this._flushPendingForConn(conn);
+      conn.reconnectAttempts = 0;
+
+      if (conn.connectTimer) {
+        clearTimeout(conn.connectTimer);
+        conn.connectTimer = null;
       }
+
+      logger.info(
+        {
+          connId: conn.id,
+          wsUrl
+        },
+        'WS connection opened'
+      );
+
+      this._flushPending(conn);
     });
 
-    ws.on('message', (msg) => {
-      try {
-        const data = JSON.parse(msg);
-        
-        if (data && data.op === 'ping') {
-          try { ws.send(JSON.stringify({ op: 'pong' })); } catch (e) { /* ignore */ }
-          return;
-        }
-
-        // Handle kline data (realtime_public format)
-        if (data && data.topic && Array.isArray(data.data) && data.data.length > 0) {
-          const topic = String(data.topic);
-          
-          // realtime_public format: "candle.{interval}.{symbol}"
-          if (topic.startsWith('candle.')) {
-            const parts = topic.split('.');
-            if (parts.length >= 3) {
-              const tf = parts[1];
-              const sym = parts.slice(2).join('.');
-              
-              if (!sym || !validateSymbol(sym)) {
-                logger.debug({ symbol: sym }, 'Kline received for filtered-out symbol, ignoring');
-                return;
-              }
-              
-              const d = data.data[0];
-              if (d) {
-                try {
-                  const k = this.normalizeKlinePayload(d, tf, sym);
-                  
-                  if (!this.klineBuffer.has(sym)) {
-                    this.klineBuffer.set(sym, {});
-                  }
-                  this.klineBuffer.get(sym)[tf] = k;
-                  
-                  this.emit('kline', { symbol: sym, timeframe: tf, data: k, raw: data });
-                  logger.debug({ symbol: sym, timeframe: tf, close: k.close }, 'Kline received');
-                } catch (normErr) {
-                  logger.debug({ err: normErr.message, symbol: sym, tf }, 'Failed to normalize kline');
-                }
-              }
-            }
-          }
-          return;
-        }
-
-        // Handle subscription responses
-        if (data && (data.success !== undefined || data.ret_code !== undefined)) {
-          const success = data.success !== false && data.ret_code === 0;
-          if (!success) {
-            logger.warn({ 
-              connId: conn.id, 
-              success: data.success,
-              retCode: data.ret_code,
-              retMsg: data.ret_msg || data.msg || 'unknown',
-              type: data.type
-            }, 'WS subscription error response');
-          } else {
-            logger.debug({ connId: conn.id, type: data.type }, 'WS subscription successful');
-          }
-          return;
-        }
-      } catch (err) {
-        logger.debug({ err: err && err.message ? err.message : err }, 'Failed to parse WS message');
-      }
+    ws.on('message', message => {
+      this._handleMessage(conn, message);
     });
 
-    ws.on('error', (err) => {
-      logger.error({ err: err && err.message ? err.message : err, code: err.code, connId: conn.id }, 'WS error');
+    ws.on('error', err => {
+      logger.error(
+        {
+          connId: conn.id,
+          message: err && err.message,
+          code: err && err.code
+        },
+        'WS connection error'
+      );
     });
 
     ws.on('close', (code, reason) => {
-      logger.info({ connId: conn.id, code, reason: reason ? reason.toString() : '' }, 'WS connection closed');
-
-      const symbolsToRecover = Array.from(conn.symbols || []);
-      for (const s of conn.symbols) this.symbolToConn.delete(s);
-
-      this.connections = this.connections.filter(c => c !== conn);
-      this.openSockets = Math.max(0, this.openSockets - 1);
-
-      // Clear any pending timers
-      if (conn._retryTimer) {
-        clearTimeout(conn._retryTimer);
-        conn._retryTimer = null;
-      }
-      if (conn._reconnectTimer) {
-        clearTimeout(conn._reconnectTimer);
-        conn._reconnectTimer = null;
-      }
-
-      // Re-subscribe symbols with exponential backoff (only if not too many retries)
-      if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries < 5) {
-        logger.info({ connId: conn.id, recoverCount: symbolsToRecover.length, retryAttempt: conn.reconnectRetries + 1 }, 'Re-queueing symbols from closed connection');
-        
-        const recoveryDelay = Math.min(
-          WS_RECONNECT_DELAY_MS * Math.pow(WS_RECONNECT_BACKOFF_FACTOR, conn.reconnectRetries),
-          WS_RECONNECT_MAX_MS
-        );
-        conn.reconnectRetries++;
-        
-        conn._reconnectTimer = setTimeout(() => {
-          conn._reconnectTimer = null;
-          for (const sym of symbolsToRecover) {
-            try {
-              // Only re-subscribe if symbol is not already in another connection
-              const existing = this.symbolToConn.get(sym);
-              if (!existing) {
-                this.subscribeSymbolMTF(sym);
-              }
-            } catch (e) {
-              logger.debug({ err: e, symbol: sym }, 'Error re-subscribing symbol');
-            }
-          }
-        }, recoveryDelay);
-        
-        logger.debug({ connId: conn.id, recoveryDelayMs: recoveryDelay }, 'Scheduled symbol recovery for connection');
-      } else if (symbolsToRecover && symbolsToRecover.length && conn.reconnectRetries >= 5) {
-        logger.warn({ connId: conn.id, recoverCount: symbolsToRecover.length, retries: conn.reconnectRetries }, 'Max reconnect retries reached, abandoning symbol recovery');
-      }
+      this._handleClose(
+        conn,
+        code,
+        reason ? reason.toString() : ''
+      );
     });
 
-    this.connections.push(conn);
-    this.openSockets++;
-    logger.info({ connId: conn.id, openSockets: this.openSockets }, 'WS connection created');
+    logger.info(
+      {
+        connId: conn.id,
+        wsUrl
+      },
+      'WS connection created'
+    );
+
     return conn;
   }
 
-  _sendTopicsBatch(conn, topicsArray, op = 'subscribe') {
-    if (!conn || !conn.ws) return Promise.reject(new Error('Invalid connection'));
-    if (!Array.isArray(topicsArray) || topicsArray.length === 0) return Promise.resolve();
+  _handleMessage(conn, rawMessage) {
+    let data;
+
+    try {
+      data = JSON.parse(rawMessage.toString());
+    } catch (err) {
+      logger.debug(
+        { err: err.message },
+        'Unable to parse WS message'
+      );
+
+      return;
+    }
+
+    // Bybit V5 heartbeat.
+    if (data.op === 'ping') {
+      try {
+        if (conn.ws.readyState === WebSocket.OPEN) {
+          conn.ws.send(JSON.stringify({ op: 'pong' }));
+        }
+      } catch (err) {
+        logger.debug({ err }, 'Failed to send WS pong');
+      }
+
+      return;
+    }
+
+    if (data.success === false || data.retCode !== undefined) {
+      if (data.success === false || Number(data.retCode) !== 0) {
+        logger.warn(
+          {
+            connId: conn.id,
+            retCode: data.retCode,
+            retMsg: data.retMsg || data.msg
+          },
+          'Bybit WS response error'
+        );
+      }
+
+      return;
+    }
+
+    if (
+      typeof data.topic !== 'string' ||
+      !data.topic.startsWith('kline.')
+    ) {
+      return;
+    }
+
+    const parts = data.topic.split('.');
+
+    if (parts.length < 3 || !Array.isArray(data.data)) {
+      return;
+    }
+
+    const timeframe = parts[1];
+    const symbol = parts.slice(2).join('.');
+
+    if (!validateSymbol(symbol)) {
+      return;
+    }
+
+    // Bybit V5 normally sends the newest candle first.
+    for (const item of data.data) {
+      const normalized = this.normalizeKlinePayload(
+        item,
+        timeframe,
+        symbol
+      );
+
+      if (!normalized || !normalized.open_time) {
+        continue;
+      }
+
+      if (!this.klineBuffer.has(symbol)) {
+        this.klineBuffer.set(symbol, {});
+      }
+
+      this.klineBuffer.get(symbol)[timeframe] = normalized;
+
+      this.emit('kline', {
+        symbol,
+        timeframe,
+        data: normalized,
+        raw: data
+      });
+    }
+  }
+
+  _handleClose(conn, code, reason) {
+    if (conn.closed) {
+      return;
+    }
+
+    conn.closed = true;
+    conn.ready = false;
+
+    if (conn.connectTimer) {
+      clearTimeout(conn.connectTimer);
+      conn.connectTimer = null;
+    }
+
+    if (conn.flushTimer) {
+      clearTimeout(conn.flushTimer);
+      conn.flushTimer = null;
+    }
+
+    this.connections = this.connections.filter(item =>
+      item !== conn
+    );
+
+    const symbols = Array.from(conn.symbols);
+
+    for (const symbol of symbols) {
+      if (this.symbolToConn.get(symbol) === conn) {
+        this.symbolToConn.delete(symbol);
+      }
+    }
+
+    logger.warn(
+      {
+        connId: conn.id,
+        code,
+        reason,
+        symbols: symbols.length
+      },
+      'WS connection closed'
+    );
+
+    if (
+      !this.shuttingDown &&
+      symbols.length > 0
+    ) {
+      this._recoverSymbols(
+        symbols,
+        conn.reconnectAttempts
+      );
+    }
+  }
+
+  _recoverSymbols(symbols, previousAttempts = 0) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const attempts = previousAttempts + 1;
+
+    if (attempts > this.maxReconnectAttempts) {
+      logger.error(
+        {
+          symbols: symbols.length,
+          attempts
+        },
+        'WS maximum reconnect attempts reached; symbols abandoned'
+      );
+
+      return;
+    }
+
+    const delay = Math.min(
+      this.reconnectDelayMs *
+        Math.pow(this.reconnectBackoffFactor, attempts - 1),
+      this.reconnectMaxMs
+    );
+
+    logger.warn(
+      {
+        symbols: symbols.length,
+        attempts,
+        delayMs: delay
+      },
+      'Scheduling WS symbol recovery'
+    );
+
+    setTimeout(() => {
+      if (this.shuttingDown) {
+        return;
+      }
+
+      for (const symbol of symbols) {
+        const timeframes =
+          this.desiredSymbols.get(symbol);
+
+        if (timeframes) {
+          this.subscribeSymbolMTF(
+            symbol,
+            timeframes
+          );
+        }
+      }
+    }, delay);
+  }
+
+  _getAvailableConnection() {
+    return this.connections.find(conn =>
+      !conn.closed &&
+      conn.symbols.size < this.batchSize
+    ) || this._createConnection();
+  }
+
+  _sendTopics(conn, topics, operation = 'subscribe') {
+    if (
+      !conn ||
+      conn.closed ||
+      !conn.ws ||
+      conn.ws.readyState !== WebSocket.OPEN
+    ) {
+      for (const topic of topics) {
+        conn && conn.pendingTopics.add(topic);
+      }
+
+      return Promise.reject(
+        new Error('WS socket is not OPEN')
+      );
+    }
 
     return new Promise((resolve, reject) => {
-      if (conn.ws.readyState !== WebSocket.OPEN) {
-        for (const t of topicsArray) conn.pendingTopics.add(t);
-        return reject(new Error('WS not open, queued for retry'));
-      }
+      const payload = JSON.stringify({
+        op: operation,
+        args: topics
+      });
 
-      try {
-        // realtime_public format: { "op": "subscribe", "args": ["candle.60.BTCUSDT"] }
-        const payload = { op, args: topicsArray };
-        const payloadStr = JSON.stringify(payload);
-        
-        logger.debug({ 
-          connId: conn.id, 
-          op, 
-          batchSize: topicsArray.length,
-          payload: payloadStr
-        }, 'Sending subscription batch');
-        
-        conn.ws.send(payloadStr, (err) => {
-          if (err) {
-            for (const t of topicsArray) conn.pendingTopics.add(t);
-            logger.warn({ err: err && err.message ? err.message : err, connId: conn.id, op, batchSize: topicsArray.length }, 'Failed to send batch; queued for retry');
-            return reject(err);
+      conn.ws.send(payload, err => {
+        if (err) {
+          for (const topic of topics) {
+            conn.pendingTopics.add(topic);
           }
-          for (const t of topicsArray) {
-            conn.pendingTopics.delete(t);
-            conn._topics.add(t);
+
+          reject(err);
+          return;
+        }
+
+        for (const topic of topics) {
+          conn.pendingTopics.delete(topic);
+
+          if (operation === 'subscribe') {
+            conn.topics.add(topic);
+          } else {
+            conn.topics.delete(topic);
           }
-          conn.retryDelayMs = WS_SUBSCRIBE_RETRY_BASE_MS;
-          logger.debug({ connId: conn.id, op, batchSize: topicsArray.length }, 'Batch sent successfully');
-          return resolve();
-        });
-      } catch (err) {
-        for (const t of topicsArray) conn.pendingTopics.add(t);
-        logger.warn({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception while sending batch; queued for retry');
-        return reject(err);
-      }
+        }
+
+        resolve();
+      });
     });
   }
 
-  _flushPendingForConn(conn) {
-    if (!conn || !conn.pendingTopics || conn.pendingTopics.size === 0) return;
-
-    if (!conn.ready || !conn.ws || conn.ws.readyState !== WebSocket.OPEN) {
-      logger.debug({ connId: conn.id, pending: conn.pendingTopics.size, readyState: conn.ws ? conn.ws.readyState : 'no-ws' }, 'Not flushing pending because socket not OPEN');
-      this._scheduleFlushRetry(conn);
+  _flushPending(conn) {
+    if (
+      !conn ||
+      conn.closed ||
+      !conn.ready ||
+      conn.ws.readyState !== WebSocket.OPEN ||
+      conn.pendingTopics.size === 0
+    ) {
       return;
     }
 
     const topics = Array.from(conn.pendingTopics);
-    const chunks = [];
-    for (let i = 0; i < topics.length; i += WS_SUBSCRIBE_CHUNK) {
-      chunks.push(topics.slice(i, i + WS_SUBSCRIBE_CHUNK));
+
+    const batches = [];
+
+    for (
+      let index = 0;
+      index < topics.length;
+      index += this.subscribeChunk
+    ) {
+      batches.push(
+        topics.slice(index, index + this.subscribeChunk)
+      );
     }
 
-    const sendNextChunk = (index) => {
-      if (index >= chunks.length) {
-        logger.debug({ connId: conn.id }, 'All pending batches sent');
-        return;
+    const sendBatch = async () => {
+      for (const batch of batches) {
+        if (
+          conn.closed ||
+          conn.ws.readyState !== WebSocket.OPEN
+        ) {
+          return;
+        }
+
+        try {
+          await this._sendTopics(
+            conn,
+            batch,
+            'subscribe'
+          );
+
+          // Avoid sending a large burst of subscriptions.
+          await sleep(100);
+        } catch (err) {
+          logger.warn(
+            {
+              connId: conn.id,
+              err: err.message
+            },
+            'Failed to send WS subscription batch'
+          );
+
+          return;
+        }
       }
-      const batch = chunks[index];
-      this._sendTopicsBatch(conn, batch, 'subscribe').then(() => {
-        sendNextChunk(index + 1);
-      }).catch((err) => {
-        logger.warn({ connId: conn.id, err: err && err.message ? err.message : err, retryIn: conn.retryDelayMs }, 'Failed to flush pending batch; scheduling retry');
-        this._scheduleFlushRetry(conn);
-      });
+
+      logger.info(
+        {
+          connId: conn.id,
+          topics: topics.length
+        },
+        'WS pending subscriptions flushed'
+      );
     };
 
-    if (chunks.length) {
-      logger.info({ connId: conn.id, batches: chunks.length, totalTopics: topics.length }, 'Flushing pending subscribe topics in batches');
-      sendNextChunk(0);
-    }
+    sendBatch().catch(err => {
+      logger.warn(
+        { connId: conn.id, err },
+        'WS subscription flush failed'
+      );
+    });
   }
 
-  _scheduleFlushRetry(conn) {
-    if (!conn) return;
-    if (conn._retryTimer) return;
+  subscribeSymbolMTF(symbol, timeframes = null) {
+    if (!validateSymbol(symbol)) {
+      logger.debug(
+        { symbol },
+        'Rejected symbol from WS subscription'
+      );
 
-    const delay = Math.min(conn.retryDelayMs || WS_SUBSCRIBE_RETRY_BASE_MS, WS_SUBSCRIBE_RETRY_MAX_MS);
-    conn._retryTimer = setTimeout(() => {
-      conn._retryTimer = null;
-      conn.retryDelayMs = Math.min((conn.retryDelayMs || WS_SUBSCRIBE_RETRY_BASE_MS) * 2, WS_SUBSCRIBE_RETRY_MAX_MS);
-      if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
-        logger.debug({ connId: conn.id, retryDelayMs: conn.retryDelayMs }, 'Retrying flush for connection');
-        this._flushPendingForConn(conn);
-      } else {
-        this._scheduleFlushRetry(conn);
-      }
-    }, delay);
-    logger.debug({ connId: conn.id, delayMs: delay }, 'Scheduled flush retry for connection');
-  }
-
-  _getOrCreateTargetConnection() {
-    let target = this.connections.find(c => c.symbols.size < this.batchSize);
-    if (!target) {
-      target = this._createConnection();
-    }
-    return target;
-  }
-
-  subscribeSymbolMTF(symbol, tfs = null) {
-    if (!symbol || !validateSymbol(symbol)) {
-      logger.debug({ symbol }, 'Symbol rejected by filter or invalid, skipping subscription');
-      return null;
-    }
-    if (this.symbolToConn.has(symbol)) {
-      logger.debug({ symbol }, 'Symbol already subscribed, skipping');
-      return this.symbolToConn.get(symbol);
-    }
-
-    const timeframes = tfs || config.MTF_TFS || ['5', '15', '60', '240', 'D'];
-    const target = this._getOrCreateTargetConnection();
-    if (!target) {
-      logger.warn({ symbol }, 'No available WS connection could be created for subscription');
       return null;
     }
 
-    const topics = [];
-    for (const tf of timeframes) {
-      const tfPart = this.intervalToTopicPart(tf);
-      // realtime_public format: candle.{interval}.{symbol}
-      topics.push(`candle.${tfPart}.${symbol}`);
+    const requestedTimeframes = (
+      timeframes ||
+      config.MTF_TFS ||
+      ['5', '15', '60', '240', 'D']
+    ).map(String);
+
+    this.desiredSymbols.set(
+      symbol,
+      requestedTimeframes
+    );
+
+    const existing = this.symbolToConn.get(symbol);
+
+    if (existing && !existing.closed) {
+      return existing;
     }
 
-    for (const t of topics) {
-      target._topics.add(t);
-      target.pendingTopics.add(t);
+    const conn = this._getAvailableConnection();
+
+    if (!conn) {
+      logger.warn(
+        { symbol },
+        'No available WS connection for symbol'
+      );
+
+      return null;
     }
 
-    target.symbols.add(symbol);
-    this.symbolToConn.set(symbol, target);
+    const topics = requestedTimeframes.map(timeframe => {
+      const interval = this.intervalToTopicPart(timeframe);
 
-    logger.info({ symbol, topicsCount: topics.length, connId: target.id, pending: target.pendingTopics.size }, 'Queued symbol for subscription (pending until socket OPEN)');
-    
-    if (target.ws && target.ws.readyState === WebSocket.OPEN) {
-      this._flushPendingForConn(target);
-    } else {
-      this._scheduleFlushRetry(target);
+      // Bybit V5 topic format.
+      return `kline.${interval}.${symbol}`;
+    });
+
+    for (const topic of topics) {
+      conn.pendingTopics.add(topic);
     }
-    return target;
+
+    conn.symbols.add(symbol);
+    this.symbolToConn.set(symbol, conn);
+
+    logger.info(
+      {
+        symbol,
+        connId: conn.id,
+        topicCount: topics.length,
+        socketState: conn.ws.readyState
+      },
+      'WS symbol queued'
+    );
+
+    if (conn.ws.readyState === WebSocket.OPEN) {
+      conn.ready = true;
+      this._flushPending(conn);
+    }
+
+    return conn;
   }
 
   unsubscribeSymbol(symbol) {
-    if (!this.symbolToConn.has(symbol)) {
-      logger.debug({ symbol }, 'Symbol not found in subscriptions');
+    const conn = this.symbolToConn.get(symbol);
+
+    this.desiredSymbols.delete(symbol);
+
+    if (!conn) {
       return;
     }
-    
-    const conn = this.symbolToConn.get(symbol);
-    if (!conn) return;
 
-    const topicsToUnsub = Array.from(conn._topics || []).filter(t => t.endsWith(`.${symbol}`));
-
-    for (const t of topicsToUnsub) {
-      conn._topics.delete(t);
-      conn.pendingTopics.delete(t);
-    }
-
-    if (topicsToUnsub.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
-      for (let i = 0; i < topicsToUnsub.length; i += WS_SUBSCRIBE_CHUNK) {
-        const batch = topicsToUnsub.slice(i, i + WS_SUBSCRIBE_CHUNK);
-        try {
-          this._sendTopicsBatch(conn, batch, 'unsubscribe').catch(err => {
-            logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Unsubscribe batch failed but continuing');
-          });
-        } catch (err) {
-          logger.debug({ err: err && err.message ? err.message : err, connId: conn.id }, 'Exception sending unsubscribe');
-        }
-      }
-    } else {
-      logger.debug({ connId: conn.id, reason: conn.ws ? `readyState=${conn.ws.readyState}` : 'no-ws', queuedUnsubs: topicsToUnsub.length }, 'Socket not OPEN, unsubscriptions queued or removed');
-    }
+    const topics = Array.from(conn.topics).filter(topic =>
+      topic.endsWith(`.${symbol}`)
+    );
 
     conn.symbols.delete(symbol);
     this.symbolToConn.delete(symbol);
-    this.klineBuffer.delete(symbol);
-    logger.info({ symbol, connId: conn.id, unsubscribedTopics: topicsToUnsub.length }, 'Unsubscribed symbol from connection');
 
-    // Close connection if no more symbols
+    for (const topic of topics) {
+      conn.topics.delete(topic);
+      conn.pendingTopics.delete(topic);
+    }
+
+    if (
+      topics.length > 0 &&
+      conn.ws.readyState === WebSocket.OPEN
+    ) {
+      this._sendTopics(
+        conn,
+        topics,
+        'unsubscribe'
+      ).catch(err => {
+        logger.debug(
+          { err, symbol },
+          'WS unsubscribe failed'
+        );
+      });
+    }
+
+    this.klineBuffer.delete(symbol);
+
     if (conn.symbols.size === 0) {
+      conn.closed = true;
+
       try {
-        if (conn._retryTimer) clearTimeout(conn._retryTimer);
-        if (conn._reconnectTimer) clearTimeout(conn._reconnectTimer);
-      } catch (e) { /* ignore */ }
-      try { if (conn.ws) conn.ws.close(); } catch (e) { /* ignore */ }
+        conn.ws.close();
+      } catch (err) {
+        logger.debug({ err }, 'Failed to close empty WS connection');
+      }
     }
   }
 
-  normalizeKlinePayload(d, tf, symbol) {
-    let open_time, open, high, low, close, volume;
+  normalizeKlinePayload(item, timeframe, symbol) {
+    if (Array.isArray(item)) {
+      const start = Number(item[0]);
 
-    if (Array.isArray(d)) {
-      // realtime_public format: [start, open, high, low, close, volume, turnover, confirm, interval]
-      open_time = Number(d[0] || 0) * 1000; // Convert to ms
-      open = Number(d[1] || 0);
-      high = Number(d[2] || 0);
-      low = Number(d[3] || 0);
-      close = Number(d[4] || 0);
-      volume = Number(d[5] || 0);
-    } else if (typeof d === 'object' && d !== null) {
-      open_time = d.t ? Number(d.t) * 1000 : (d.open_time || null);
-      open = Number(d.o || d.open || 0);
-      high = Number(d.h || d.high || 0);
-      low = Number(d.l || d.low || 0);
-      close = Number(d.c || d.close || 0);
-      volume = Number(d.v || d.volume || 0);
-    } else {
-      open_time = null;
-      open = high = low = close = volume = 0;
+      return {
+        open_time: start < 100000000000
+          ? start * 1000
+          : start,
+        open: Number(item[1] || 0),
+        high: Number(item[2] || 0),
+        low: Number(item[3] || 0),
+        close: Number(item[4] || 0),
+        volume: Number(item[5] || 0),
+        timeframe,
+        symbol
+      };
     }
 
-    return { open_time, open, high, low, close, volume, timeframe: tf, symbol };
+    if (!item || typeof item !== 'object') {
+      return null;
+    }
+
+    const rawOpenTime =
+      item.start ??
+      item.startTime ??
+      item.t ??
+      item.open_time;
+
+    const numericOpenTime = Number(rawOpenTime);
+
+    if (!Number.isFinite(numericOpenTime)) {
+      return null;
+    }
+
+    return {
+      open_time: numericOpenTime < 100000000000
+        ? numericOpenTime * 1000
+        : numericOpenTime,
+      open: Number(item.open ?? item.o ?? 0),
+      high: Number(item.high ?? item.h ?? 0),
+      low: Number(item.low ?? item.l ?? 0),
+      close: Number(item.close ?? item.c ?? 0),
+      volume: Number(item.volume ?? item.v ?? 0),
+      timeframe,
+      symbol
+    };
   }
 
   async performInitialScan() {
-    try {
-      if (this.connections.length === 0) {
-        logger.warn('performInitialScan: no active connections yet');
-        return [];
+    const symbols = [];
+
+    for (const symbol of this.desiredSymbols.keys()) {
+      if (validateSymbol(symbol)) {
+        symbols.push({
+          symbol,
+          base: symbol.replace(/USDT(\.P)?$/i, ''),
+          quote: 'USDT'
+        });
       }
-
-      const symbols = new Set();
-      for (const conn of this.connections) {
-        for (const sym of conn.symbols) {
-          if (validateSymbol(sym)) {
-            symbols.add(sym);
-          }
-        }
-      }
-
-      const result = Array.from(symbols).map(s => ({
-        symbol: s,
-        base: s.replace(/USDT[Pp]?$/i, ''),
-        quote: 'USDT'
-      }));
-
-      logger.info({ count: result.length }, 'performInitialScan: returning subscribed symbols');
-      return result;
-    } catch (err) {
-      logger.error({ err: err && err.message ? err.message : err }, 'performInitialScan: error');
-      return [];
     }
+
+    logger.info(
+      { count: symbols.length },
+      'WS initial scan completed'
+    );
+
+    return symbols;
   }
 
   async closeAll() {
-    try {
-      logger.info({ connectionsCount: this.connections.length }, 'WSManager: closing all connections');
-      
-      for (const conn of this.connections.slice()) {
-        try {
-          // Clear all timers
-          if (conn._retryTimer) {
-            clearTimeout(conn._retryTimer);
-            conn._retryTimer = null;
-          }
-          if (conn._reconnectTimer) {
-            clearTimeout(conn._reconnectTimer);
-            conn._reconnectTimer = null;
-          }
+    this.shuttingDown = true;
+    this.started = false;
 
-          // Unsubscribe all topics
-          const topics = Array.from(conn._topics || []);
-          if (topics.length && conn.ws && conn.ws.readyState === WebSocket.OPEN) {
-            try {
-              conn.ws.send(JSON.stringify({ op: 'unsubscribe', args: topics }));
-              logger.debug({ connId: conn.id, topicsCount: topics.length }, 'Unsubscribed all topics');
-            } catch (e) { 
-              logger.debug({ err: e }, 'Failed to unsubscribe on close');
-            }
-          }
+    for (const conn of this.connections.slice()) {
+      conn.closed = true;
 
-          // Close websocket
-          if (conn.ws && (conn.ws.readyState === WebSocket.OPEN || conn.ws.readyState === WebSocket.CONNECTING)) {
-            try { conn.ws.close(); } catch (e) { /* ignore */ }
-          }
-        } catch (e) {
-          logger.debug({ err: e, connId: conn.id }, 'Error closing connection');
-        }
+      if (conn.connectTimer) {
+        clearTimeout(conn.connectTimer);
       }
-      this.connections = [];
-      this.symbolToConn = new Map();
-      this.klineBuffer = new Map();
-      this.openSockets = 0;
-      this.reconnectDelayMs = WS_RECONNECT_DELAY_MS;
-      logger.info('WSManager: closed all connections');
-    } catch (err) {
-      logger.warn({ err: err && err.message ? err.message : err }, 'WSManager.closeAll error');
+
+      if (conn.flushTimer) {
+        clearTimeout(conn.flushTimer);
+      }
+
+      try {
+        if (
+          conn.ws.readyState === WebSocket.OPEN ||
+          conn.ws.readyState === WebSocket.CONNECTING
+        ) {
+          conn.ws.close();
+        }
+      } catch (err) {
+        logger.debug(
+          { err, connId: conn.id },
+          'Failed to close WS connection'
+        );
+      }
     }
+
+    this.connections = [];
+    this.symbolToConn.clear();
+    this.desiredSymbols.clear();
+    this.klineBuffer.clear();
+
+    logger.info('WS Manager closed all connections');
   }
 }
 
