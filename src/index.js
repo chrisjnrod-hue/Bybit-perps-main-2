@@ -1,19 +1,9 @@
-/**
- * Entrypoint - starts Express server and the poller/scanner
- *
- * Startup flow:
- *  - db.init()
- *  - telegram.init()
- *  - poller.initialScan()
- *  - targeted seeding (optional)
- *  - poller.scanAllForStartup()  // ensures every symbol is evaluated for flips (silent)
- *  - signalManager.sendStartupSummary()
- *  - poller.start(), wsManager.start(), signalManager.start()
- */
-
+const path = require('path');
 require('dotenv').config();
+
 const express = require('express');
 const pino = require('pino');
+
 const config = require('./config');
 const db = require('./db');
 const poller = require('./services/poller');
@@ -23,162 +13,313 @@ const telegram = require('./services/telegram');
 const tradeManager = require('./services/tradeManager');
 const debugRoutes = require('./routes/debug');
 
-const logger = pino({ level: config.LOG_LEVEL || 'info' });
+const logger = pino({
+  level: config.LOG_LEVEL || 'info'
+});
 
 process.on('uncaughtException', (err) => {
-  logger.error({ err }, 'UNCAUGHT EXCEPTION - the process may terminate');
+  logger.error(
+    { err },
+    'UNCAUGHT EXCEPTION - the process may terminate'
+  );
 });
+
 process.on('unhandledRejection', (reason) => {
-  logger.error({ reason }, 'UNHANDLED REJECTION - promise rejected without handler');
+  logger.error(
+    { reason },
+    'UNHANDLED REJECTION - promise rejected without handler'
+  );
 });
 
 const app = express();
+
 app.use(express.json());
 app.use('/debug', debugRoutes);
 
 const PORT = process.env.PORT || config.PORT || 3000;
+
 let server;
 let heartbeatInterval;
 
+async function runStartup() {
+  logger.info('Startup: initializing database');
+  db.init();
+
+  // Initialize Telegram before any notification can be queued.
+  logger.info('Startup: initializing Telegram');
+  telegram.init();
+
+  // This probe is intentionally non-blocking.
+  try {
+    const bybitRest = require('./services/bybitRest');
+
+    bybitRest
+      .probeHosts(3000)
+      .then((base) => {
+        if (base) {
+          logger.info(
+            { base },
+            'probeHosts completed in background'
+          );
+        } else {
+          logger.warn(
+            'probeHosts completed in background with no selected base'
+          );
+        }
+      })
+      .catch((err) => {
+        logger.debug(
+          { err },
+          'probeHosts background failure'
+        );
+      });
+  } catch (err) {
+    logger.debug(
+      { err },
+      'probeHosts startup call failed'
+    );
+  }
+
+  /*
+   * Discover symbols only. Do not start background seeding here because
+   * startup must complete its controlled seed before the startup flip pass.
+   */
+  try {
+    logger.info(
+      'Startup: discovering symbols'
+    );
+
+    await poller.initialScan({
+      seed: false
+    });
+  } catch (err) {
+    logger.warn(
+      { err },
+      'initialScan failed during startup; continuing'
+    );
+  }
+
+  /*
+   * Seed the configured startup subset synchronously. This prevents
+   * scanAllForStartup() from racing with the background seed started by
+   * initialScan().
+   */
+  try {
+    const startupSeedCount = Number(
+      process.env.STARTUP_SEED_SYMBOLS ||
+      config.STARTUP_SEED_SYMBOLS ||
+      50
+    );
+
+    const dbInstance = db.get();
+
+    const rows = dbInstance
+      .prepare(
+        `
+          SELECT symbol
+          FROM symbols
+          ORDER BY symbol COLLATE NOCASE ASC
+          LIMIT ?
+        `
+      )
+      .all(startupSeedCount);
+
+    const seedList = rows.map((row) => ({
+      symbol: row.symbol
+    }));
+
+    if (
+      seedList.length > 0 &&
+      typeof poller.backgroundSeedKlines === 'function'
+    ) {
+      logger.info(
+        {
+          count: seedList.length
+        },
+        'Startup: synchronously seeding startup symbols'
+      );
+
+      await poller.backgroundSeedKlines(seedList);
+    } else {
+      logger.info(
+        'Startup: no symbols available for targeted seeding'
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Startup: targeted seeding failed; continuing'
+    );
+  }
+
+  /*
+   * This is the only startup signal scan.
+   *
+   * scanAllForStartup() enqueues the startup batch. The notification queue
+   * owns delivery of the startup summary. Do not call
+   * signalManager.sendStartupSummary() here as well.
+   */
+  try {
+    logger.info(
+      'Startup: running full startup flip pass'
+    );
+
+    await poller.scanAllForStartup();
+
+    logger.info(
+      'Startup: full startup flip pass completed'
+    );
+  } catch (err) {
+    logger.warn(
+      { err },
+      'Startup: full startup flip pass failed; continuing'
+    );
+  }
+
+  /*
+   * Start recurring services only after the startup scan has completed.
+   */
+  poller.start();
+  wsManager.start();
+  signalManager.start();
+  tradeManager.registerWs(wsManager);
+
+  app.get('/', (req, res) => {
+    res.json({
+      ok: true,
+      version: '0.3.0'
+    });
+  });
+
+  server = app.listen(PORT, () => {
+    logger.info(
+      { PORT },
+      'Server listening'
+    );
+  });
+
+  heartbeatInterval = setInterval(() => {
+    logger.info(
+      {
+        ts: new Date().toISOString()
+      },
+      'heartbeat'
+    );
+  }, 60_000);
+
+  logger.info('Startup complete');
+}
+
 async function start() {
   try {
-    logger.info('Starting app...');
-    db.init();
-
-    // init telegram early so any immediate notifications are possible
-    telegram.init();
-
-    // background bybit probe (non-blocking)
-    try {
-      const bybitRest = require('./services/bybitRest');
-      bybitRest.probeHosts(3000)
-        .then((base) => {
-          if (base) logger.info({ base }, 'probeHosts completed in background');
-          else logger.warn('probeHosts completed in background with no selected base');
-        })
-        .catch((e) => logger.debug({ e }, 'probeHosts background failure'));
-    } catch (e) {
-      logger.debug({ e }, 'probeHosts startup call failed');
-    }
-
-    // 1) Discover symbols
-    try {
-      logger.info('Startup: running initialScan() to populate symbols');
-      await poller.initialScan();
-    } catch (e) {
-      logger.warn({ e }, 'initialScan failed during startup (continuing)');
-    }
-
-    // 2) targeted synchronous seeding for a limited number of symbols so klines + MACD are available.
-    try {
-      const startupSeedCount = Number(process.env.STARTUP_SEED_SYMBOLS || config.STARTUP_SEED_SYMBOLS || 50);
-      let seedList = [];
-      try {
-        const dbInst = db.get();
-        const rows = dbInst.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC LIMIT ?').all(startupSeedCount);
-        seedList = rows.map(r => ({ symbol: r.symbol }));
-      } catch (e) {
-        logger.debug({ e }, 'Startup: failed to read symbols from DB for targeted seeding (will still attempt full iteration)');
-      }
-
-      if (seedList.length && typeof poller.backgroundSeedKlines === 'function') {
-        logger.info({ count: seedList.length }, 'Startup: seeding klines for top symbols before full flip pass');
-        await poller.backgroundSeedKlines(seedList);
-      } else {
-        logger.info('Startup: no targeted seed list available or backgroundSeedKlines not present; skipping targeted seeding');
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Startup: targeted seeding failed (continuing)');
-    }
-
-    // 3) Full iteration across all fetched symbols to detect flips (silent)
-    try {
-      logger.info('Startup: running full symbol flip pass (silent) to populate signals for summary');
-      if (typeof poller.scanAllForStartup === 'function') {
-        await poller.scanAllForStartup();
-      } else {
-        // fallback: silent scanOnce if scanAllForStartup not present
-        await poller.scanOnce({ notifyNewSignals: false });
-      }
-    } catch (e) {
-      logger.warn({ e }, 'Full flip pass failed during startup (continuing)');
-    }
-
-    // 4) send startup summary now that snapshot should be populated
-    try {
-      logger.info('Startup: sending startup summary (after full flip pass)');
-      await signalManager.sendStartupSummary();
-    } catch (e) {
-      logger.debug({ e }, 'Failed to send startup summary (non-fatal)');
-    }
-
-    // 5) start schedulers and managers
-    poller.start();
-    wsManager.start();
-    signalManager.start();
-    tradeManager.registerWs(wsManager);
-
-    app.get('/', (req, res) => res.json({ ok: true, version: '0.3.0' }));
-
-    server = app.listen(PORT, () => {
-      logger.info({ PORT }, 'Server listening');
-    });
-
-    heartbeatInterval = setInterval(() => {
-      logger.info('heartbeat', { ts: new Date().toISOString() });
-    }, 60_000);
-
-    logger.info('Startup complete');
+    logger.info('Starting app');
+    await runStartup();
   } catch (err) {
-    logger.error({ err }, 'Failed to start application');
+    logger.error(
+      { err },
+      'Failed to start application'
+    );
+
     process.exit(1);
   }
 }
 
 async function gracefulShutdown(signal) {
-  logger.info({ signal }, 'Starting graceful shutdown');
+  logger.info(
+    { signal },
+    'Starting graceful shutdown'
+  );
+
   try {
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
 
-    if (server && server.close) {
+    if (server && typeof server.close === 'function') {
       logger.info('Closing HTTP server');
-      await new Promise((resolve) => server.close(resolve));
+
+      await new Promise((resolve) => {
+        server.close(resolve);
+      });
     }
 
     try {
-      if (wsManager && typeof wsManager.closeAll === 'function') {
+      if (
+        wsManager &&
+        typeof wsManager.closeAll === 'function'
+      ) {
         await wsManager.closeAll();
-        logger.info('WS Manager closed all connections');
-      } else if (wsManager && Array.isArray(wsManager.connections)) {
-        wsManager.connections.forEach((c) => { try { c.ws && c.ws.close(); } catch (e) {} });
+
+        logger.info(
+          'WS manager closed all connections'
+        );
+      } else if (
+        wsManager &&
+        Array.isArray(wsManager.connections)
+      ) {
+        wsManager.connections.forEach((connection) => {
+          try {
+            if (connection.ws) {
+              connection.ws.close();
+            }
+          } catch (_) {
+            // Ignore individual connection close failures.
+          }
+        });
       }
-    } catch (e) {
-      logger.warn({ e }, 'Failed to close WS manager cleanly');
+    } catch (err) {
+      logger.warn(
+        { err },
+        'Failed to close WS manager cleanly'
+      );
     }
 
     try {
-      const dbInstance = db.get();
       if (db && typeof db.close === 'function') {
         db.close();
         logger.info('Database closed');
-      } else if (dbInstance && typeof dbInstance.close === 'function') {
-        dbInstance.close();
-        logger.info('Database closed (db.get())');
+      } else {
+        const dbInstance = db.get();
+
+        if (
+          dbInstance &&
+          typeof dbInstance.close === 'function'
+        ) {
+          dbInstance.close();
+          logger.info('Database closed through db.get()');
+        }
       }
-    } catch (e) {
-      logger.warn({ e }, 'Error closing DB');
+    } catch (err) {
+      logger.warn(
+        { err },
+        'Error closing database'
+      );
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 500);
+    });
   } catch (err) {
-    logger.error({ err }, 'Error during graceful shutdown');
+    logger.error(
+      { err },
+      'Error during graceful shutdown'
+    );
   } finally {
-    logger.info('Shutdown complete, exiting process');
+    logger.info(
+      'Shutdown complete, exiting process'
+    );
+
     process.exit(0);
   }
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => {
+  gracefulShutdown('SIGTERM');
+});
+
+process.on('SIGINT', () => {
+  gracefulShutdown('SIGINT');
+});
 
 start();
