@@ -79,10 +79,6 @@ function isUsdtSymbol(symbol) {
     return false;
   }
 
-  /*
-   * Exclude dated contracts and other symbols where characters follow
-   * the USDT suffix.
-   */
   if (/USDT[QHUZ0-9]/.test(value.slice(-6))) {
     return false;
   }
@@ -860,6 +856,7 @@ module.exports = {
             candle_open_time: Number(
               rows[0].open_time
             ),
+            event_type: 'startup',
             notifyImmediately: false
           });
 
@@ -879,6 +876,100 @@ module.exports = {
     }
 
     return results;
+  },
+
+  getRootBoundaryLabel(tf) {
+    const normalized = normalizeRootTf(tf);
+
+    if (normalized === '60') {
+      return '1h';
+    }
+
+    if (normalized === '240') {
+      return '4h';
+    }
+
+    if (normalized === 'D') {
+      return '1d';
+    }
+
+    return normalized;
+  },
+
+  async scanRootSymbolAtFiveMinuteBoundary(
+    symbol,
+    tf,
+    boundary
+  ) {
+    const db = dbModule.get();
+
+    await this.seedKlinesForSymbol(
+      symbol,
+      tf
+    );
+
+    const latestOpen =
+      getLatestOpenTime(
+        db,
+        symbol,
+        tf
+      );
+
+    if (latestOpen === null) {
+      return {
+        signal: null,
+        isNewRootCandle: false
+      };
+    }
+
+    const stateKey =
+      this.getLoop2ProcessedCandleKey(
+        symbol,
+        tf
+      );
+
+    const previousOpen = Number(
+      dbModule.getState(stateKey) || 0
+    );
+
+    const isNewRootCandle =
+      latestOpen > previousOpen;
+
+    const flip =
+      await macdUtil.isMacdFlip(
+        symbol,
+        tf
+      );
+
+    let signal = null;
+
+    if (flip || isNewRootCandle) {
+      signal =
+        await signalManager.handleRootSignal({
+          symbol,
+          root_tf: tf,
+          detected_at: boundary.getTime(),
+          candle_open_time: latestOpen,
+          event_type: isNewRootCandle
+            ? 'root_boundary'
+            : 'root_flip',
+          notifyImmediately: false
+        });
+    }
+
+    if (isNewRootCandle) {
+      dbModule.setState(
+        stateKey,
+        latestOpen
+      );
+    }
+
+    return {
+      signal,
+      isNewRootCandle,
+      latestOpen,
+      flip
+    };
   },
 
   /*
@@ -981,13 +1072,9 @@ module.exports = {
       {
         boundary: boundary.toISOString()
       },
-      'poller.loop2: starting exact five-minute boundary scan'
+      'poller.loop2: starting five-minute root scan'
     );
 
-    /*
-     * Refresh the symbol list, but do not launch another background
-     * seed. This boundary scan controls its own data refresh.
-     */
     await this.initialScan({
       seed: false
     });
@@ -1009,237 +1096,89 @@ module.exports = {
     );
 
     const rootTfs = buildRootTfs();
-    const newSignals = [];
-    const alignmentAlerts = [];
+    const signals = [];
 
     for (const row of validRows) {
-      const symbol = row.symbol;
-
       for (const tf of rootTfs) {
         try {
-          /*
-           * Refresh the current symbol/timeframe before evaluating it.
-           */
-          await this.seedKlinesForSymbol(
-            symbol,
-            tf
-          );
+          const result =
+            await this.scanRootSymbolAtFiveMinuteBoundary(
+              row.symbol,
+              tf,
+              boundary
+            );
 
-          const latestOpen = getLatestOpenTime(
-            db,
-            symbol,
-            tf
-          );
-
-          if (latestOpen === null) {
+          if (!result.signal) {
             continue;
           }
 
-          const processedStateKey =
-            this.getLoop2ProcessedCandleKey(
-              symbol,
-              tf
-            );
-
-          const processedOpen = Number(
-            dbModule.getState(
-              processedStateKey
-            ) || 0
-          );
-
-          /*
-           * Root MACD flip detection occurs only once for each newly
-           * observed candle.
-           */
-          if (latestOpen > processedOpen) {
-            const flip =
-              await macdUtil.isMacdFlip(
-                symbol,
-                tf
-              );
-
-            if (flip) {
-              const signal =
-                await signalManager.handleRootSignal({
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  notifyImmediately: false
-                });
-
-              if (signal) {
-                newSignals.push(signal);
-              }
-            }
-
-            /*
-             * Mark the candle after the refresh and MACD evaluation.
-             * If an exception occurred above, this state is not updated
-             * and the candle can be retried on the next boundary.
-             */
-            dbModule.setState(
-              processedStateKey,
-              latestOpen
-            );
-
-            logger.debug(
-              {
-                symbol,
-                tf,
-                latestOpen
-              },
-              'poller.loop2: processed newly opened root candle'
-            );
-          }
-
-          /*
-           * Alignment checks are independent of root-candle
-           * de-duplication, but only run for active signals.
-           */
-          const latestSignals =
-            dbModule.getLatestSignalsSnapshot();
-
-          const activeSignals =
-            latestSignals.filter((signal) => {
-              return (
-                signal.symbol === symbol &&
-                signal.root_tf === tf
-              );
-            });
-
-          if (activeSignals.length === 0) {
-            continue;
-          }
-
-          const alignment =
-            await signalManager.evaluateMtfAlignment(
-              symbol
-            );
-
-          const alignmentStateKey =
-            `poller.loop2.alignment.${symbol}.${tf}`;
-
-          const previousAlignment =
-            dbModule.getState(
-              alignmentStateKey
-            );
-
-          const nextAlignmentJson =
-            JSON.stringify(alignment || {});
-
-          if (
-            previousAlignment === nextAlignmentJson
-          ) {
-            continue;
-          }
-
-          dbModule.setState(
-            alignmentStateKey,
-            alignment || {}
-          );
-
-          const alignmentValues =
-            Object.values(alignment || {});
-
-          const positiveCount =
-            alignmentValues.filter((value) => {
-              return value && value.positive;
-            }).length;
-
-          const alignmentCount =
-            alignmentValues.length;
-
-          alignmentAlerts.push({
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            state: 'monitor',
-            meta: {
-              alignment: alignment || {},
-              decision: 'monitor',
-              acceptReason: 'mtf_alignment_alert',
-              tvScore: 0,
-              tvSource: 'loop2',
-              mtfScore: alignmentCount > 0
-                ? positiveCount / alignmentCount
-                : 0
-            }
+          signals.push({
+            ...result.signal,
+            is_new_root_candle:
+              result.isNewRootCandle,
+            root_boundary_label:
+              result.isNewRootCandle
+                ? this.getRootBoundaryLabel(tf)
+                : null
           });
         } catch (err) {
           logger.debug(
             {
               err,
-              symbol,
+              symbol: row.symbol,
               tf
             },
-            'poller.loop2: symbol/timeframe scan failed'
+            'poller.loop2: root scan failed'
           );
         }
       }
     }
 
-    /*
-     * Loop 2 sends realtime blocks only. It does not enqueue a startup
-     * batch and therefore does not generate summary/recommendation
-     * messages.
-     */
-    for (const signal of newSignals) {
-      try {
-        notificationQueue.enqueueSignal(
-          signal,
-          'realtime'
-        );
+    const signalsByTf = new Map();
 
-        logger.info(
-          {
-            symbol: signal.symbol,
-            root_tf: signal.root_tf
-          },
-          'poller.loop2: realtime root signal enqueued'
-        );
-      } catch (err) {
-        logger.warn(
-          {
-            err,
-            signal
-          },
-          'poller.loop2: failed to enqueue root signal'
-        );
+    for (const signal of signals) {
+      const tf = normalizeRootTf(
+        signal.root_tf
+      );
+
+      if (!signalsByTf.has(tf)) {
+        signalsByTf.set(tf, []);
       }
+
+      signalsByTf.get(tf).push(signal);
     }
 
-    for (const alert of alignmentAlerts) {
-      try {
-        notificationQueue.enqueueSignal(
-          alert,
-          'realtime'
-        );
+    for (const [tf, tfSignals] of signalsByTf) {
+      tfSignals.sort((a, b) =>
+        String(a.symbol).localeCompare(
+          String(b.symbol),
+          undefined,
+          { sensitivity: 'base' }
+        )
+      );
 
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf
-          },
-          'poller.loop2: realtime alignment alert enqueued'
-        );
-      } catch (err) {
-        logger.warn(
-          {
-            err,
-            alert
-          },
-          'poller.loop2: failed to enqueue alignment alert'
-        );
-      }
+      notificationQueue.enqueueBoundaryBatch({
+        root_tf: tf,
+        boundary,
+        signals: tfSignals
+      });
+
+      logger.info(
+        {
+          root_tf: tf,
+          signals: tfSignals.length
+        },
+        'poller.loop2: boundary notification batch enqueued'
+      );
     }
 
     logger.info(
       {
-        newSignals: newSignals.length,
-        alignmentAlerts: alignmentAlerts.length
+        boundary: boundary.toISOString(),
+        signals: signals.length,
+        timeframes: signalsByTf.size
       },
-      'poller.loop2: exact five-minute boundary scan completed'
+      'poller.loop2: five-minute root scan completed'
     );
   },
 
