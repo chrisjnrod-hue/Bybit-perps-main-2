@@ -7,24 +7,42 @@ const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
 
-const limiter = new Bottleneck({ minTime: 50 });
-const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
+const limiter = new Bottleneck({
+  minTime: 50
+});
+
+const SEED_CONCURRENCY = Number(
+  config.SEED_CONCURRENCY || 6
+);
+
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 
 let isRunning = false;
 let startupComplete = false;
+let boundaryScanInProgress = false;
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms || 0));
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms || 0);
+  });
 }
 
 function normalizeRootTf(tf) {
-  if (tf === null || tf === undefined) return null;
+  if (tf === null || tf === undefined) {
+    return null;
+  }
 
-  const value = String(tf).trim().toUpperCase();
+  const value = String(tf)
+    .trim()
+    .toUpperCase();
 
-  if (value === '1D' || value === 'D') return 'D';
-  if (value === '1H' || value === 'H') return '60';
+  if (value === '1D' || value === 'D') {
+    return 'D';
+  }
+
+  if (value === '1H' || value === 'H') {
+    return '60';
+  }
 
   return value;
 }
@@ -35,101 +53,132 @@ function buildRootTfs() {
     : ['60', '240', 'D'];
 
   const seen = new Set();
-  const out = [];
+  const output = [];
 
-  for (const tf of raw) {
-    const norm = normalizeRootTf(tf);
+  for (const timeframe of raw) {
+    const normalized = normalizeRootTf(timeframe);
 
-    if (!norm || seen.has(norm)) continue;
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
 
-    seen.add(norm);
-    out.push(norm);
+    seen.add(normalized);
+    output.push(normalized);
   }
 
-  return out.length ? out : ['60', '240', 'D'];
+  return output.length > 0
+    ? output
+    : ['60', '240', 'D'];
 }
 
 function isUsdtSymbol(symbol) {
-  const s = String(symbol || '').toUpperCase();
+  const value = String(symbol || '')
+    .toUpperCase();
 
-  if (!s) return false;
+  if (!value) {
+    return false;
+  }
 
-  if (/USDT[QHUZ0-9]/.test(s.slice(-6))) return false;
+  /*
+   * Exclude dated contracts and other symbols where characters follow
+   * the USDT suffix.
+   */
+  if (/USDT[QHUZ0-9]/.test(value.slice(-6))) {
+    return false;
+  }
 
-  return /USDT(\.P)?$/.test(s);
+  return /USDT(\.P)?$/.test(value);
+}
+
+function getLatestOpenTime(db, symbol, timeframe) {
+  const row = db
+    .prepare(
+      `
+        SELECT open_time
+        FROM klines
+        WHERE symbol = ?
+          AND timeframe = ?
+        ORDER BY open_time DESC
+        LIMIT 1
+      `
+    )
+    .get(symbol, timeframe);
+
+  if (!row) {
+    return null;
+  }
+
+  const openTime = Number(row.open_time);
+
+  return Number.isFinite(openTime)
+    ? openTime
+    : null;
 }
 
 module.exports = {
+  /*
+   * Start only the recurring polling loop.
+   *
+   * Startup discovery, startup seeding, and the startup flip scan are
+   * deliberately owned by index.js. Do not run initialScan() or
+   * scanAllForStartup() here.
+   */
   start() {
-    if (isRunning) return;
+    if (isRunning) {
+      logger.debug(
+        'poller.start: poller is already running'
+      );
+
+      return;
+    }
 
     isRunning = true;
-    startupComplete = false;
+    startupComplete = true;
 
     try {
-      signalManager.setOpenTradesAllowed(false);
-    } catch (e) {
-      // Ignore startup state errors.
+      signalManager.setOpenTradesAllowed(true);
+
+      logger.info(
+        'poller.start: open trades enabled'
+      );
+    } catch (err) {
+      logger.debug(
+        { err },
+        'poller.start: failed to enable open trades'
+      );
     }
 
-    try {
-      bybit.probeHosts(3000)
-        .then((base) => {
-          if (base) {
-            logger.info({ base }, 'probeHosts completed in background');
-          } else {
-            logger.warn('probeHosts completed in background with no selected base');
-          }
-        })
-        .catch((e) => {
-          logger.debug({ e }, 'probeHosts background failure');
-        });
-    } catch (e) {
-      logger.debug({ e }, 'probeHosts startup call failed');
-    }
+    this.startBoundaryScanLoop();
 
-    (async () => {
-      try {
-        logger.info('poller: starting initialScan');
-
-        await this.initialScan();
-
-        logger.info('poller: initialScan completed');
-
-        try {
-          await this.scanAllForStartup();
-          logger.info('poller: startup full scan completed');
-        } catch (err) {
-          logger.error({ err }, 'poller: scanAllForStartup error');
-        }
-
-        try {
-          signalManager.setOpenTradesAllowed(true);
-          logger.info('poller: open trades enabled after initial scan');
-        } catch (e) {
-          logger.debug({ e }, 'poller: failed to enable open trades');
-        }
-
-        // LOOP 2: exact five-minute boundary scan.
-        this.startBoundaryScanLoop();
-
-        // LOOP 3: exact root candle open scan.
-        this.startRootCandleOpenLoop();
-      } catch (err) {
-        logger.error({ err }, 'poller: initialScan failed');
-      }
-    })();
+    logger.info(
+      'poller.start: boundary scan loop started'
+    );
   },
 
-  async initialScan() {
-    logger.info('poller.initialScan: starting');
+  /*
+   * Discover and persist symbols.
+   *
+   * By default, this method preserves the previous background-seeding
+   * behavior. Startup and Loop 2 call it with { seed: false } so that
+   * they can control seeding explicitly.
+   */
+  async initialScan(options = {}) {
+    const {
+      seed = true
+    } = options;
+
+    logger.info(
+      { seed },
+      'poller.initialScan: starting'
+    );
 
     let allSymbols = [];
     const useWs = !!config.USE_WS;
 
     if (useWs) {
       try {
-        const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
+        const wsTimeoutMs =
+          config.WS_INITIAL_SCAN_TIMEOUT || 10000;
 
         logger.info(
           { timeoutMs: wsTimeoutMs },
@@ -139,16 +188,18 @@ module.exports = {
         allSymbols = await Promise.race([
           this.performWsInitialScan(),
           new Promise((_, reject) => {
-            setTimeout(
-              () => reject(new Error('WS scan timeout')),
-              wsTimeoutMs
-            );
+            setTimeout(() => {
+              reject(new Error('WS scan timeout'));
+            }, wsTimeoutMs);
           })
         ]);
 
-        if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
+        if (
+          !Array.isArray(allSymbols) ||
+          allSymbols.length === 0
+        ) {
           logger.warn(
-            'poller: WS initial scan returned no symbols; will fallback to REST'
+            'poller: WS initial scan returned no symbols; falling back to REST'
           );
 
           allSymbols = [];
@@ -158,83 +209,145 @@ module.exports = {
             'poller: WS initial scan provided symbols'
           );
         }
-      } catch (e) {
+      } catch (err) {
         logger.debug(
-          { e },
-          'poller: WS initial scan failed or timed out; fallback to REST'
+          { err },
+          'poller: WS initial scan failed or timed out; falling back to REST'
         );
 
         allSymbols = [];
       }
     }
 
-    if (!allSymbols || allSymbols.length === 0) {
+    if (
+      !Array.isArray(allSymbols) ||
+      allSymbols.length === 0
+    ) {
       logger.info(
-        'poller: fetching symbols via REST (cursor pagination for USDT perpetuals)'
+        'poller: fetching symbols via REST'
       );
 
       allSymbols = await bybit.fetchAllSymbols();
     }
 
-    if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
-      logger.warn('poller.initialScan: no symbols discovered');
-      return;
+    if (
+      !Array.isArray(allSymbols) ||
+      allSymbols.length === 0
+    ) {
+      logger.warn(
+        'poller.initialScan: no symbols discovered'
+      );
+
+      return [];
     }
 
     const db = dbModule.get();
 
     const insert = db.prepare(
-      'INSERT OR REPLACE INTO symbols ' +
-      '(symbol, base, quote, fetched_at) VALUES (?, ?, ?, ?)'
+      `
+        INSERT OR REPLACE INTO symbols
+          (symbol, base, quote, fetched_at)
+        VALUES (?, ?, ?, ?)
+      `
     );
 
     const now = Date.now();
 
     const insertMany = db.transaction((rows) => {
-      for (const s of rows) {
+      for (const symbolInfo of rows) {
+        if (
+          !symbolInfo ||
+          !symbolInfo.symbol
+        ) {
+          continue;
+        }
+
         insert.run(
-          s.symbol,
-          s.base || s.symbol.replace(/USDT(\.P)?$/i, ''),
-          s.quote || 'USDT',
+          symbolInfo.symbol,
+          symbolInfo.base ||
+            symbolInfo.symbol.replace(
+              /USDT(\.P)?$/i,
+              ''
+            ),
+          symbolInfo.quote || 'USDT',
           now
         );
       }
     });
 
-    insertMany(allSymbols.filter(s => s && s.symbol));
-
-    logger.info(
-      { total: allSymbols.length },
-      'poller.initialScan: symbols persisted (USDT perpetuals only)'
+    insertMany(
+      allSymbols.filter((symbolInfo) =>
+        symbolInfo &&
+        symbolInfo.symbol
+      )
     );
 
-    const seedSymbols = bybit.getSeedSymbols(allSymbols);
+    logger.info(
+      {
+        total: allSymbols.length
+      },
+      'poller.initialScan: symbols persisted'
+    );
 
-    if (seedSymbols && seedSymbols.length) {
-      const invalidSymbols = seedSymbols.filter(s => {
-        const sym = String(s.symbol || '').toUpperCase();
+    const seedSymbols =
+      bybit.getSeedSymbols(allSymbols);
 
-        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return true;
+    if (
+      seedSymbols &&
+      seedSymbols.length > 0
+    ) {
+      const invalidSymbols = seedSymbols.filter(
+        (seedSymbol) => {
+          const symbol = String(
+            seedSymbol.symbol || ''
+          ).toUpperCase();
 
-        return !/USDT(\.P)?$/.test(sym);
-      });
+          if (
+            /USDT[QHUZ0-9]/.test(
+              symbol.slice(-6)
+            )
+          ) {
+            return true;
+          }
+
+          return !/USDT(\.P)?$/.test(symbol);
+        }
+      );
 
       if (invalidSymbols.length > 0) {
         logger.error(
           {
             count: invalidSymbols.length,
-            samples: invalidSymbols.slice(0, 5).map(s => s.symbol)
+            samples: invalidSymbols
+              .slice(0, 5)
+              .map((item) => item.symbol)
           },
-          'poller.initialScan: CRITICAL - invalid symbols in seed list! These should have been filtered.'
+          'poller.initialScan: invalid symbols in seed list'
         );
       }
 
-      setImmediate(() => this.backgroundSeedKlines(seedSymbols));
+      if (seed) {
+        setImmediate(() => {
+          this.backgroundSeedKlines(seedSymbols)
+            .catch((err) => {
+              logger.debug(
+                { err },
+                'poller.initialScan: background seeding failed'
+              );
+            });
+        });
+      } else {
+        logger.debug(
+          'poller.initialScan: background seeding disabled'
+        );
+      }
     } else {
       logger.info(
-        'poller.initialScan: no seed symbols to process (SYMBOL_SEED_ALL disabled or none)'
+        'poller.initialScan: no seed symbols to process'
       );
     }
+
+    return allSymbols;
   },
 
   async performWsInitialScan() {
@@ -245,20 +358,32 @@ module.exports = {
         wsManager &&
         typeof wsManager.performInitialScan === 'function'
       ) {
-        const res = await wsManager.performInitialScan();
+        const result =
+          await wsManager.performInitialScan();
 
-        return Array.isArray(res) ? res : [];
+        return Array.isArray(result)
+          ? result
+          : [];
       }
-    } catch (e) {
-      logger.debug({ e }, 'performWsInitialScan failed');
+    } catch (err) {
+      logger.debug(
+        { err },
+        'poller.performWsInitialScan failed'
+      );
     }
 
     return [];
   },
 
   async backgroundSeedKlines(symbols = []) {
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      logger.info('backgroundSeedKlines: nothing to seed');
+    if (
+      !Array.isArray(symbols) ||
+      symbols.length === 0
+    ) {
+      logger.info(
+        'backgroundSeedKlines: nothing to seed'
+      );
+
       return;
     }
 
@@ -270,43 +395,62 @@ module.exports = {
       'backgroundSeedKlines: starting'
     );
 
-    for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
-      const batch = symbols.slice(i, i + SEED_CONCURRENCY);
-
-      const jobs = batch.map(s =>
-        limiter.schedule(() => this.seedKlinesForSymbol(s.symbol))
+    for (
+      let i = 0;
+      i < symbols.length;
+      i += SEED_CONCURRENCY
+    ) {
+      const batch = symbols.slice(
+        i,
+        i + SEED_CONCURRENCY
       );
+
+      const jobs = batch.map((item) => {
+        return limiter.schedule(() =>
+          this.seedKlinesForSymbol(item.symbol)
+        );
+      });
 
       try {
         await Promise.all(jobs);
-      } catch (e) {
+      } catch (err) {
         logger.debug(
-          { e },
-          'backgroundSeedKlines: batch failed (continuing)'
+          { err },
+          'backgroundSeedKlines: batch failed; continuing'
         );
       }
     }
 
-    logger.info('backgroundSeedKlines: completed');
+    logger.info(
+      'backgroundSeedKlines: completed'
+    );
   },
 
-  async seedKlinesForSymbol(symbol, timeframe = null) {
+  async seedKlinesForSymbol(
+    symbol,
+    timeframe = null
+  ) {
     try {
-      const symUpper = String(symbol || '').toUpperCase();
+      const symbolUpper = String(symbol || '')
+        .toUpperCase();
 
       if (!isUsdtSymbol(symbol)) {
         logger.warn(
           { symbol },
-          'seedKlinesForSymbol: symbol is not valid USDT, skipping'
+          'seedKlinesForSymbol: invalid USDT symbol; skipping'
         );
 
         return;
       }
 
-      if (/USDT[QHUZ0-9]/.test(symUpper.slice(-6))) {
+      if (
+        /USDT[QHUZ0-9]/.test(
+          symbolUpper.slice(-6)
+        )
+      ) {
         logger.warn(
           { symbol },
-          'seedKlinesForSymbol: symbol is a dated variant, skipping'
+          'seedKlinesForSymbol: dated variant; skipping'
         );
 
         return;
@@ -314,23 +458,28 @@ module.exports = {
 
       const rootTfs = timeframe
         ? [String(timeframe)]
-        : (config.ROOT_TFS || []);
+        : (
+            Array.isArray(config.ROOT_TFS)
+              ? config.ROOT_TFS
+              : buildRootTfs()
+          );
 
       const mtfTfs = Array.isArray(config.MTF_TFS)
         ? config.MTF_TFS.map(String)
         : [];
 
-      const tfsSet = new Set([
-        ...(rootTfs || []),
-        ...(mtfTfs || [])
-      ]);
+      const timeframes = Array.from(
+        new Set([
+          ...rootTfs,
+          ...mtfTfs
+        ])
+      );
 
-      const tfs = Array.from(tfsSet);
-
-      for (const tf of tfs) {
-        const interval = normalizeRootTf(tf) === 'D'
-          ? 'D'
-          : String(tf);
+      for (const tf of timeframes) {
+        const interval =
+          normalizeRootTf(tf) === 'D'
+            ? 'D'
+            : String(tf);
 
         try {
           const klines = await limiter.schedule(() =>
@@ -341,10 +490,13 @@ module.exports = {
             )
           );
 
-          if (!klines || klines.length === 0) {
+          if (
+            !klines ||
+            klines.length === 0
+          ) {
             logger.debug(
               { symbol, tf },
-              'seedKlinesForSymbol: no klines returned from API'
+              'seedKlinesForSymbol: no klines returned'
             );
 
             continue;
@@ -353,22 +505,33 @@ module.exports = {
           const db = dbModule.get();
 
           const insert = db.prepare(
-            'INSERT OR IGNORE INTO klines ' +
-            '(symbol, timeframe, open_time, open, high, low, close, volume) ' +
-            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+            `
+              INSERT OR IGNORE INTO klines
+                (
+                  symbol,
+                  timeframe,
+                  open_time,
+                  open,
+                  high,
+                  low,
+                  close,
+                  volume
+                )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `
           );
 
           const insertMany = db.transaction((rows) => {
-            for (const k of rows) {
+            for (const kline of rows) {
               insert.run(
                 symbol,
                 tf,
-                k.open_time,
-                k.open,
-                k.high,
-                k.low,
-                k.close,
-                k.volume
+                kline.open_time,
+                kline.open,
+                kline.high,
+                kline.low,
+                kline.close,
+                kline.volume
               );
             }
           });
@@ -376,199 +539,340 @@ module.exports = {
           insertMany(klines);
 
           logger.debug(
-            { symbol, tf, count: klines.length },
+            {
+              symbol,
+              tf,
+              count: klines.length
+            },
             'seedKlinesForSymbol: klines persisted'
           );
 
+          /*
+           * This repository currently exposes computeMacdHistogram()
+           * rather than computeAndStoreMacd(). Warm the calculation when
+           * available, but do not fail seeding if MACD warm-up fails.
+           */
           try {
             if (
-              typeof macdUtil.computeAndStoreMacd === 'function'
+              typeof macdUtil.computeAndStoreMacd ===
+              'function'
             ) {
-              await macdUtil.computeAndStoreMacd(symbol, tf);
+              await macdUtil.computeAndStoreMacd(
+                symbol,
+                tf
+              );
             } else if (
-              typeof macdUtil.computeMacdHistogram === 'function'
+              typeof macdUtil.computeMacdHistogram ===
+              'function'
             ) {
-              await macdUtil.computeMacdHistogram(symbol, tf);
+              await macdUtil.computeMacdHistogram(
+                symbol,
+                tf
+              );
             }
           } catch (err) {
             logger.debug(
-              { err, symbol, tf },
-              'seedKlinesForSymbol: macd warm-up failed (continuing)'
+              {
+                err,
+                symbol,
+                tf
+              },
+              'seedKlinesForSymbol: MACD warm-up failed'
             );
           }
         } catch (err) {
           logger.debug(
-            { err, symbol, tf },
-            'seedKlinesForSymbol: fetch failed (skipping tf)'
+            {
+              err,
+              symbol,
+              tf
+            },
+            'seedKlinesForSymbol: timeframe fetch failed'
           );
         }
       }
     } catch (err) {
       logger.debug(
-        { err, symbol, timeframe },
+        {
+          err,
+          symbol,
+          timeframe
+        },
         'seedKlinesForSymbol: unexpected error'
       );
     }
   },
 
+  /*
+   * Perform the one and only startup signal scan.
+   *
+   * index.js calls this after controlled startup seeding. This method
+   * enqueues one startup batch and initializes Loop 2's candle state.
+   */
   async scanAllForStartup() {
     if (startupComplete) {
-      logger.info(
-        'scanAllForStartup: already completed, skipping'
+      logger.debug(
+        'scanAllForStartup: startup scan already completed'
       );
 
-      return;
+      return [];
     }
 
-    try {
-      logger.info('scanAllForStartup: starting full startup pass');
+    logger.info(
+      'scanAllForStartup: starting full startup pass'
+    );
 
+    try {
       const db = dbModule.get();
 
-      const rows = db.prepare(
-        'SELECT symbol FROM symbols ' +
-        'ORDER BY symbol COLLATE NOCASE ASC'
-      ).all();
+      const rows = db
+        .prepare(
+          `
+            SELECT symbol
+            FROM symbols
+            ORDER BY symbol COLLATE NOCASE ASC
+          `
+        )
+        .all();
 
-      const invalidSymbols = rows.filter(r => {
-        const sym = String(r.symbol || '').toUpperCase();
+      const validRows = rows.filter((row) =>
+        isUsdtSymbol(row.symbol)
+      );
 
-        if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) return true;
+      const invalidCount =
+        rows.length - validRows.length;
 
-        return !isUsdtSymbol(r.symbol);
-      });
-
-      if (invalidSymbols.length > 0) {
+      if (invalidCount > 0) {
         logger.warn(
           {
-            count: invalidSymbols.length,
-            samples: invalidSymbols.slice(0, 5).map(r => r.symbol)
+            invalidCount
           },
-          'scanAllForStartup: WARNING - database contains invalid symbols! These will be skipped.'
+          'scanAllForStartup: invalid symbols skipped'
         );
       }
 
       const newSignals = [];
+      const pageSize = Number(
+        config.PAGE_SIZE || 25
+      );
 
       for (
         let i = 0;
-        i < rows.length;
-        i += config.PAGE_SIZE
+        i < validRows.length;
+        i += pageSize
       ) {
-        const page = rows.slice(i, i + config.PAGE_SIZE);
+        const page = validRows.slice(
+          i,
+          i + pageSize
+        );
 
-        const tasks = page
-          .filter(r => isUsdtSymbol(r.symbol))
-          .map(r => this.scanSymbolRoots(r.symbol));
+        const results = await Promise.all(
+          page.map((row) =>
+            this.scanSymbolRoots(row.symbol)
+          )
+        );
 
-        try {
-          const results = await Promise.all(tasks);
-
-          newSignals.push(...results.flat());
-        } catch (e) {
-          logger.debug(
-            { e },
-            'scanAllForStartup: page tasks error (continuing)'
-          );
-        }
+        newSignals.push(...results.flat());
       }
 
       newSignals.sort((a, b) => {
-        const symA = String(a.symbol || '').toUpperCase();
-        const symB = String(b.symbol || '').toUpperCase();
+        const symbolA = String(
+          a.symbol || ''
+        ).toUpperCase();
 
-        return symA.localeCompare(symB);
+        const symbolB = String(
+          b.symbol || ''
+        ).toUpperCase();
+
+        return symbolA.localeCompare(symbolB);
       });
 
       if (newSignals.length > 0) {
         logger.info(
-          { newSignals: newSignals.length },
-          'scanAllForStartup: enqueuing startup batch to notification queue'
+          {
+            count: newSignals.length
+          },
+          'scanAllForStartup: enqueueing startup notification batch'
         );
 
-        notificationQueue.enqueueStartupBatch(newSignals);
+        notificationQueue.enqueueStartupBatch(
+          newSignals
+        );
       } else {
         logger.info(
-          'scanAllForStartup: no new signals found'
+          'scanAllForStartup: no startup signals found'
         );
       }
+
+      /*
+       * The startup pass has already examined the latest available
+       * candle. Loop 2 must not treat that existing candle as new at
+       * the first five-minute boundary after deployment.
+       */
+      this.initializeBoundaryCandleState(
+        validRows,
+        db
+      );
 
       startupComplete = true;
 
       logger.info(
-        'scanAllForStartup: completed full startup pass (USDT perpetuals only)'
+        'scanAllForStartup: completed'
       );
+
+      return newSignals;
     } catch (err) {
       logger.error(
-        { err },
+        {
+          err
+        },
         'scanAllForStartup: unexpected error'
       );
+
+      return [];
     }
   },
 
+  initializeBoundaryCandleState(rows, db) {
+    const rootTfs = buildRootTfs();
+
+    for (const row of rows) {
+      const symbol = row.symbol;
+
+      for (const tf of rootTfs) {
+        const latestOpen = getLatestOpenTime(
+          db,
+          symbol,
+          tf
+        );
+
+        if (latestOpen === null) {
+          continue;
+        }
+
+        dbModule.setState(
+          this.getLoop2ProcessedCandleKey(
+            symbol,
+            tf
+          ),
+          latestOpen
+        );
+      }
+    }
+
+    logger.info(
+      {
+        symbols: rows.length,
+        timeframes: rootTfs.length
+      },
+      'poller: initialized boundary candle state'
+    );
+  },
+
   async scanSymbolRoots(symbol) {
-    const tfList = buildRootTfs();
+    const rootTfs = buildRootTfs();
     const results = [];
 
     if (!isUsdtSymbol(symbol)) {
       logger.warn(
-        { symbol },
-        'scanSymbolRoots: symbol is not valid USDT, skipping'
+        {
+          symbol
+        },
+        'scanSymbolRoots: invalid USDT symbol; skipping'
       );
 
       return results;
     }
 
-    for (const tf of tfList) {
+    for (const tf of rootTfs) {
       try {
         const db = dbModule.get();
 
-        const selectStmt = db.prepare(
-          'SELECT open_time, close, open FROM klines ' +
-          'WHERE symbol=? AND timeframe=? ' +
-          'ORDER BY open_time DESC LIMIT 2'
+        const selectStatement = db.prepare(
+          `
+            SELECT open_time, close, open
+            FROM klines
+            WHERE symbol = ?
+              AND timeframe = ?
+            ORDER BY open_time DESC
+            LIMIT 2
+          `
         );
 
-        let rows = selectStmt.all(symbol, tf);
+        let rows = selectStatement.all(
+          symbol,
+          tf
+        );
 
-        if (!rows || rows.length < 2) {
+        if (
+          !rows ||
+          rows.length < 2
+        ) {
           logger.debug(
-            { symbol, tf },
-            'scanSymbolRoots: insufficient klines, seeding now'
+            {
+              symbol,
+              tf
+            },
+            'scanSymbolRoots: insufficient klines; seeding'
           );
 
-          await this.seedKlinesForSymbol(symbol, tf);
+          await this.seedKlinesForSymbol(
+            symbol,
+            tf
+          );
 
-          rows = selectStmt.all(symbol, tf);
+          rows = selectStatement.all(
+            symbol,
+            tf
+          );
 
-          if (!rows || rows.length < 2) {
+          if (
+            !rows ||
+            rows.length < 2
+          ) {
             logger.debug(
-              { symbol, tf },
-              'scanSymbolRoots: still insufficient klines after seeding, skipping tf'
+              {
+                symbol,
+                tf
+              },
+              'scanSymbolRoots: still insufficient klines'
             );
 
             continue;
           }
         }
 
-        const flip = await require('./macd').isMacdFlip(
-          symbol,
-          tf
-        );
+        const flip =
+          await macdUtil.isMacdFlip(
+            symbol,
+            tf
+          );
 
-        if (flip) {
-          const sig = await require('./signalManager').handleRootSignal({
+        if (!flip) {
+          continue;
+        }
+
+        const signal =
+          await signalManager.handleRootSignal({
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
+            candle_open_time: Number(
+              rows[0].open_time
+            ),
             notifyImmediately: false
           });
 
-          if (sig) results.push(sig);
+        if (signal) {
+          results.push(signal);
         }
       } catch (err) {
         logger.debug(
-          { err, symbol, tf },
+          {
+            err,
+            symbol,
+            tf
+          },
           'scanSymbolRoots: error checking flip'
         );
       }
@@ -577,14 +881,19 @@ module.exports = {
     return results;
   },
 
-  // Returns the next exact UTC five-minute boundary.
-  //
-  // Examples:
-  //   12:00:01 -> 12:05:00
-  //   12:04:59 -> 12:05:00
-  //   12:05:00 -> 12:10:00
-  getNextFiveMinuteBoundaryMs(nowMs = Date.now()) {
-    const remainder = nowMs % FIVE_MINUTES_MS;
+  /*
+   * Return the next exact UTC five-minute boundary.
+   *
+   * Examples:
+   *   12:00:01 -> 12:05:00
+   *   12:04:59 -> 12:05:00
+   *   12:05:00 -> 12:10:00
+   */
+  getNextFiveMinuteBoundaryMs(
+    nowMs = Date.now()
+  ) {
+    const remainder =
+      nowMs % FIVE_MINUTES_MS;
 
     return nowMs + (
       remainder === 0
@@ -593,515 +902,348 @@ module.exports = {
     );
   },
 
-  // ===========================================================
-  // LOOP 2: exact five-minute boundary scan.
-  //
-  // Behavior:
-  // - waits for exact UTC five-minute boundaries
-  // - refreshes/seed data like the initial deployment scan
-  // - detects each symbol/timeframe once per newly opened root candle
-  // - sends only one signal block per new root signal
-  // - sends only one block per changed MTF alignment state
-  // - sends no summary block
-  // - sends no recommended block
-  // ===========================================================
+  /*
+   * Start Loop 2.
+   *
+   * There is intentionally no Loop 3. Having two loops call
+   * handleRootSignal() for the same root candle caused duplicate and
+   * delayed startup-style notifications.
+   */
   startBoundaryScanLoop() {
     setImmediate(() => {
-      this.runBoundaryScanLoop().catch((err) => {
-        logger.error(
-          { err },
-          'poller: boundary scan loop crashed'
-        );
-      });
+      this.runBoundaryScanLoop()
+        .catch((err) => {
+          logger.error(
+            {
+              err
+            },
+            'poller: boundary scan loop crashed'
+          );
+        });
     });
   },
 
   async runBoundaryScanLoop() {
     while (isRunning) {
-      try {
-        /*
-         * Wait until the next exact UTC five-minute boundary instead
-         * of sleeping for five minutes from the previous scan's
-         * completion time.
-         */
-        const nextBoundary = this.getNextFiveMinuteBoundaryMs();
-        const delay = Math.max(0, nextBoundary - Date.now());
+      const nextBoundary =
+        this.getNextFiveMinuteBoundaryMs();
 
-        logger.debug(
-          {
-            nextBoundary: new Date(nextBoundary).toISOString(),
-            delayMs: delay
-          },
-          'poller.loop2: waiting for next five-minute boundary'
-        );
+      const delay = Math.max(
+        0,
+        nextBoundary - Date.now()
+      );
 
-        await sleep(delay);
+      logger.debug(
+        {
+          nextBoundary: new Date(
+            nextBoundary
+          ).toISOString(),
+          delayMs: delay
+        },
+        'poller.loop2: waiting for next five-minute boundary'
+      );
 
-        if (!isRunning) break;
+      await sleep(delay);
 
-        logger.info(
-          {
-            boundary: new Date().toISOString()
-          },
-          'poller.loop2: starting exact five-minute boundary scan'
-        );
-
-        /*
-         * Refresh symbols and perform the same initial data refresh/
-         * background seeding behavior used during deployment.
-         */
-        await this.initialScan();
-
-        const db = dbModule.get();
-
-        const rows = db.prepare(
-          'SELECT symbol FROM symbols ' +
-          'ORDER BY symbol COLLATE NOCASE ASC'
-        ).all();
-
-        const validRows = rows.filter(r =>
-          isUsdtSymbol(r.symbol)
-        );
-
-        const rootTfs = buildRootTfs();
-
-        const newSignals = [];
-        const alignmentAlerts = [];
-
-        for (const row of validRows) {
-          const symbol = row.symbol;
-
-          for (const tf of rootTfs) {
-            try {
-              /*
-               * Always refresh the current root timeframe before
-               * determining whether a new candle has opened.
-               */
-              await this.seedKlinesForSymbol(symbol, tf);
-
-              const latestRows = db.prepare(
-                'SELECT open_time, close, open FROM klines ' +
-                'WHERE symbol=? AND timeframe=? ' +
-                'ORDER BY open_time DESC LIMIT 2'
-              ).all(symbol, tf);
-
-              if (!latestRows || latestRows.length < 2) {
-                logger.debug(
-                  { symbol, tf },
-                  'poller.loop2: insufficient root klines after seeding'
-                );
-
-                continue;
-              }
-
-              /*
-               * Track the latest processed candle, not merely whether
-               * this symbol/timeframe was seen before.
-               *
-               * This allows a new signal to be detected when the next
-               * root candle opens while preventing duplicate processing
-               * during later Loop 2 scans for the same candle.
-               */
-              const latestOpen = Number(
-                latestRows[0].open_time
-              );
-
-              if (!Number.isFinite(latestOpen)) {
-                logger.debug(
-                  { symbol, tf },
-                  'poller.loop2: invalid latest root candle open_time'
-                );
-
-                continue;
-              }
-
-              const processedStateKey =
-                this.getLoop2ProcessedCandleKey(symbol, tf);
-
-              const processedOpen = Number(
-                dbModule.getState(processedStateKey) || 0
-              );
-
-              if (
-                !Number.isFinite(processedOpen) ||
-                latestOpen > processedOpen
-              ) {
-                const flip = await require('./macd').isMacdFlip(
-                  symbol,
-                  tf
-                );
-
-                if (flip) {
-                  const sig =
-                    await signalManager.handleRootSignal({
-                      symbol,
-                      root_tf: tf,
-                      detected_at: Date.now(),
-                      notifyImmediately: false
-                    });
-
-                  if (sig) {
-                    newSignals.push(sig);
-                  }
-                }
-
-                /*
-                 * Mark this candle as processed only after the refresh
-                 * and MACD check completed. If the refresh/check throws,
-                 * the outer catch leaves the previous state intact and
-                 * allows the candle to be retried on the next boundary.
-                 */
-                dbModule.setState(
-                  processedStateKey,
-                  latestOpen
-                );
-
-                logger.debug(
-                  {
-                    symbol,
-                    tf,
-                    latestOpen
-                  },
-                  'poller.loop2: processed new root candle'
-                );
-              }
-
-              /*
-               * MTF alignment alerts are evaluated for monitored/active
-               * root signals. They remain independent of the root candle
-               * de-duplication above.
-               */
-              const latestSignals =
-                dbModule.getLatestSignalsSnapshot();
-
-              const active = latestSignals.filter(s =>
-                s.symbol === symbol &&
-                s.root_tf === tf
-              );
-
-              if (active.length > 0) {
-                const alignment =
-                  await signalManager.evaluateMtfAlignment(symbol);
-
-                const alignmentStateKey =
-                  `poller.loop2.alignment.${symbol}.${tf}`;
-
-                const prevAlignment =
-                  dbModule.getState(alignmentStateKey);
-
-                const nextAlignmentJson =
-                  JSON.stringify(alignment || {});
-
-                if (prevAlignment !== nextAlignmentJson) {
-                  dbModule.setState(
-                    alignmentStateKey,
-                    alignment || {}
-                  );
-
-                  alignmentAlerts.push({
-                    symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    state: 'monitor',
-                    meta: {
-                      alignment: alignment || {},
-                      decision: 'monitor',
-                      acceptReason: 'mtf_alignment_alert',
-                      tvScore: 0,
-                      tvSource: 'loop2',
-                      mtfScore: Object.keys(alignment || {}).length
-                        ? (
-                            Object.values(alignment || {})
-                              .filter(v => v && v.positive)
-                              .length /
-                            Object.keys(alignment || {}).length
-                          )
-                        : 0
-                    }
-                  });
-                }
-              }
-            } catch (e) {
-              logger.debug(
-                { e, symbol, tf },
-                'poller.loop2: root check failed'
-              );
-            }
-          }
-        }
-
-        /*
-         * Loop 2 deliberately uses enqueueSignal() for every item.
-         * It does not use enqueueStartupBatch(), so it cannot create
-         * the startup summary or recommended blocks.
-         */
-        for (const sig of newSignals) {
-          try {
-            notificationQueue.enqueueSignal(
-              sig,
-              'realtime'
-            );
-
-            logger.info(
-              {
-                symbol: sig.symbol,
-                root_tf: sig.root_tf
-              },
-              'poller.loop2: enqueued one new root signal block'
-            );
-          } catch (e) {
-            logger.warn(
-              { e, sig },
-              'poller.loop2: failed to enqueue new root signal'
-            );
-          }
-        }
-
-        for (const al of alignmentAlerts) {
-          try {
-            notificationQueue.enqueueSignal(
-              al,
-              'realtime'
-            );
-
-            logger.info(
-              {
-                symbol: al.symbol,
-                root_tf: al.root_tf
-              },
-              'poller.loop2: enqueued one MTF alignment alert block'
-            );
-          } catch (e) {
-            logger.warn(
-              { e, al },
-              'poller.loop2: failed to enqueue alignment alert'
-            );
-          }
-        }
-
-        logger.info(
-          {
-            newSignals: newSignals.length,
-            alignmentAlerts: alignmentAlerts.length
-          },
-          'poller.loop2: exact five-minute boundary scan completed'
-        );
-      } catch (err) {
-        logger.error(
-          { err },
-          'poller.loop2: unexpected error'
-        );
+      if (!isRunning) {
+        break;
       }
 
-      /*
-       * Do not sleep for a fixed five minutes here. The next loop
-       * iteration recalculates the next exact UTC five-minute boundary.
-       */
+      if (boundaryScanInProgress) {
+        logger.warn(
+          'poller.loop2: previous boundary scan is still running; skipping boundary'
+        );
+
+        continue;
+      }
+
+      boundaryScanInProgress = true;
+
+      try {
+        await this.runBoundaryScanOnce();
+      } catch (err) {
+        logger.error(
+          {
+            err
+          },
+          'poller.loop2: boundary scan failed'
+        );
+      } finally {
+        boundaryScanInProgress = false;
+      }
     }
+  },
+
+  async runBoundaryScanOnce() {
+    const boundary = new Date();
+
+    logger.info(
+      {
+        boundary: boundary.toISOString()
+      },
+      'poller.loop2: starting exact five-minute boundary scan'
+    );
+
+    /*
+     * Refresh the symbol list, but do not launch another background
+     * seed. This boundary scan controls its own data refresh.
+     */
+    await this.initialScan({
+      seed: false
+    });
+
+    const db = dbModule.get();
+
+    const rows = db
+      .prepare(
+        `
+          SELECT symbol
+          FROM symbols
+          ORDER BY symbol COLLATE NOCASE ASC
+        `
+      )
+      .all();
+
+    const validRows = rows.filter((row) =>
+      isUsdtSymbol(row.symbol)
+    );
+
+    const rootTfs = buildRootTfs();
+    const newSignals = [];
+    const alignmentAlerts = [];
+
+    for (const row of validRows) {
+      const symbol = row.symbol;
+
+      for (const tf of rootTfs) {
+        try {
+          /*
+           * Refresh the current symbol/timeframe before evaluating it.
+           */
+          await this.seedKlinesForSymbol(
+            symbol,
+            tf
+          );
+
+          const latestOpen = getLatestOpenTime(
+            db,
+            symbol,
+            tf
+          );
+
+          if (latestOpen === null) {
+            continue;
+          }
+
+          const processedStateKey =
+            this.getLoop2ProcessedCandleKey(
+              symbol,
+              tf
+            );
+
+          const processedOpen = Number(
+            dbModule.getState(
+              processedStateKey
+            ) || 0
+          );
+
+          /*
+           * Root MACD flip detection occurs only once for each newly
+           * observed candle.
+           */
+          if (latestOpen > processedOpen) {
+            const flip =
+              await macdUtil.isMacdFlip(
+                symbol,
+                tf
+              );
+
+            if (flip) {
+              const signal =
+                await signalManager.handleRootSignal({
+                  symbol,
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  notifyImmediately: false
+                });
+
+              if (signal) {
+                newSignals.push(signal);
+              }
+            }
+
+            /*
+             * Mark the candle after the refresh and MACD evaluation.
+             * If an exception occurred above, this state is not updated
+             * and the candle can be retried on the next boundary.
+             */
+            dbModule.setState(
+              processedStateKey,
+              latestOpen
+            );
+
+            logger.debug(
+              {
+                symbol,
+                tf,
+                latestOpen
+              },
+              'poller.loop2: processed newly opened root candle'
+            );
+          }
+
+          /*
+           * Alignment checks are independent of root-candle
+           * de-duplication, but only run for active signals.
+           */
+          const latestSignals =
+            dbModule.getLatestSignalsSnapshot();
+
+          const activeSignals =
+            latestSignals.filter((signal) => {
+              return (
+                signal.symbol === symbol &&
+                signal.root_tf === tf
+              );
+            });
+
+          if (activeSignals.length === 0) {
+            continue;
+          }
+
+          const alignment =
+            await signalManager.evaluateMtfAlignment(
+              symbol
+            );
+
+          const alignmentStateKey =
+            `poller.loop2.alignment.${symbol}.${tf}`;
+
+          const previousAlignment =
+            dbModule.getState(
+              alignmentStateKey
+            );
+
+          const nextAlignmentJson =
+            JSON.stringify(alignment || {});
+
+          if (
+            previousAlignment === nextAlignmentJson
+          ) {
+            continue;
+          }
+
+          dbModule.setState(
+            alignmentStateKey,
+            alignment || {}
+          );
+
+          const alignmentValues =
+            Object.values(alignment || {});
+
+          const positiveCount =
+            alignmentValues.filter((value) => {
+              return value && value.positive;
+            }).length;
+
+          const alignmentCount =
+            alignmentValues.length;
+
+          alignmentAlerts.push({
+            symbol,
+            root_tf: tf,
+            detected_at: Date.now(),
+            state: 'monitor',
+            meta: {
+              alignment: alignment || {},
+              decision: 'monitor',
+              acceptReason: 'mtf_alignment_alert',
+              tvScore: 0,
+              tvSource: 'loop2',
+              mtfScore: alignmentCount > 0
+                ? positiveCount / alignmentCount
+                : 0
+            }
+          });
+        } catch (err) {
+          logger.debug(
+            {
+              err,
+              symbol,
+              tf
+            },
+            'poller.loop2: symbol/timeframe scan failed'
+          );
+        }
+      }
+    }
+
+    /*
+     * Loop 2 sends realtime blocks only. It does not enqueue a startup
+     * batch and therefore does not generate summary/recommendation
+     * messages.
+     */
+    for (const signal of newSignals) {
+      try {
+        notificationQueue.enqueueSignal(
+          signal,
+          'realtime'
+        );
+
+        logger.info(
+          {
+            symbol: signal.symbol,
+            root_tf: signal.root_tf
+          },
+          'poller.loop2: realtime root signal enqueued'
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            signal
+          },
+          'poller.loop2: failed to enqueue root signal'
+        );
+      }
+    }
+
+    for (const alert of alignmentAlerts) {
+      try {
+        notificationQueue.enqueueSignal(
+          alert,
+          'realtime'
+        );
+
+        logger.info(
+          {
+            symbol: alert.symbol,
+            root_tf: alert.root_tf
+          },
+          'poller.loop2: realtime alignment alert enqueued'
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            alert
+          },
+          'poller.loop2: failed to enqueue alignment alert'
+        );
+      }
+    }
+
+    logger.info(
+      {
+        newSignals: newSignals.length,
+        alignmentAlerts: alignmentAlerts.length
+      },
+      'poller.loop2: exact five-minute boundary scan completed'
+    );
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
     return `poller.loop2.lastRootOpen.${symbol}.${tf}`;
-  },
-
-  // ===========================================================
-  // LOOP 3: precise root candle open scan.
-  //
-  // Behavior:
-  // - exact root candle open detection for 60 / 240 / D
-  // - only scans on relevant open boundaries
-  // - when a relevant signal appears, uses the existing full
-  //   startup summary layout:
-  //   summary + per-signal blocks + recommended blocks
-  // ===========================================================
-  startRootCandleOpenLoop() {
-    setImmediate(() => {
-      this.runRootCandleOpenLoop().catch((err) => {
-        logger.error(
-          { err },
-          'poller: root candle open loop crashed'
-        );
-      });
-    });
-  },
-
-  getNextRootCandleOpenMs(tf) {
-    const now = new Date();
-    const ts = now.getTime();
-
-    if (normalizeRootTf(tf) === 'D') {
-      const next = new Date(
-        Date.UTC(
-          now.getUTCFullYear(),
-          now.getUTCMonth(),
-          now.getUTCDate() + 1,
-          0,
-          0,
-          0,
-          0
-        )
-      );
-
-      return next.getTime();
-    }
-
-    if (normalizeRootTf(tf) === '60') {
-      const next = new Date(now);
-
-      next.setUTCMinutes(0, 0, 0);
-      next.setUTCHours(next.getUTCHours() + 1);
-
-      return next.getTime();
-    }
-
-    if (normalizeRootTf(tf) === '240') {
-      const next = new Date(now);
-      const currentHour = next.getUTCHours();
-      const alignedHour = Math.floor(currentHour / 4) * 4;
-
-      const candidate = new Date(
-        Date.UTC(
-          next.getUTCFullYear(),
-          next.getUTCMonth(),
-          next.getUTCDate(),
-          alignedHour + 4,
-          0,
-          0,
-          0
-        )
-      );
-
-      if (candidate.getTime() <= ts) {
-        const shifted = new Date(
-          Date.UTC(
-            next.getUTCFullYear(),
-            next.getUTCMonth(),
-            next.getUTCDate() + 1,
-            0,
-            0,
-            0,
-            0
-          )
-        );
-
-        return shifted.getTime();
-      }
-
-      return candidate.getTime();
-    }
-
-    return ts + 60000;
-  },
-
-  getProcessedCandleKey(symbol, tf) {
-    return `poller.loop3.lastRootOpen.${symbol}.${tf}`;
-  },
-
-  async runRootCandleOpenLoop() {
-    while (isRunning) {
-      try {
-        const rootTfs = buildRootTfs();
-        const db = dbModule.get();
-
-        const symbols = db.prepare(
-          'SELECT symbol FROM symbols ' +
-          'ORDER BY symbol COLLATE NOCASE ASC'
-        ).all();
-
-        const candidateSignals = [];
-
-        for (const symbolRow of symbols) {
-          const symbol = symbolRow.symbol;
-
-          if (!isUsdtSymbol(symbol)) continue;
-
-          for (const tf of rootTfs) {
-            try {
-              /*
-               * Refresh seed data before checking the exact root open.
-               */
-              await this.seedKlinesForSymbol(symbol, tf);
-
-              const latestRows = db.prepare(
-                'SELECT open_time, close, open FROM klines ' +
-                'WHERE symbol=? AND timeframe=? ' +
-                'ORDER BY open_time DESC LIMIT 2'
-              ).all(symbol, tf);
-
-              if (!latestRows || latestRows.length < 2) {
-                continue;
-              }
-
-              const latestOpen = Number(
-                latestRows[0].open_time
-              );
-
-              const processedOpen = Number(
-                dbModule.getState(
-                  this.getProcessedCandleKey(symbol, tf)
-                ) || 0
-              );
-
-              /*
-               * Only scan when the newest root candle is newer than
-               * the last processed root candle.
-               */
-              if (latestOpen > processedOpen) {
-                const flip = await require('./macd').isMacdFlip(
-                  symbol,
-                  tf
-                );
-
-                if (flip) {
-                  const sig =
-                    await signalManager.handleRootSignal({
-                      symbol,
-                      root_tf: tf,
-                      detected_at: Date.now(),
-                      notifyImmediately: false
-                    });
-
-                  if (sig) {
-                    candidateSignals.push(sig);
-                  }
-                }
-
-                dbModule.setState(
-                  this.getProcessedCandleKey(symbol, tf),
-                  latestOpen
-                );
-              }
-            } catch (e) {
-              logger.debug(
-                { e, symbol, tf },
-                'poller.loop3: root candle check failed'
-              );
-            }
-          }
-        }
-
-        /*
-         * Loop 3 intentionally uses the full startup-style notification
-         * flow: summary, per-signal blocks, and recommended blocks.
-         */
-        if (candidateSignals.length > 0) {
-          notificationQueue.enqueueStartupBatch(
-            candidateSignals
-          );
-
-          logger.info(
-            { count: candidateSignals.length },
-            'poller.loop3: enqueued full startup-style summary/recommended telegram flow'
-          );
-        }
-      } catch (err) {
-        logger.error(
-          { err },
-          'poller.loop3: unexpected error'
-        );
-      }
-
-      await sleep(60000);
-    }
   }
 };
