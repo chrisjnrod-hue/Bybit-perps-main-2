@@ -4,139 +4,395 @@ const logger = require('pino')();
 const tradingview = require('./tradingview');
 const marketData = require('./marketData');
 
-const macdOptions = { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false };
+const macdOptions = {
+  fastPeriod: 12,
+  slowPeriod: 26,
+  signalPeriod: 9,
+  SimpleMAOscillator: false,
+  SimpleMASignal: false
+};
+
+function toFiniteNumber(value) {
+  const number = Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
 
 module.exports = {
-  async getKlineSeries(symbol, timeframe, limit = 500) {
+  async getKlineSeries(
+    symbol,
+    timeframe,
+    limit = 500
+  ) {
     const db = dbModule.get();
-    const rows = db.prepare('SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?').all(symbol, timeframe, limit);
-    return rows.map(r => ({ time: r.open_time, close: r.close }));
+
+    const rows = db
+      .prepare(
+        `
+          SELECT open_time, close
+          FROM (
+            SELECT open_time, close
+            FROM klines
+            WHERE symbol = ?
+              AND timeframe = ?
+            ORDER BY open_time DESC
+            LIMIT ?
+          )
+          ORDER BY open_time ASC
+        `
+      )
+      .all(symbol, timeframe, limit);
+
+    return rows
+      .map((row) => ({
+        time: Number(row.open_time),
+        close: toFiniteNumber(row.close)
+      }))
+      .filter((row) => {
+        return (
+          Number.isFinite(row.time) &&
+          row.close !== null
+        );
+      });
   },
 
   async computeMacdHistogram(symbol, timeframe) {
     try {
-      const series = await this.getKlineSeries(symbol, timeframe, 500);
-      const closes = series.map(s => s.close);
-      if (closes.length < 35) return null;
-      const macdInput = { values: closes, ...macdOptions };
-      const out = MACD.calculate(macdInput);
-      const offset = closes.length - out.length;
-      const withTime = out.map((o, idx) => ({
-        time: series[offset + idx].time,
-        MACD: o.MACD,
-        signal: o.signal,
-        histogram: o.histogram
-      }));
-      return withTime;
+      const series = await this.getKlineSeries(
+        symbol,
+        timeframe,
+        500
+      );
+
+      if (series.length < 35) {
+        return null;
+      }
+
+      const values = series.map((item) => item.close);
+
+      const output = MACD.calculate({
+        values,
+        ...macdOptions
+      });
+
+      if (!Array.isArray(output) || output.length === 0) {
+        return null;
+      }
+
+      const offset = series.length - output.length;
+
+      return output
+        .map((item, index) => {
+          const source = series[offset + index];
+
+          return {
+            time: source.time,
+            MACD: toFiniteNumber(item.MACD),
+            signal: toFiniteNumber(item.signal),
+            histogram: toFiniteNumber(item.histogram)
+          };
+        })
+        .filter((item) => {
+          return (
+            item.MACD !== null &&
+            item.signal !== null &&
+            item.histogram !== null
+          );
+        });
     } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'computeMacdHistogram error');
+      logger.debug(
+        {
+          err,
+          symbol,
+          timeframe
+        },
+        'macd.computeMacdHistogram failed'
+      );
+
       return null;
     }
   },
 
-  /**
-   * FIXED: isMacdFlip - Only detect FIRST candle flips (negative->positive)
-   * 
-   * Prevents false positives from 2nd+ candle behavior.
-   * Returns true ONLY if:
-   *   - Previous candle histogram was negative (< 0)
-   *   - Current candle histogram is positive (> 0)
-   *   - This is a 1st candle flip (clean transition)
+  /*
+   * Retained for compatibility.
+   * Evaluates the latest two available histogram values.
    */
   async isMacdFlip(symbol, timeframe) {
     try {
-      const hist = await this.computeMacdHistogram(symbol, timeframe);
-      if (!hist || hist.length < 2) return false;
-
-      const last = hist[hist.length - 1];      // Current candle (most recent)
-      const prev = hist[hist.length - 2];      // Previous candle
-
-      // STRICT: negative -> positive (first candle flip only)
-      // Prevents 2nd candle noise from triggering signals
-      if (prev.histogram < 0 && last.histogram > 0) {
-        logger.info(
-          { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
-          'MACD flip detected (1st candle: negative->positive)'
+      const histogram =
+        await this.computeMacdHistogram(
+          symbol,
+          timeframe
         );
-        return true;
+
+      if (!histogram || histogram.length < 2) {
+        return false;
       }
 
-      return false;
+      const previous =
+        histogram[histogram.length - 2];
+
+      const current =
+        histogram[histogram.length - 1];
+
+      const flipped =
+        previous.histogram < 0 &&
+        current.histogram > 0;
+
+      if (flipped) {
+        logger.info(
+          {
+            symbol,
+            timeframe,
+            previousHistogram: previous.histogram,
+            currentHistogram: current.histogram
+          },
+          'macd: negative-to-positive flip detected'
+        );
+      }
+
+      return flipped;
     } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'isMacdFlip error');
+      logger.debug(
+        {
+          err,
+          symbol,
+          timeframe
+        },
+        'macd.isMacdFlip failed'
+      );
+
       return false;
     }
   },
 
-  async getMtfStatus(symbol, tfs = []) {
+  /*
+   * Used by the five-minute boundary scan.
+   *
+   * When a new root candle opens, the candle that should be
+   * evaluated is the previous candle, because that candle has
+   * just closed. This prevents evaluation of the still-forming
+   * current candle.
+   */
+  async isMacdFlipAtClosedCandle(
+    symbol,
+    timeframe,
+    closedOpenTime
+  ) {
+    try {
+      const histogram =
+        await this.computeMacdHistogram(
+          symbol,
+          timeframe
+        );
+
+      if (!histogram || histogram.length < 2) {
+        return false;
+      }
+
+      const targetTime = Number(closedOpenTime);
+
+      const currentIndex = histogram.findIndex(
+        (item) => Number(item.time) === targetTime
+      );
+
+      if (currentIndex < 1) {
+        logger.debug(
+          {
+            symbol,
+            timeframe,
+            closedOpenTime
+          },
+          'macd: closed candle not present in histogram'
+        );
+
+        return false;
+      }
+
+      const previous =
+        histogram[currentIndex - 1];
+
+      const current =
+        histogram[currentIndex];
+
+      const flipped =
+        previous.histogram < 0 &&
+        current.histogram > 0;
+
+      if (flipped) {
+        logger.info(
+          {
+            symbol,
+            timeframe,
+            closedOpenTime,
+            previousHistogram: previous.histogram,
+            currentHistogram: current.histogram
+          },
+          'macd: flip detected on closed candle'
+        );
+      }
+
+      return flipped;
+    } catch (err) {
+      logger.debug(
+        {
+          err,
+          symbol,
+          timeframe,
+          closedOpenTime
+        },
+        'macd.isMacdFlipAtClosedCandle failed'
+      );
+
+      return false;
+    }
+  },
+
+  async getMtfStatus(symbol, timeframes = []) {
     const status = {};
-    for (const tf of tfs) {
+
+    for (const timeframe of timeframes) {
       try {
-        const hist = await this.computeMacdHistogram(symbol, tf);
-        if (!hist || hist.length < 1) {
-          status[tf] = 'UNKNOWN';
+        const histogram =
+          await this.computeMacdHistogram(
+            symbol,
+            timeframe
+          );
+
+        if (!histogram || histogram.length === 0) {
+          status[timeframe] = 'UNKNOWN';
           continue;
         }
-        const last = hist[hist.length - 1];
+
+        const last =
+          histogram[histogram.length - 1];
+
         if (last.histogram > 0) {
-          status[tf] = 'POSITIVE';
+          status[timeframe] = 'POSITIVE';
         } else if (last.histogram < 0) {
-          status[tf] = 'NEGATIVE';
+          status[timeframe] = 'NEGATIVE';
         } else {
-          status[tf] = 'UNKNOWN';
+          status[timeframe] = 'UNKNOWN';
         }
       } catch (err) {
-        logger.debug({ err, symbol, tf }, 'getMtfStatus error for timeframe');
-        status[tf] = 'UNKNOWN';
+        logger.debug(
+          {
+            err,
+            symbol,
+            timeframe
+          },
+          'macd.getMtfStatus failed'
+        );
+
+        status[timeframe] = 'UNKNOWN';
       }
     }
+
     return status;
   },
 
-  async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
+  async getSignalMetrics(
+    symbol,
+    rootTf,
+    mtfTfs = []
+  ) {
     try {
       let tvScore = 0;
       let tvSource = 'fallback';
+
       try {
-        const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
-        tvScore = tvResult && typeof tvResult.score === 'number' ? tvResult.score : 0;
-        tvSource = tvResult && tvResult.source ? tvResult.source : 'error';
-      } catch (e) {
-        logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
-        tvScore = 0;
+        const result =
+          await tradingview.fetchTvRatingForSymbol(
+            symbol
+          );
+
+        tvScore =
+          result && typeof result.score === 'number'
+            ? result.score
+            : 0;
+
+        tvSource =
+          result && result.source
+            ? result.source
+            : 'error';
+      } catch (err) {
+        logger.debug(
+          {
+            err,
+            symbol
+          },
+          'macd.getSignalMetrics: TradingView failed'
+        );
+
         tvSource = 'error';
       }
 
-      const mtfStatus = await this.getMtfStatus(symbol, mtfTfs);
+      const mtfStatus =
+        await this.getMtfStatus(symbol, mtfTfs);
 
-      const rootHist = await this.computeMacdHistogram(symbol, rootTf);
-      const rootMacd = rootHist && rootHist.length > 0 ? rootHist[rootHist.length - 1] : null;
+      const rootHistogram =
+        await this.computeMacdHistogram(
+          symbol,
+          rootTf
+        );
+
+      const rootMacd =
+        rootHistogram &&
+        rootHistogram.length > 0
+          ? rootHistogram[rootHistogram.length - 1]
+          : null;
 
       let marketDataResult = null;
+
       try {
-        marketDataResult = await marketData.updateSymbolMarketData(symbol);
-      } catch (e) {
-        logger.debug({ e, symbol }, 'getSignalMetrics: market data update failed');
+        marketDataResult =
+          await marketData.updateSymbolMarketData(
+            symbol
+          );
+      } catch (err) {
+        logger.debug(
+          {
+            err,
+            symbol
+          },
+          'macd.getSignalMetrics: market data update failed'
+        );
       }
 
       return {
         tv_score: tvScore,
         tv_source: tvSource,
         mtf_status: mtfStatus,
-        root_macd: rootMacd ? {
-          macd: rootMacd.MACD,
-          signal: rootMacd.signal,
-          histogram: rootMacd.histogram
-        } : null,
-        market_data: marketDataResult ? {
-          price: marketDataResult.price || 0,
-          volume_24h_usdt: marketDataResult.volume_24h_usdt || 0,
-          volume_change_pct: marketDataResult.volume_change_pct || null,
-          market_cap: marketDataResult.market_cap || null
-        } : null
+        root_macd: rootMacd
+          ? {
+              macd: rootMacd.MACD,
+              signal: rootMacd.signal,
+              histogram: rootMacd.histogram
+            }
+          : null,
+        market_data: marketDataResult
+          ? {
+              price: marketDataResult.price || 0,
+              volume_24h_usdt:
+                marketDataResult.volume_24h_usdt || 0,
+              volume_change_pct:
+                marketDataResult.volume_change_pct || null,
+              market_cap:
+                marketDataResult.market_cap || null
+            }
+          : null
       };
     } catch (err) {
-      logger.error({ err, symbol }, 'getSignalMetrics: unexpected error');
+      logger.error(
+        {
+          err,
+          symbol
+        },
+        'macd.getSignalMetrics failed'
+      );
+
       return {
         tv_score: 0,
         tv_source: 'error',
