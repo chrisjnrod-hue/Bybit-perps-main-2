@@ -11,7 +11,10 @@ const limiter = new Bottleneck({
   minTime: 50
 });
 
-const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
+const SEED_CONCURRENCY = Number(
+  config.SEED_CONCURRENCY || 6
+);
+
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 
 let isRunning = false;
@@ -19,7 +22,9 @@ let startupComplete = false;
 let boundaryScanInProgress = false;
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms || 0));
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms || 0);
+  });
 }
 
 function normalizeRootTf(tf) {
@@ -27,7 +32,9 @@ function normalizeRootTf(tf) {
     return null;
   }
 
-  const value = String(tf).trim().toUpperCase();
+  const value = String(tf)
+    .trim()
+    .toUpperCase();
 
   if (value === '1D' || value === 'D') {
     return 'D';
@@ -59,11 +66,14 @@ function buildRootTfs() {
     output.push(normalized);
   }
 
-  return output.length > 0 ? output : ['60', '240', 'D'];
+  return output.length > 0
+    ? output
+    : ['60', '240', 'D'];
 }
 
 function isUsdtSymbol(symbol) {
-  const value = String(symbol || '').toUpperCase();
+  const value = String(symbol || '')
+    .toUpperCase();
 
   if (!value) {
     return false;
@@ -96,39 +106,55 @@ function getLatestOpenTime(db, symbol, timeframe) {
 
   const openTime = Number(row.open_time);
 
-  return Number.isFinite(openTime) ? openTime : null;
+  return Number.isFinite(openTime)
+    ? openTime
+    : null;
 }
 
 module.exports = {
   start() {
     if (isRunning) {
-      logger.debug('poller.start: poller is already running');
+      logger.debug(
+        'poller.start: poller is already running'
+      );
+
       return;
     }
 
     isRunning = true;
 
-    logger.info(
-      { isRunning, startupComplete },
-      'poller.start: poller started'
-    );
+    // Do not set startupComplete here.
+    // scanAllForStartup() sets it only after a successful startup scan.
 
     try {
       signalManager.setOpenTradesAllowed(true);
-      logger.info('poller.start: open trades enabled');
+
+      logger.info(
+        'poller.start: open trades enabled'
+      );
     } catch (err) {
-      logger.debug({ err }, 'poller.start: failed to enable open trades');
+      logger.debug(
+        { err },
+        'poller.start: failed to enable open trades'
+      );
     }
 
     this.startBoundaryScanLoop();
 
-    logger.info('poller.start: boundary scan loop started');
+    logger.info(
+      'poller.start: boundary scan loop started'
+    );
   },
 
   async initialScan(options = {}) {
-    const { seed = true } = options;
+    const {
+      seed = true
+    } = options;
 
-    logger.info({ seed }, 'poller.initialScan: starting');
+    logger.info(
+      { seed },
+      'poller.initialScan: starting'
+    );
 
     let allSymbols = [];
     const useWs = !!config.USE_WS;
@@ -145,14 +171,20 @@ module.exports = {
         allSymbols = await Promise.race([
           this.performWsInitialScan(),
           new Promise((_, reject) => {
-            setTimeout(() => reject(new Error('WS scan timeout')), wsTimeoutMs);
+            setTimeout(() => {
+              reject(new Error('WS scan timeout'));
+            }, wsTimeoutMs);
           })
         ]);
 
-        if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
+        if (
+          !Array.isArray(allSymbols) ||
+          allSymbols.length === 0
+        ) {
           logger.warn(
             'poller: WS initial scan returned no symbols; falling back to REST'
           );
+
           allSymbols = [];
         } else {
           logger.info(
@@ -165,17 +197,30 @@ module.exports = {
           { err },
           'poller: WS initial scan failed or timed out; falling back to REST'
         );
+
         allSymbols = [];
       }
     }
 
-    if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
-      logger.info('poller: fetching symbols via REST');
+    if (
+      !Array.isArray(allSymbols) ||
+      allSymbols.length === 0
+    ) {
+      logger.info(
+        'poller: fetching symbols via REST'
+      );
+
       allSymbols = await bybit.fetchAllSymbols();
     }
 
-    if (!Array.isArray(allSymbols) || allSymbols.length === 0) {
-      logger.warn('poller.initialScan: no symbols discovered');
+    if (
+      !Array.isArray(allSymbols) ||
+      allSymbols.length === 0
+    ) {
+      logger.warn(
+        'poller.initialScan: no symbols discovered'
+      );
+
       return [];
     }
 
@@ -199,7 +244,8 @@ module.exports = {
 
         insert.run(
           symbolInfo.symbol,
-          symbolInfo.base || symbolInfo.symbol.replace(/USDT(\.P)?$/i, ''),
+          symbolInfo.base ||
+            symbolInfo.symbol.replace(/USDT(\.P)?$/i, ''),
           symbolInfo.quote || 'USDT',
           now
         );
@@ -207,17 +253,24 @@ module.exports = {
     });
 
     insertMany(
-      allSymbols.filter((symbolInfo) => symbolInfo && symbolInfo.symbol)
+      allSymbols.filter((symbolInfo) =>
+        symbolInfo && symbolInfo.symbol
+      )
     );
 
     logger.info(
-      { total: allSymbols.length },
+      {
+        total: allSymbols.length
+      },
       'poller.initialScan: symbols persisted'
     );
 
     const seedSymbols = bybit.getSeedSymbols(allSymbols);
 
-    if (seedSymbols && seedSymbols.length > 0) {
+    if (
+      seedSymbols &&
+      seedSymbols.length > 0
+    ) {
       const invalidSymbols = seedSymbols.filter((seedSymbol) => {
         const symbol = String(seedSymbol.symbol || '').toUpperCase();
 
@@ -232,7 +285,9 @@ module.exports = {
         logger.error(
           {
             count: invalidSymbols.length,
-            samples: invalidSymbols.slice(0, 5).map((item) => item.symbol)
+            samples: invalidSymbols
+              .slice(0, 5)
+              .map((item) => item.symbol)
           },
           'poller.initialScan: invalid symbols in seed list'
         );
@@ -240,18 +295,23 @@ module.exports = {
 
       if (seed) {
         setImmediate(() => {
-          this.backgroundSeedKlines(seedSymbols).catch((err) => {
-            logger.debug(
-              { err },
-              'poller.initialScan: background seeding failed'
-            );
-          });
+          this.backgroundSeedKlines(seedSymbols)
+            .catch((err) => {
+              logger.debug(
+                { err },
+                'poller.initialScan: background seeding failed'
+              );
+            });
         });
       } else {
-        logger.debug('poller.initialScan: background seeding disabled');
+        logger.debug(
+          'poller.initialScan: background seeding disabled'
+        );
       }
     } else {
-      logger.info('poller.initialScan: no seed symbols to process');
+      logger.info(
+        'poller.initialScan: no seed symbols to process'
+      );
     }
 
     return allSymbols;
@@ -261,20 +321,35 @@ module.exports = {
     try {
       const wsManager = require('./bybitWs');
 
-      if (wsManager && typeof wsManager.performInitialScan === 'function') {
+      if (
+        wsManager &&
+        typeof wsManager.performInitialScan === 'function'
+      ) {
         const result = await wsManager.performInitialScan();
-        return Array.isArray(result) ? result : [];
+
+        return Array.isArray(result)
+          ? result
+          : [];
       }
     } catch (err) {
-      logger.debug({ err }, 'poller.performWsInitialScan failed');
+      logger.debug(
+        { err },
+        'poller.performWsInitialScan failed'
+      );
     }
 
     return [];
   },
 
   async backgroundSeedKlines(symbols = []) {
-    if (!Array.isArray(symbols) || symbols.length === 0) {
-      logger.info('backgroundSeedKlines: nothing to seed');
+    if (
+      !Array.isArray(symbols) ||
+      symbols.length === 0
+    ) {
+      logger.info(
+        'backgroundSeedKlines: nothing to seed'
+      );
+
       return;
     }
 
@@ -286,21 +361,32 @@ module.exports = {
       'backgroundSeedKlines: starting'
     );
 
-    for (let i = 0; i < symbols.length; i += SEED_CONCURRENCY) {
+    for (
+      let i = 0;
+      i < symbols.length;
+      i += SEED_CONCURRENCY
+    ) {
       const batch = symbols.slice(i, i + SEED_CONCURRENCY);
 
       const jobs = batch.map((item) =>
-        limiter.schedule(() => this.seedKlinesForSymbol(item.symbol))
+        limiter.schedule(() =>
+          this.seedKlinesForSymbol(item.symbol)
+        )
       );
 
       try {
         await Promise.all(jobs);
       } catch (err) {
-        logger.debug({ err }, 'backgroundSeedKlines: batch failed; continuing');
+        logger.debug(
+          { err },
+          'backgroundSeedKlines: batch failed; continuing'
+        );
       }
     }
 
-    logger.info('backgroundSeedKlines: completed');
+    logger.info(
+      'backgroundSeedKlines: completed'
+    );
   },
 
   async seedKlinesForSymbol(symbol, timeframe = null) {
@@ -308,38 +394,78 @@ module.exports = {
       const symbolUpper = String(symbol || '').toUpperCase();
 
       if (!isUsdtSymbol(symbol)) {
-        logger.warn({ symbol }, 'seedKlinesForSymbol: invalid USDT symbol; skipping');
+        logger.warn(
+          { symbol },
+          'seedKlinesForSymbol: invalid USDT symbol; skipping'
+        );
+
         return;
       }
 
-      if (/USDT[QHUZ0-9]/.test(symbolUpper.slice(-6))) {
-        logger.warn({ symbol }, 'seedKlinesForSymbol: dated variant; skipping');
+      if (
+        /USDT[QHUZ0-9]/.test(
+          symbolUpper.slice(-6)
+        )
+      ) {
+        logger.warn(
+          { symbol },
+          'seedKlinesForSymbol: dated variant; skipping'
+        );
+
         return;
       }
 
+      /*
+       * Always normalize root timeframes before using them.
+       * This prevents config values such as 1H and 1D from being
+       * stored under different names than the scan queries use.
+       */
       const rootTfs = timeframe
-        ? [String(timeframe)]
-        : Array.isArray(config.ROOT_TFS)
-          ? config.ROOT_TFS
-          : buildRootTfs();
+        ? [normalizeRootTf(timeframe)]
+        : buildRootTfs();
 
       const mtfTfs = Array.isArray(config.MTF_TFS)
-        ? config.MTF_TFS.map(String)
+        ? config.MTF_TFS
+            .map(normalizeRootTf)
+            .filter(Boolean)
         : [];
 
-      const timeframes = Array.from(new Set([...rootTfs, ...mtfTfs]));
+      const timeframes = Array.from(
+        new Set([
+          ...rootTfs,
+          ...mtfTfs
+        ])
+      );
 
       for (const tf of timeframes) {
-        const interval =
-          normalizeRootTf(tf) === 'D' ? 'D' : String(tf);
+        const normalizedTf = normalizeRootTf(tf);
+
+        if (!normalizedTf) {
+          continue;
+        }
+
+        const interval = normalizedTf === 'D'
+          ? 'D'
+          : normalizedTf;
 
         try {
           const klines = await limiter.schedule(() =>
-            bybit.fetchKlines(symbol, interval, config.SEED_KLINES_LIMIT)
+            bybit.fetchKlines(
+              symbol,
+              interval,
+              config.SEED_KLINES_LIMIT
+            )
           );
 
           if (!klines || klines.length === 0) {
-            logger.debug({ symbol, tf }, 'seedKlinesForSymbol: no klines returned');
+            logger.debug(
+              {
+                symbol,
+                tf: normalizedTf
+              },
+              'seedKlinesForSymbol: no klines returned'
+            );
+
             continue;
           }
 
@@ -366,7 +492,7 @@ module.exports = {
             for (const kline of rows) {
               insert.run(
                 symbol,
-                tf,
+                normalizedTf,
                 kline.open_time,
                 kline.open,
                 kline.high,
@@ -380,32 +506,58 @@ module.exports = {
           insertMany(klines);
 
           logger.debug(
-            { symbol, tf, count: klines.length },
+            {
+              symbol,
+              tf: normalizedTf,
+              count: klines.length
+            },
             'seedKlinesForSymbol: klines persisted'
           );
 
           try {
-            if (typeof macdUtil.computeAndStoreMacd === 'function') {
-              await macdUtil.computeAndStoreMacd(symbol, tf);
-            } else if (typeof macdUtil.computeMacdHistogram === 'function') {
-              await macdUtil.computeMacdHistogram(symbol, tf);
+            if (
+              typeof macdUtil.computeAndStoreMacd === 'function'
+            ) {
+              await macdUtil.computeAndStoreMacd(
+                symbol,
+                normalizedTf
+              );
+            } else if (
+              typeof macdUtil.computeMacdHistogram === 'function'
+            ) {
+              await macdUtil.computeMacdHistogram(
+                symbol,
+                normalizedTf
+              );
             }
           } catch (err) {
             logger.debug(
-              { err, symbol, tf },
+              {
+                err,
+                symbol,
+                tf: normalizedTf
+              },
               'seedKlinesForSymbol: MACD warm-up failed'
             );
           }
         } catch (err) {
           logger.debug(
-            { err, symbol, tf },
+            {
+              err,
+              symbol,
+              tf: normalizedTf
+            },
             'seedKlinesForSymbol: timeframe fetch failed'
           );
         }
       }
     } catch (err) {
       logger.debug(
-        { err, symbol, timeframe },
+        {
+          err,
+          symbol,
+          timeframe
+        },
         'seedKlinesForSymbol: unexpected error'
       );
     }
@@ -413,11 +565,16 @@ module.exports = {
 
   async scanAllForStartup() {
     if (startupComplete) {
-      logger.debug('scanAllForStartup: startup scan already completed');
+      logger.debug(
+        'scanAllForStartup: startup scan already completed'
+      );
+
       return [];
     }
 
-    logger.info('scanAllForStartup: starting full startup pass');
+    logger.info(
+      'scanAllForStartup: starting full startup pass'
+    );
 
     try {
       const db = dbModule.get();
@@ -432,12 +589,17 @@ module.exports = {
         )
         .all();
 
-      const validRows = rows.filter((row) => isUsdtSymbol(row.symbol));
+      const validRows = rows.filter((row) =>
+        isUsdtSymbol(row.symbol)
+      );
+
       const invalidCount = rows.length - validRows.length;
 
       if (invalidCount > 0) {
         logger.warn(
-          { invalidCount },
+          {
+            invalidCount
+          },
           'scanAllForStartup: invalid symbols skipped'
         );
       }
@@ -445,11 +607,17 @@ module.exports = {
       const newSignals = [];
       const pageSize = Number(config.PAGE_SIZE || 25);
 
-      for (let i = 0; i < validRows.length; i += pageSize) {
+      for (
+        let i = 0;
+        i < validRows.length;
+        i += pageSize
+      ) {
         const page = validRows.slice(i, i + pageSize);
 
         const results = await Promise.all(
-          page.map((row) => this.scanSymbolRoots(row.symbol))
+          page.map((row) =>
+            this.scanSymbolRoots(row.symbol)
+          )
         );
 
         newSignals.push(...results.flat());
@@ -464,13 +632,17 @@ module.exports = {
 
       if (newSignals.length > 0) {
         logger.info(
-          { count: newSignals.length },
+          {
+            count: newSignals.length
+          },
           'scanAllForStartup: enqueueing startup notification batch'
         );
 
         notificationQueue.enqueueStartupBatch(newSignals);
       } else {
-        logger.info('scanAllForStartup: no startup signals found');
+        logger.info(
+          'scanAllForStartup: no startup signals found'
+        );
       }
 
       this.initializeBoundaryCandleState(validRows, db);
@@ -478,13 +650,18 @@ module.exports = {
       startupComplete = true;
 
       logger.info(
-        { startupComplete },
         'scanAllForStartup: completed'
       );
 
       return newSignals;
     } catch (err) {
-      logger.error({ err }, 'scanAllForStartup: unexpected error');
+      logger.error(
+        {
+          err
+        },
+        'scanAllForStartup: unexpected error'
+      );
+
       return [];
     }
   },
@@ -496,7 +673,11 @@ module.exports = {
       const symbol = row.symbol;
 
       for (const tf of rootTfs) {
-        const latestOpen = getLatestOpenTime(db, symbol, tf);
+        const latestOpen = getLatestOpenTime(
+          db,
+          symbol,
+          tf
+        );
 
         if (latestOpen === null) {
           continue;
@@ -523,7 +704,13 @@ module.exports = {
     const results = [];
 
     if (!isUsdtSymbol(symbol)) {
-      logger.warn({ symbol }, 'scanSymbolRoots: invalid USDT symbol; skipping');
+      logger.warn(
+        {
+          symbol
+        },
+        'scanSymbolRoots: invalid USDT symbol; skipping'
+      );
+
       return results;
     }
 
@@ -546,7 +733,10 @@ module.exports = {
 
         if (!rows || rows.length < 2) {
           logger.debug(
-            { symbol, tf },
+            {
+              symbol,
+              tf
+            },
             'scanSymbolRoots: insufficient klines; seeding'
           );
 
@@ -556,7 +746,10 @@ module.exports = {
 
           if (!rows || rows.length < 2) {
             logger.debug(
-              { symbol, tf },
+              {
+                symbol,
+                tf
+              },
               'scanSymbolRoots: still insufficient klines'
             );
 
@@ -564,7 +757,19 @@ module.exports = {
           }
         }
 
-        const flip = await macdUtil.isMacdFlip(symbol, tf);
+        const flip = await macdUtil.isMacdFlip(
+          symbol,
+          tf
+        );
+
+        logger.debug(
+          {
+            symbol,
+            tf,
+            flip
+          },
+          'scanSymbolRoots: MACD result'
+        );
 
         if (!flip) {
           continue;
@@ -579,12 +784,25 @@ module.exports = {
           notificationType: 'startup'
         });
 
+        logger.info(
+          {
+            symbol,
+            tf,
+            signalCreated: !!signal
+          },
+          'scanSymbolRoots: root signal result'
+        );
+
         if (signal) {
           results.push(signal);
         }
       } catch (err) {
         logger.debug(
-          { err, symbol, tf },
+          {
+            err,
+            symbol,
+            tf
+          },
           'scanSymbolRoots: error checking flip'
         );
       }
@@ -605,18 +823,27 @@ module.exports = {
 
   startBoundaryScanLoop() {
     setImmediate(() => {
-      this.runBoundaryScanLoop().catch((err) => {
-        logger.error({ err }, 'poller: boundary scan loop crashed');
-      });
+      this.runBoundaryScanLoop()
+        .catch((err) => {
+          logger.error(
+            {
+              err
+            },
+            'poller: boundary scan loop crashed'
+          );
+        });
     });
   },
 
   async runBoundaryScanLoop() {
-    logger.info('poller.loop2: runBoundaryScanLoop entered');
-
     while (isRunning) {
-      const nextBoundary = this.getNextFiveMinuteBoundaryMs();
-      const delay = Math.max(0, nextBoundary - Date.now());
+      const nextBoundary =
+        this.getNextFiveMinuteBoundaryMs();
+
+      const delay = Math.max(
+        0,
+        nextBoundary - Date.now()
+      );
 
       logger.debug(
         {
@@ -636,19 +863,21 @@ module.exports = {
         logger.warn(
           'poller.loop2: previous boundary scan is still running; skipping boundary'
         );
+
         continue;
       }
 
       boundaryScanInProgress = true;
 
       try {
-        logger.info(
-          'poller.loop2: starting exact five-minute boundary scan'
-        );
-
         await this.runBoundaryScanOnce();
       } catch (err) {
-        logger.error({ err }, 'poller.loop2: boundary scan failed');
+        logger.error(
+          {
+            err
+          },
+          'poller.loop2: boundary scan failed'
+        );
       } finally {
         boundaryScanInProgress = false;
       }
@@ -665,7 +894,9 @@ module.exports = {
       'poller.loop2: starting exact five-minute boundary scan'
     );
 
-    await this.initialScan({ seed: false });
+    await this.initialScan({
+      seed: false
+    });
 
     const db = dbModule.get();
 
@@ -679,10 +910,21 @@ module.exports = {
       )
       .all();
 
-    const validRows = rows.filter((row) => isUsdtSymbol(row.symbol));
+    const validRows = rows.filter((row) =>
+      isUsdtSymbol(row.symbol)
+    );
+
     const rootTfs = buildRootTfs();
     const newSignals = [];
     const alignmentAlerts = [];
+
+    logger.info(
+      {
+        symbolCount: validRows.length,
+        rootTfs
+      },
+      'poller.loop2: symbols and timeframes loaded'
+    );
 
     for (const row of validRows) {
       const symbol = row.symbol;
@@ -691,13 +933,26 @@ module.exports = {
         try {
           await this.seedKlinesForSymbol(symbol, tf);
 
-          const latestOpen = getLatestOpenTime(db, symbol, tf);
+          const latestOpen = getLatestOpenTime(
+            db,
+            symbol,
+            tf
+          );
 
           if (latestOpen === null) {
+            logger.debug(
+              {
+                symbol,
+                tf
+              },
+              'poller.loop2: no latest candle found'
+            );
+
             continue;
           }
 
-          const processedStateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
+          const processedStateKey =
+            this.getLoop2ProcessedCandleKey(symbol, tf);
 
           const processedOpen = Number(
             dbModule.getState(processedStateKey) || 0
@@ -708,14 +963,16 @@ module.exports = {
               symbol,
               tf,
               latestOpen,
-              processedOpen,
-              isNewCandle: latestOpen > processedOpen
+              processedOpen
             },
-            'poller.loop2: root candle state'
+            'poller.loop2: candle state'
           );
 
           if (latestOpen > processedOpen) {
-            const flip = await macdUtil.isMacdFlip(symbol, tf);
+            const flip = await macdUtil.isMacdFlip(
+              symbol,
+              tf
+            );
 
             logger.info(
               {
@@ -725,36 +982,41 @@ module.exports = {
                 processedOpen,
                 flip
               },
-              'poller.loop2: checked MACD flip for new root candle'
+              'poller.loop2: MACD result'
             );
 
             if (flip) {
-              const signal = await signalManager.handleRootSignal({
-                symbol,
-                root_tf: tf,
-                detected_at: Date.now(),
-                candle_open_time: latestOpen,
-                notifyImmediately: false,
-                notificationType: 'new_root_candle'
-              });
+              const signal =
+                await signalManager.handleRootSignal({
+                  symbol,
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  notifyImmediately: false,
+                  notificationType: 'new_root_candle'
+                });
 
               logger.info(
                 {
                   symbol,
                   tf,
-                  latestOpen,
                   signalCreated: !!signal
                 },
                 'poller.loop2: root signal result'
               );
 
               if (signal) {
-                signal.notificationType = 'new_root_candle';
+                signal.notificationType =
+                  'new_root_candle';
+
                 newSignals.push(signal);
               }
             }
 
-            dbModule.setState(processedStateKey, latestOpen);
+            dbModule.setState(
+              processedStateKey,
+              latestOpen
+            );
 
             logger.debug(
               {
@@ -766,37 +1028,55 @@ module.exports = {
             );
           }
 
-          const latestSignals = dbModule.getLatestSignalsSnapshot();
+          const latestSignals =
+            dbModule.getLatestSignalsSnapshot();
 
-          const activeSignals = latestSignals.filter((signal) => {
-            return (
-              signal.symbol === symbol &&
-              signal.root_tf === tf
-            );
-          });
+          const activeSignals = latestSignals.filter(
+            (signal) => {
+              return (
+                signal.symbol === symbol &&
+                signal.root_tf === tf
+              );
+            }
+          );
 
           if (activeSignals.length === 0) {
             continue;
           }
 
-          const alignment = await signalManager.evaluateMtfAlignment(symbol);
+          const alignment =
+            await signalManager.evaluateMtfAlignment(
+              symbol
+            );
 
-          const alignmentStateKey = `poller.loop2.alignment.${symbol}.${tf}`;
-          const previousAlignment = dbModule.getState(alignmentStateKey);
-          const nextAlignmentJson = JSON.stringify(alignment || {});
+          const alignmentStateKey =
+            `poller.loop2.alignment.${symbol}.${tf}`;
+
+          const previousAlignment =
+            dbModule.getState(alignmentStateKey);
+
+          const nextAlignmentJson =
+            JSON.stringify(alignment || {});
 
           if (previousAlignment === nextAlignmentJson) {
             continue;
           }
 
-          dbModule.setState(alignmentStateKey, alignment || {});
+          dbModule.setState(
+            alignmentStateKey,
+            alignment || {}
+          );
 
-          const alignmentValues = Object.values(alignment || {});
-          const positiveCount = alignmentValues.filter((value) => {
-            return value && value.positive;
-          }).length;
+          const alignmentValues =
+            Object.values(alignment || {});
 
-          const alignmentCount = alignmentValues.length;
+          const positiveCount =
+            alignmentValues.filter((value) => {
+              return value && value.positive;
+            }).length;
+
+          const alignmentCount =
+            alignmentValues.length;
 
           alignmentAlerts.push({
             symbol,
@@ -810,7 +1090,9 @@ module.exports = {
               acceptReason: 'mtf_alignment_alert',
               tvScore: 0,
               tvSource: 'loop2',
-              mtfScore: alignmentCount > 0 ? positiveCount / alignmentCount : 0
+              mtfScore: alignmentCount > 0
+                ? positiveCount / alignmentCount
+                : 0
             }
           });
         } catch (err) {
@@ -827,7 +1109,9 @@ module.exports = {
     }
 
     if (newSignals.length > 0) {
-      notificationQueue.enqueueRootCandleBatch(newSignals);
+      notificationQueue.enqueueRootCandleBatch(
+        newSignals
+      );
 
       logger.info(
         {
@@ -835,11 +1119,18 @@ module.exports = {
         },
         'poller.loop2: root candle batch enqueued'
       );
+    } else {
+      logger.info(
+        'poller.loop2: no new root candle signals found'
+      );
     }
 
     for (const alert of alignmentAlerts) {
       try {
-        notificationQueue.enqueueSignal(alert, 'realtime');
+        notificationQueue.enqueueSignal(
+          alert,
+          'realtime'
+        );
 
         logger.info(
           {
