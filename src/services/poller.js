@@ -6,20 +6,32 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
+const wsManager = require('./bybitWs');
 
-const limiter = new Bottleneck({
-  minTime: 50
+const restLimiter = new Bottleneck({
+  maxConcurrent: Number(
+    config.REST_MAX_CONCURRENT ||
+    process.env.REST_MAX_CONCURRENT ||
+    6
+  ),
+  minTime: Number(
+    config.REST_MIN_TIME_MS ||
+    process.env.REST_MIN_TIME_MS ||
+    100
+  )
 });
 
-const SEED_CONCURRENCY = Number(
-  config.SEED_CONCURRENCY || 6
-);
-
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
+const DEFAULT_REST_UPDATE_INTERVAL_MS = 60 * 1000;
+const DEFAULT_WS_STALE_MS = 10 * 60 * 1000;
 
 let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
+let restUpdateInProgress = false;
+let wsListenerAttached = false;
+let restUpdaterTimer = null;
+let startupPromise = null;
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -27,36 +39,61 @@ function sleep(ms) {
   });
 }
 
-function normalizeRootTf(tf) {
-  if (tf === null || tf === undefined) {
+function configBool(value, defaultValue = false) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  const normalized = String(value)
+    .trim()
+    .toLowerCase();
+
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) {
+    return true;
+  }
+
+  if (['0', 'false', 'no', 'off'].includes(normalized)) {
+    return false;
+  }
+
+  return defaultValue;
+}
+
+function normalizeTimeframe(timeframe) {
+  if (timeframe === null || timeframe === undefined) {
     return null;
   }
 
-  const value = String(tf)
+  const value = String(timeframe)
     .trim()
     .toUpperCase();
 
-  if (value === '1D' || value === 'D') {
-    return 'D';
-  }
-
   if (value === '1H' || value === 'H') {
     return '60';
+  }
+
+  if (value === '1D') {
+    return 'D';
   }
 
   return value;
 }
 
 function buildRootTfs() {
-  const raw = Array.isArray(config.ROOT_TFS)
+  const configured = Array.isArray(config.ROOT_TFS)
     ? config.ROOT_TFS
     : ['60', '240', 'D'];
 
-  const seen = new Set();
   const output = [];
+  const seen = new Set();
 
-  for (const timeframe of raw) {
-    const normalized = normalizeRootTf(timeframe);
+  for (const timeframe of configured) {
+    const normalized =
+      normalizeTimeframe(timeframe);
 
     if (!normalized || seen.has(normalized)) {
       continue;
@@ -71,9 +108,34 @@ function buildRootTfs() {
     : ['60', '240', 'D'];
 }
 
+function buildAllTfs() {
+  const configured = [
+    ...buildRootTfs(),
+    ...(Array.isArray(config.MTF_TFS)
+      ? config.MTF_TFS
+      : [])
+  ];
+
+  const output = [];
+  const seen = new Set();
+
+  for (const timeframe of configured) {
+    const normalized =
+      normalizeTimeframe(timeframe);
+
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+
+    seen.add(normalized);
+    output.push(normalized);
+  }
+
+  return output;
+}
+
 function isUsdtSymbol(symbol) {
-  const value = String(symbol || '')
-    .toUpperCase();
+  const value = String(symbol || '').toUpperCase();
 
   if (!value) {
     return false;
@@ -104,18 +166,461 @@ function getLatestOpenTime(db, symbol, timeframe) {
     return null;
   }
 
-  const openTime = Number(row.open_time);
+  const value = Number(row.open_time);
 
-  return Number.isFinite(openTime)
-    ? openTime
+  return Number.isFinite(value)
+    ? value
     : null;
+}
+
+function getSymbolsFromDb() {
+  const db = dbModule.get();
+
+  return db
+    .prepare(
+      `
+        SELECT symbol
+        FROM symbols
+        ORDER BY symbol COLLATE NOCASE ASC
+      `
+    )
+    .all()
+    .map((row) => row.symbol)
+    .filter(isUsdtSymbol);
+}
+
+function upsertKlines(symbol, timeframe, klines) {
+  if (!Array.isArray(klines) || klines.length === 0) {
+    return 0;
+  }
+
+  const db = dbModule.get();
+
+  const statement = db.prepare(
+    `
+      INSERT INTO klines
+        (
+          symbol,
+          timeframe,
+          open_time,
+          open,
+          high,
+          low,
+          close,
+          volume
+        )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(symbol, timeframe, open_time)
+      DO UPDATE SET
+        open = excluded.open,
+        high = excluded.high,
+        low = excluded.low,
+        close = excluded.close,
+        volume = excluded.volume
+    `
+  );
+
+  let count = 0;
+
+  const transaction = db.transaction((rows) => {
+    for (const kline of rows) {
+      const openTime = Number(kline.open_time);
+
+      if (!Number.isFinite(openTime)) {
+        continue;
+      }
+
+      statement.run(
+        symbol,
+        timeframe,
+        openTime,
+        Number(kline.open || 0),
+        Number(kline.high || 0),
+        Number(kline.low || 0),
+        Number(kline.close || 0),
+        Number(kline.volume || 0)
+      );
+
+      count++;
+    }
+  });
+
+  transaction(klines);
+
+  return count;
+}
+
+function getRestIntervalMs() {
+  return Number(
+    config.REST_UPDATE_INTERVAL_MS ||
+    process.env.REST_UPDATE_INTERVAL_MS ||
+    DEFAULT_REST_UPDATE_INTERVAL_MS
+  );
+}
+
+function getWsStaleMs() {
+  return Number(
+    config.WS_STALE_MS ||
+    process.env.WS_STALE_MS ||
+    DEFAULT_WS_STALE_MS
+  );
+}
+
+function isWsEnabled() {
+  return configBool(
+    config.USE_WS ??
+    process.env.USE_WS,
+    true
+  );
+}
+
+async function persistWsKline(kline) {
+  if (
+    !kline ||
+    !kline.symbol ||
+    !kline.timeframe
+  ) {
+    return;
+  }
+
+  const symbol = kline.symbol;
+  const timeframe =
+    normalizeTimeframe(kline.timeframe);
+
+  if (
+    !isUsdtSymbol(symbol) ||
+    !timeframe
+  ) {
+    return;
+  }
+
+  upsertKlines(
+    symbol,
+    timeframe,
+    [kline]
+  );
+
+  logger.debug(
+    {
+      symbol,
+      timeframe,
+      openTime: kline.open_time,
+      confirm: kline.confirm
+    },
+    'poller: WebSocket kline persisted'
+  );
+}
+
+async function fetchAndPersistRestKlines(
+  symbol,
+  timeframe,
+  limit
+) {
+  try {
+    const klines = await restLimiter.schedule(() => {
+      return bybit.fetchKlines(
+        symbol,
+        timeframe,
+        limit
+      );
+    });
+
+    if (!Array.isArray(klines) || klines.length === 0) {
+      return 0;
+    }
+
+    return upsertKlines(
+      symbol,
+      timeframe,
+      klines
+    );
+  } catch (err) {
+    logger.debug(
+      {
+        err,
+        symbol,
+        timeframe
+      },
+      'poller: REST kline fetch failed'
+    );
+
+    return 0;
+  }
+}
+
+async function updateAllKlinesFromRest() {
+  if (restUpdateInProgress) {
+    return;
+  }
+
+  restUpdateInProgress = true;
+
+  const startedAt = Date.now();
+  const symbols = getSymbolsFromDb();
+
+  const wsHealthy =
+    isWsEnabled() &&
+    wsManager.isHealthy(getWsStaleMs());
+
+  /*
+   * When WS is healthy, REST reconciles root timeframes.
+   * When WS is unavailable or stale, REST updates all
+   * configured root and MTF timeframes.
+   */
+  const timeframes = wsHealthy
+    ? buildRootTfs()
+    : buildAllTfs();
+
+  const limit = Number(
+    config.REST_UPDATE_LIMIT ||
+    process.env.REST_UPDATE_LIMIT ||
+    100
+  );
+
+  let completed = 0;
+
+  try {
+    logger.info(
+      {
+        symbols: symbols.length,
+        timeframes,
+        wsHealthy
+      },
+      'poller: REST batch update started'
+    );
+
+    for (
+      let index = 0;
+      index < symbols.length;
+      index += Number(
+        config.REST_BATCH_SIZE ||
+        process.env.REST_BATCH_SIZE ||
+        25
+      )
+    ) {
+      const batchSize = Number(
+        config.REST_BATCH_SIZE ||
+        process.env.REST_BATCH_SIZE ||
+        25
+      );
+
+      const batch = symbols.slice(
+        index,
+        index + batchSize
+      );
+
+      const jobs = [];
+
+      for (const symbol of batch) {
+        for (const timeframe of timeframes) {
+          jobs.push(
+            fetchAndPersistRestKlines(
+              symbol,
+              timeframe,
+              limit
+            )
+          );
+        }
+      }
+
+      const results = await Promise.all(jobs);
+      completed += results.reduce(
+        (total, value) => total + value,
+        0
+      );
+    }
+
+    logger.info(
+      {
+        symbols: symbols.length,
+        timeframes,
+        completed,
+        durationMs: Date.now() - startedAt
+      },
+      'poller: REST batch update completed'
+    );
+  } finally {
+    restUpdateInProgress = false;
+  }
+}
+
+function startRestUpdater() {
+  if (restUpdaterTimer) {
+    return;
+  }
+
+  const interval = getRestIntervalMs();
+
+  const run = async () => {
+    if (!isRunning) {
+      restUpdaterTimer = null;
+      return;
+    }
+
+    try {
+      await updateAllKlinesFromRest();
+    } catch (err) {
+      logger.error(
+        {
+          err
+        },
+        'poller: REST updater failed'
+      );
+    }
+
+    if (isRunning) {
+      restUpdaterTimer = setTimeout(
+        run,
+        interval
+      );
+    } else {
+      restUpdaterTimer = null;
+    }
+  };
+
+  void run();
+
+  logger.info(
+    {
+      intervalMs: interval
+    },
+    'poller: REST updater started'
+  );
+}
+
+function attachWsListener() {
+  if (wsListenerAttached) {
+    return;
+  }
+
+  wsListenerAttached = true;
+
+  wsManager.on('kline', (kline) => {
+    void persistWsKline(kline)
+      .catch((err) => {
+        logger.debug(
+          {
+            err
+          },
+          'poller: WebSocket kline persistence failed'
+        );
+      });
+  });
+}
+
+function subscribeAllSymbolsToWs() {
+  if (!isWsEnabled()) {
+    logger.info(
+      'poller: WebSocket disabled; REST fallback active'
+    );
+
+    return 0;
+  }
+
+  if (!wsManager.start()) {
+    return 0;
+  }
+
+  const symbols = getSymbolsFromDb();
+  const timeframes = buildAllTfs();
+
+  const subscribed =
+    wsManager.subscribeSymbols(
+      symbols,
+      timeframes
+    );
+
+  logger.info(
+    {
+      symbols: symbols.length,
+      subscribed,
+      timeframes
+    },
+    'poller: WebSocket subscriptions requested'
+  );
+
+  return subscribed;
+}
+
+async function discoverAndPersistSymbols() {
+  const symbols = await bybit.fetchAllSymbols();
+
+  if (
+    !Array.isArray(symbols) ||
+    symbols.length === 0
+  ) {
+    logger.warn(
+      'poller: REST symbol discovery returned no symbols'
+    );
+
+    return [];
+  }
+
+  const db = dbModule.get();
+
+  const insert = db.prepare(
+    `
+      INSERT OR REPLACE INTO symbols
+        (symbol, base, quote, fetched_at)
+      VALUES (?, ?, ?, ?)
+    `
+  );
+
+  const now = Date.now();
+
+  const transaction = db.transaction((rows) => {
+    for (const item of rows) {
+      if (
+        !item ||
+        !item.symbol ||
+        !isUsdtSymbol(item.symbol)
+      ) {
+        continue;
+      }
+
+      insert.run(
+        item.symbol,
+        item.base ||
+          item.symbol.replace(/USDT(\.P)?$/i, ''),
+        item.quote || 'USDT',
+        now
+      );
+    }
+  });
+
+  transaction(symbols);
+
+  logger.info(
+    {
+      count: symbols.length
+    },
+    'poller: symbols discovered and persisted'
+  );
+
+  return symbols;
+}
+
+async function seedSymbolTimeframes(symbol) {
+  const timeframes = buildAllTfs();
+
+  for (const timeframe of timeframes) {
+    await fetchAndPersistRestKlines(
+      symbol,
+      timeframe,
+      Number(
+        config.SEED_KLINES_LIMIT ||
+        process.env.SEED_KLINES_LIMIT ||
+        500
+      )
+    );
+  }
 }
 
 module.exports = {
   start() {
     if (isRunning) {
       logger.debug(
-        'poller.start: poller is already running'
+        'poller.start: poller already running'
       );
 
       return;
@@ -123,222 +628,102 @@ module.exports = {
 
     isRunning = true;
 
-    // Do not set startupComplete here.
-    // scanAllForStartup() sets it only after a successful startup scan.
-
-    try {
-      signalManager.setOpenTradesAllowed(true);
-
-      logger.info(
-        'poller.start: open trades enabled'
-      );
-    } catch (err) {
-      logger.debug(
-        { err },
-        'poller.start: failed to enable open trades'
-      );
-    }
-
+    attachWsListener();
+    startRestUpdater();
     this.startBoundaryScanLoop();
 
+    /*
+     * This makes start() safe even when the caller did not
+     * explicitly run initialScan(). If the caller already ran
+     * initialScan(), the same startup promise is reused.
+     */
+    if (!startupPromise) {
+      startupPromise = this.initialScan({
+        seed: true
+      }).catch((err) => {
+        logger.error(
+          {
+            err
+          },
+          'poller.start: startup initialization failed'
+        );
+
+        return [];
+      });
+    }
+
     logger.info(
-      'poller.start: boundary scan loop started'
+      'poller.start: boundary scan and continuous updater started'
     );
   },
 
   async initialScan(options = {}) {
-    const {
-      seed = true
-    } = options;
-
-    logger.info(
-      { seed },
-      'poller.initialScan: starting'
-    );
-
-    let allSymbols = [];
-    const useWs = !!config.USE_WS;
-
-    if (useWs) {
-      try {
-        const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
-
-        logger.info(
-          { timeoutMs: wsTimeoutMs },
-          'poller: attempting WS initial scan'
-        );
-
-        allSymbols = await Promise.race([
-          this.performWsInitialScan(),
-          new Promise((_, reject) => {
-            setTimeout(() => {
-              reject(new Error('WS scan timeout'));
-            }, wsTimeoutMs);
-          })
-        ]);
-
-        if (
-          !Array.isArray(allSymbols) ||
-          allSymbols.length === 0
-        ) {
-          logger.warn(
-            'poller: WS initial scan returned no symbols; falling back to REST'
-          );
-
-          allSymbols = [];
-        } else {
-          logger.info(
-            { count: allSymbols.length },
-            'poller: WS initial scan provided symbols'
-          );
-        }
-      } catch (err) {
-        logger.debug(
-          { err },
-          'poller: WS initial scan failed or timed out; falling back to REST'
-        );
-
-        allSymbols = [];
-      }
+    if (startupPromise) {
+      return startupPromise;
     }
 
-    if (
-      !Array.isArray(allSymbols) ||
-      allSymbols.length === 0
-    ) {
+    startupPromise = (async () => {
+      const seed = options.seed !== false;
+
       logger.info(
-        'poller: fetching symbols via REST'
+        {
+          seed
+        },
+        'poller.initialScan: starting'
       );
 
-      allSymbols = await bybit.fetchAllSymbols();
-    }
+      const symbols =
+        await discoverAndPersistSymbols();
 
-    if (
-      !Array.isArray(allSymbols) ||
-      allSymbols.length === 0
-    ) {
-      logger.warn(
-        'poller.initialScan: no symbols discovered'
-      );
+      attachWsListener();
+      subscribeAllSymbolsToWs();
 
-      return [];
-    }
+      const seedSymbols =
+        bybit.getSeedSymbols(symbols);
 
-    const db = dbModule.get();
-
-    const insert = db.prepare(
-      `
-        INSERT OR REPLACE INTO symbols
-          (symbol, base, quote, fetched_at)
-        VALUES (?, ?, ?, ?)
-      `
-    );
-
-    const now = Date.now();
-
-    const insertMany = db.transaction((rows) => {
-      for (const symbolInfo of rows) {
-        if (!symbolInfo || !symbolInfo.symbol) {
-          continue;
-        }
-
-        insert.run(
-          symbolInfo.symbol,
-          symbolInfo.base ||
-            symbolInfo.symbol.replace(/USDT(\.P)?$/i, ''),
-          symbolInfo.quote || 'USDT',
-          now
-        );
-      }
-    });
-
-    insertMany(
-      allSymbols.filter((symbolInfo) =>
-        symbolInfo && symbolInfo.symbol
-      )
-    );
-
-    logger.info(
-      {
-        total: allSymbols.length
-      },
-      'poller.initialScan: symbols persisted'
-    );
-
-    const seedSymbols = bybit.getSeedSymbols(allSymbols);
-
-    if (
-      seedSymbols &&
-      seedSymbols.length > 0
-    ) {
-      const invalidSymbols = seedSymbols.filter((seedSymbol) => {
-        const symbol = String(seedSymbol.symbol || '').toUpperCase();
-
-        if (/USDT[QHUZ0-9]/.test(symbol.slice(-6))) {
-          return true;
-        }
-
-        return !/USDT(\.P)?$/.test(symbol);
-      });
-
-      if (invalidSymbols.length > 0) {
-        logger.error(
-          {
-            count: invalidSymbols.length,
-            samples: invalidSymbols
-              .slice(0, 5)
-              .map((item) => item.symbol)
-          },
-          'poller.initialScan: invalid symbols in seed list'
+      if (seed && seedSymbols.length > 0) {
+        await this.backgroundSeedKlines(
+          seedSymbols
         );
       }
 
-      if (seed) {
-        setImmediate(() => {
-          this.backgroundSeedKlines(seedSymbols)
-            .catch((err) => {
-              logger.debug(
-                { err },
-                'poller.initialScan: background seeding failed'
-              );
-            });
-        });
-      } else {
-        logger.debug(
-          'poller.initialScan: background seeding disabled'
-        );
-      }
-    } else {
       logger.info(
-        'poller.initialScan: no seed symbols to process'
+        {
+          symbols: symbols.length,
+          seeded: seed && seedSymbols.length > 0
+        },
+        'poller.initialScan: completed'
       );
-    }
 
-    return allSymbols;
+      return symbols;
+    })();
+
+    try {
+      return await startupPromise;
+    } catch (err) {
+      startupPromise = null;
+      throw err;
+    }
   },
 
   async performWsInitialScan() {
     try {
-      const wsManager = require('./bybitWs');
+      const result =
+        await wsManager.performInitialScan();
 
-      if (
-        wsManager &&
-        typeof wsManager.performInitialScan === 'function'
-      ) {
-        const result = await wsManager.performInitialScan();
-
-        return Array.isArray(result)
-          ? result
-          : [];
-      }
+      return Array.isArray(result)
+        ? result
+        : [];
     } catch (err) {
       logger.debug(
-        { err },
+        {
+          err
+        },
         'poller.performWsInitialScan failed'
       );
-    }
 
-    return [];
+      return [];
+    }
   },
 
   async backgroundSeedKlines(symbols = []) {
@@ -347,218 +732,86 @@ module.exports = {
       symbols.length === 0
     ) {
       logger.info(
-        'backgroundSeedKlines: nothing to seed'
+        'poller.backgroundSeedKlines: no symbols'
       );
 
       return;
     }
 
+    const concurrency = Number(
+      config.SEED_CONCURRENCY ||
+      process.env.SEED_CONCURRENCY ||
+      6
+    );
+
     logger.info(
       {
-        count: symbols.length,
-        concurrency: SEED_CONCURRENCY
+        symbols: symbols.length,
+        concurrency,
+        timeframes: buildAllTfs()
       },
-      'backgroundSeedKlines: starting'
+      'poller.backgroundSeedKlines: started'
     );
 
     for (
-      let i = 0;
-      i < symbols.length;
-      i += SEED_CONCURRENCY
+      let index = 0;
+      index < symbols.length;
+      index += concurrency
     ) {
-      const batch = symbols.slice(i, i + SEED_CONCURRENCY);
-
-      const jobs = batch.map((item) =>
-        limiter.schedule(() =>
-          this.seedKlinesForSymbol(item.symbol)
-        )
+      const batch = symbols.slice(
+        index,
+        index + concurrency
       );
 
-      try {
-        await Promise.all(jobs);
-      } catch (err) {
-        logger.debug(
-          { err },
-          'backgroundSeedKlines: batch failed; continuing'
-        );
-      }
+      await Promise.all(
+        batch.map((item) => {
+          const symbol =
+            typeof item === 'string'
+              ? item
+              : item && item.symbol;
+
+          return seedSymbolTimeframes(symbol);
+        })
+      );
     }
 
     logger.info(
-      'backgroundSeedKlines: completed'
+      'poller.backgroundSeedKlines: completed'
     );
   },
 
-  async seedKlinesForSymbol(symbol, timeframe = null) {
-    try {
-      const symbolUpper = String(symbol || '').toUpperCase();
-
-      if (!isUsdtSymbol(symbol)) {
-        logger.warn(
-          { symbol },
-          'seedKlinesForSymbol: invalid USDT symbol; skipping'
-        );
-
-        return;
-      }
-
-      if (
-        /USDT[QHUZ0-9]/.test(
-          symbolUpper.slice(-6)
-        )
-      ) {
-        logger.warn(
-          { symbol },
-          'seedKlinesForSymbol: dated variant; skipping'
-        );
-
-        return;
-      }
-
-      /*
-       * Always normalize root timeframes before using them.
-       * This prevents config values such as 1H and 1D from being
-       * stored under different names than the scan queries use.
-       */
-      const rootTfs = timeframe
-        ? [normalizeRootTf(timeframe)]
-        : buildRootTfs();
-
-      const mtfTfs = Array.isArray(config.MTF_TFS)
-        ? config.MTF_TFS
-            .map(normalizeRootTf)
-            .filter(Boolean)
-        : [];
-
-      const timeframes = Array.from(
-        new Set([
-          ...rootTfs,
-          ...mtfTfs
-        ])
+  async seedKlinesForSymbol(
+    symbol,
+    timeframe = null
+  ) {
+    if (!isUsdtSymbol(symbol)) {
+      logger.warn(
+        {
+          symbol
+        },
+        'poller.seedKlinesForSymbol: invalid symbol'
       );
 
-      for (const tf of timeframes) {
-        const normalizedTf = normalizeRootTf(tf);
+      return;
+    }
 
-        if (!normalizedTf) {
-          continue;
-        }
+    const timeframes = timeframe
+      ? [normalizeTimeframe(timeframe)]
+      : buildAllTfs();
 
-        const interval = normalizedTf === 'D'
-          ? 'D'
-          : normalizedTf;
-
-        try {
-          const klines = await limiter.schedule(() =>
-            bybit.fetchKlines(
-              symbol,
-              interval,
-              config.SEED_KLINES_LIMIT
-            )
-          );
-
-          if (!klines || klines.length === 0) {
-            logger.debug(
-              {
-                symbol,
-                tf: normalizedTf
-              },
-              'seedKlinesForSymbol: no klines returned'
-            );
-
-            continue;
-          }
-
-          const db = dbModule.get();
-
-          const insert = db.prepare(
-            `
-              INSERT OR IGNORE INTO klines
-                (
-                  symbol,
-                  timeframe,
-                  open_time,
-                  open,
-                  high,
-                  low,
-                  close,
-                  volume
-                )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `
-          );
-
-          const insertMany = db.transaction((rows) => {
-            for (const kline of rows) {
-              insert.run(
-                symbol,
-                normalizedTf,
-                kline.open_time,
-                kline.open,
-                kline.high,
-                kline.low,
-                kline.close,
-                kline.volume
-              );
-            }
-          });
-
-          insertMany(klines);
-
-          logger.debug(
-            {
-              symbol,
-              tf: normalizedTf,
-              count: klines.length
-            },
-            'seedKlinesForSymbol: klines persisted'
-          );
-
-          try {
-            if (
-              typeof macdUtil.computeAndStoreMacd === 'function'
-            ) {
-              await macdUtil.computeAndStoreMacd(
-                symbol,
-                normalizedTf
-              );
-            } else if (
-              typeof macdUtil.computeMacdHistogram === 'function'
-            ) {
-              await macdUtil.computeMacdHistogram(
-                symbol,
-                normalizedTf
-              );
-            }
-          } catch (err) {
-            logger.debug(
-              {
-                err,
-                symbol,
-                tf: normalizedTf
-              },
-              'seedKlinesForSymbol: MACD warm-up failed'
-            );
-          }
-        } catch (err) {
-          logger.debug(
-            {
-              err,
-              symbol,
-              tf: normalizedTf
-            },
-            'seedKlinesForSymbol: timeframe fetch failed'
-          );
-        }
+    for (const currentTimeframe of timeframes) {
+      if (!currentTimeframe) {
+        continue;
       }
-    } catch (err) {
-      logger.debug(
-        {
-          err,
-          symbol,
-          timeframe
-        },
-        'seedKlinesForSymbol: unexpected error'
+
+      await fetchAndPersistRestKlines(
+        symbol,
+        currentTimeframe,
+        Number(
+          config.SEED_KLINES_LIMIT ||
+          process.env.SEED_KLINES_LIMIT ||
+          500
+        )
       );
     }
   },
@@ -566,117 +819,92 @@ module.exports = {
   async scanAllForStartup() {
     if (startupComplete) {
       logger.debug(
-        'scanAllForStartup: startup scan already completed'
+        'poller.scanAllForStartup: already completed'
       );
 
       return [];
     }
 
-    logger.info(
-      'scanAllForStartup: starting full startup pass'
+    const db = dbModule.get();
+
+    const rows = db
+      .prepare(
+        `
+          SELECT symbol
+          FROM symbols
+          ORDER BY symbol COLLATE NOCASE ASC
+        `
+      )
+      .all()
+      .filter((row) => isUsdtSymbol(row.symbol));
+
+    const signals = [];
+    const pageSize = Number(
+      config.PAGE_SIZE ||
+      process.env.PAGE_SIZE ||
+      25
     );
 
-    try {
-      const db = dbModule.get();
-
-      const rows = db
-        .prepare(
-          `
-            SELECT symbol
-            FROM symbols
-            ORDER BY symbol COLLATE NOCASE ASC
-          `
-        )
-        .all();
-
-      const validRows = rows.filter((row) =>
-        isUsdtSymbol(row.symbol)
+    for (
+      let index = 0;
+      index < rows.length;
+      index += pageSize
+    ) {
+      const page = rows.slice(
+        index,
+        index + pageSize
       );
 
-      const invalidCount = rows.length - validRows.length;
-
-      if (invalidCount > 0) {
-        logger.warn(
-          {
-            invalidCount
-          },
-          'scanAllForStartup: invalid symbols skipped'
-        );
-      }
-
-      const newSignals = [];
-      const pageSize = Number(config.PAGE_SIZE || 25);
-
-      for (
-        let i = 0;
-        i < validRows.length;
-        i += pageSize
-      ) {
-        const page = validRows.slice(i, i + pageSize);
-
-        const results = await Promise.all(
-          page.map((row) =>
-            this.scanSymbolRoots(row.symbol)
-          )
-        );
-
-        newSignals.push(...results.flat());
-      }
-
-      newSignals.sort((a, b) => {
-        const symbolA = String(a.symbol || '').toUpperCase();
-        const symbolB = String(b.symbol || '').toUpperCase();
-
-        return symbolA.localeCompare(symbolB);
-      });
-
-      if (newSignals.length > 0) {
-        logger.info(
-          {
-            count: newSignals.length
-          },
-          'scanAllForStartup: enqueueing startup notification batch'
-        );
-
-        notificationQueue.enqueueStartupBatch(newSignals);
-      } else {
-        logger.info(
-          'scanAllForStartup: no startup signals found'
-        );
-      }
-
-      this.initializeBoundaryCandleState(validRows, db);
-
-      startupComplete = true;
-
-      logger.info(
-        'scanAllForStartup: completed'
+      const results = await Promise.all(
+        page.map((row) => {
+          return this.scanSymbolRoots(
+            row.symbol
+          );
+        })
       );
 
-      return newSignals;
-    } catch (err) {
-      logger.error(
-        {
-          err
-        },
-        'scanAllForStartup: unexpected error'
-      );
-
-      return [];
+      for (const result of results) {
+        signals.push(...result);
+      }
     }
+
+    if (signals.length > 0) {
+      notificationQueue.enqueueStartupBatch(
+        signals
+      );
+    }
+
+    /*
+     * Establish the baseline only after stored data has
+     * been scanned. Future scans process newer candles only.
+     */
+    this.initializeBoundaryCandleState(
+      rows,
+      db
+    );
+
+    startupComplete = true;
+
+    logger.info(
+      {
+        signals: signals.length,
+        symbols: rows.length
+      },
+      'poller.scanAllForStartup: completed'
+    );
+
+    return signals;
   },
 
   initializeBoundaryCandleState(rows, db) {
     const rootTfs = buildRootTfs();
 
     for (const row of rows) {
-      const symbol = row.symbol;
-
-      for (const tf of rootTfs) {
+      for (const timeframe of rootTfs) {
         const latestOpen = getLatestOpenTime(
           db,
-          symbol,
-          tf
+          row.symbol,
+          timeframe
         );
 
         if (latestOpen === null) {
@@ -684,7 +912,10 @@ module.exports = {
         }
 
         dbModule.setState(
-          this.getLoop2ProcessedCandleKey(symbol, tf),
+          this.getLoop2ProcessedCandleKey(
+            row.symbol,
+            timeframe
+          ),
           latestOpen
         );
       }
@@ -693,126 +924,81 @@ module.exports = {
     logger.info(
       {
         symbols: rows.length,
-        timeframes: rootTfs.length
+        timeframes: rootTfs
       },
-      'poller: initialized boundary candle state'
+      'poller: boundary state initialized'
     );
   },
 
   async scanSymbolRoots(symbol) {
-    const rootTfs = buildRootTfs();
+    const db = dbModule.get();
     const results = [];
 
     if (!isUsdtSymbol(symbol)) {
-      logger.warn(
-        {
-          symbol
-        },
-        'scanSymbolRoots: invalid USDT symbol; skipping'
-      );
-
       return results;
     }
 
-    for (const tf of rootTfs) {
-      try {
-        const db = dbModule.get();
-
-        const selectStatement = db.prepare(
+    for (const timeframe of buildRootTfs()) {
+      const rows = db
+        .prepare(
           `
-            SELECT open_time, close, open
+            SELECT open_time
             FROM klines
             WHERE symbol = ?
               AND timeframe = ?
             ORDER BY open_time DESC
             LIMIT 2
           `
-        );
+        )
+        .all(symbol, timeframe);
 
-        let rows = selectStatement.all(symbol, tf);
+      if (rows.length < 2) {
+        continue;
+      }
 
-        if (!rows || rows.length < 2) {
-          logger.debug(
-            {
+      const closedOpenTime =
+        Number(rows[0].open_time);
+
+      const flip =
+        typeof macdUtil.isMacdFlipAtClosedCandle ===
+        'function'
+          ? await macdUtil.isMacdFlipAtClosedCandle(
               symbol,
-              tf
-            },
-            'scanSymbolRoots: insufficient klines; seeding'
-          );
-
-          await this.seedKlinesForSymbol(symbol, tf);
-
-          rows = selectStatement.all(symbol, tf);
-
-          if (!rows || rows.length < 2) {
-            logger.debug(
-              {
-                symbol,
-                tf
-              },
-              'scanSymbolRoots: still insufficient klines'
+              timeframe,
+              closedOpenTime
+            )
+          : await macdUtil.isMacdFlip(
+              symbol,
+              timeframe
             );
 
-            continue;
-          }
-        }
+      if (!flip) {
+        continue;
+      }
 
-        const flip = await macdUtil.isMacdFlip(
+      const signal =
+        await signalManager.handleRootSignal({
           symbol,
-          tf
-        );
-
-        logger.debug(
-          {
-            symbol,
-            tf,
-            flip
-          },
-          'scanSymbolRoots: MACD result'
-        );
-
-        if (!flip) {
-          continue;
-        }
-
-        const signal = await signalManager.handleRootSignal({
-          symbol,
-          root_tf: tf,
+          root_tf: timeframe,
           detected_at: Date.now(),
-          candle_open_time: Number(rows[0].open_time),
+          candle_open_time: closedOpenTime,
           notifyImmediately: false,
           notificationType: 'startup'
         });
 
-        logger.info(
-          {
-            symbol,
-            tf,
-            signalCreated: !!signal
-          },
-          'scanSymbolRoots: root signal result'
-        );
-
-        if (signal) {
-          results.push(signal);
-        }
-      } catch (err) {
-        logger.debug(
-          {
-            err,
-            symbol,
-            tf
-          },
-          'scanSymbolRoots: error checking flip'
-        );
+      if (signal) {
+        results.push(signal);
       }
     }
 
     return results;
   },
 
-  getNextFiveMinuteBoundaryMs(nowMs = Date.now()) {
-    const remainder = nowMs % FIVE_MINUTES_MS;
+  getNextFiveMinuteBoundaryMs(
+    nowMs = Date.now()
+  ) {
+    const remainder =
+      nowMs % FIVE_MINUTES_MS;
 
     return nowMs + (
       remainder === 0
@@ -829,7 +1015,7 @@ module.exports = {
             {
               err
             },
-            'poller: boundary scan loop crashed'
+            'poller: boundary loop crashed'
           );
         });
     });
@@ -847,10 +1033,12 @@ module.exports = {
 
       logger.debug(
         {
-          nextBoundary: new Date(nextBoundary).toISOString(),
+          nextBoundary: new Date(
+            nextBoundary
+          ).toISOString(),
           delayMs: delay
         },
-        'poller.loop2: waiting for next five-minute boundary'
+        'poller.loop2: waiting for boundary'
       );
 
       await sleep(delay);
@@ -861,7 +1049,7 @@ module.exports = {
 
       if (boundaryScanInProgress) {
         logger.warn(
-          'poller.loop2: previous boundary scan is still running; skipping boundary'
+          'poller.loop2: previous scan still running'
         );
 
         continue;
@@ -885,20 +1073,9 @@ module.exports = {
   },
 
   async runBoundaryScanOnce() {
-    const boundary = new Date();
-
-    logger.info(
-      {
-        boundary: boundary.toISOString()
-      },
-      'poller.loop2: starting exact five-minute boundary scan'
-    );
-
-    await this.initialScan({
-      seed: false
-    });
-
+    const startedAt = Date.now();
     const db = dbModule.get();
+    const newSignals = [];
 
     const rows = db
       .prepare(
@@ -908,203 +1085,139 @@ module.exports = {
           ORDER BY symbol COLLATE NOCASE ASC
         `
       )
-      .all();
-
-    const validRows = rows.filter((row) =>
-      isUsdtSymbol(row.symbol)
-    );
+      .all()
+      .filter((row) => isUsdtSymbol(row.symbol));
 
     const rootTfs = buildRootTfs();
-    const newSignals = [];
-    const alignmentAlerts = [];
 
     logger.info(
       {
-        symbolCount: validRows.length,
+        symbols: rows.length,
         rootTfs
       },
-      'poller.loop2: symbols and timeframes loaded'
+      'poller.loop2: boundary scan started'
     );
 
-    for (const row of validRows) {
+    /*
+     * Important:
+     * This method does not call REST and does not call WS.
+     * It only reads the latest stored candle.
+     */
+    for (const row of rows) {
       const symbol = row.symbol;
 
-      for (const tf of rootTfs) {
-        try {
-          await this.seedKlinesForSymbol(symbol, tf);
+      for (const timeframe of rootTfs) {
+        const latestOpen = getLatestOpenTime(
+          db,
+          symbol,
+          timeframe
+        );
 
-          const latestOpen = getLatestOpenTime(
-            db,
-            symbol,
-            tf
-          );
-
-          if (latestOpen === null) {
-            logger.debug(
-              {
-                symbol,
-                tf
-              },
-              'poller.loop2: no latest candle found'
-            );
-
-            continue;
-          }
-
-          const processedStateKey =
-            this.getLoop2ProcessedCandleKey(symbol, tf);
-
-          const processedOpen = Number(
-            dbModule.getState(processedStateKey) || 0
-          );
-
-          logger.debug(
-            {
-              symbol,
-              tf,
-              latestOpen,
-              processedOpen
-            },
-            'poller.loop2: candle state'
-          );
-
-          if (latestOpen > processedOpen) {
-            const flip = await macdUtil.isMacdFlip(
-              symbol,
-              tf
-            );
-
-            logger.info(
-              {
-                symbol,
-                tf,
-                latestOpen,
-                processedOpen,
-                flip
-              },
-              'poller.loop2: MACD result'
-            );
-
-            if (flip) {
-              const signal =
-                await signalManager.handleRootSignal({
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  notifyImmediately: false,
-                  notificationType: 'new_root_candle'
-                });
-
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  signalCreated: !!signal
-                },
-                'poller.loop2: root signal result'
-              );
-
-              if (signal) {
-                signal.notificationType =
-                  'new_root_candle';
-
-                newSignals.push(signal);
-              }
-            }
-
-            dbModule.setState(
-              processedStateKey,
-              latestOpen
-            );
-
-            logger.debug(
-              {
-                symbol,
-                tf,
-                latestOpen
-              },
-              'poller.loop2: processed newly opened root candle'
-            );
-          }
-
-          const latestSignals =
-            dbModule.getLatestSignalsSnapshot();
-
-          const activeSignals = latestSignals.filter(
-            (signal) => {
-              return (
-                signal.symbol === symbol &&
-                signal.root_tf === tf
-              );
-            }
-          );
-
-          if (activeSignals.length === 0) {
-            continue;
-          }
-
-          const alignment =
-            await signalManager.evaluateMtfAlignment(
-              symbol
-            );
-
-          const alignmentStateKey =
-            `poller.loop2.alignment.${symbol}.${tf}`;
-
-          const previousAlignment =
-            dbModule.getState(alignmentStateKey);
-
-          const nextAlignmentJson =
-            JSON.stringify(alignment || {});
-
-          if (previousAlignment === nextAlignmentJson) {
-            continue;
-          }
-
-          dbModule.setState(
-            alignmentStateKey,
-            alignment || {}
-          );
-
-          const alignmentValues =
-            Object.values(alignment || {});
-
-          const positiveCount =
-            alignmentValues.filter((value) => {
-              return value && value.positive;
-            }).length;
-
-          const alignmentCount =
-            alignmentValues.length;
-
-          alignmentAlerts.push({
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            state: 'monitor',
-            notificationType: 'mtf_alignment',
-            meta: {
-              alignment: alignment || {},
-              decision: 'monitor',
-              acceptReason: 'mtf_alignment_alert',
-              tvScore: 0,
-              tvSource: 'loop2',
-              mtfScore: alignmentCount > 0
-                ? positiveCount / alignmentCount
-                : 0
-            }
-          });
-        } catch (err) {
-          logger.debug(
-            {
-              err,
-              symbol,
-              tf
-            },
-            'poller.loop2: symbol/timeframe scan failed'
-          );
+        if (latestOpen === null) {
+          continue;
         }
+
+        const stateKey =
+          this.getLoop2ProcessedCandleKey(
+            symbol,
+            timeframe
+          );
+
+        const processedOpen = Number(
+          dbModule.getState(stateKey) || 0
+        );
+
+        /*
+         * Process only symbols/timeframes with a newer
+         * stored candle.
+         */
+        if (latestOpen <= processedOpen) {
+          continue;
+        }
+
+        /*
+         * The latest candle is the newly opened candle.
+         * The previous candle is the one that just closed and
+         * is the candle used for the MACD flip decision.
+         */
+        const previousRow = db
+          .prepare(
+            `
+              SELECT open_time
+              FROM klines
+              WHERE symbol = ?
+                AND timeframe = ?
+                AND open_time < ?
+              ORDER BY open_time DESC
+              LIMIT 1
+            `
+          )
+          .get(symbol, timeframe, latestOpen);
+
+        if (!previousRow) {
+          dbModule.setState(
+            stateKey,
+            latestOpen
+          );
+
+          continue;
+        }
+
+        const closedOpenTime =
+          Number(previousRow.open_time);
+
+        const flip =
+          typeof macdUtil.isMacdFlipAtClosedCandle ===
+          'function'
+            ? await macdUtil.isMacdFlipAtClosedCandle(
+                symbol,
+                timeframe,
+                closedOpenTime
+              )
+            : await macdUtil.isMacdFlip(
+                symbol,
+                timeframe
+              );
+
+        logger.info(
+          {
+            symbol,
+            timeframe,
+            latestOpen,
+            processedOpen,
+            closedOpenTime,
+            flip
+          },
+          'poller.loop2: new root candle evaluated'
+        );
+
+        if (flip) {
+          const signal =
+            await signalManager.handleRootSignal({
+              symbol,
+              root_tf: timeframe,
+              detected_at: Date.now(),
+              candle_open_time: closedOpenTime,
+              notifyImmediately: false,
+              notificationType: 'new_root_candle'
+            });
+
+          if (signal) {
+            signal.notificationType =
+              'new_root_candle';
+
+            newSignals.push(signal);
+          }
+        }
+
+        /*
+         * Mark the new candle processed after its previous
+         * candle has been evaluated.
+         */
+        dbModule.setState(
+          stateKey,
+          latestOpen
+        );
       }
     }
 
@@ -1121,45 +1234,27 @@ module.exports = {
       );
     } else {
       logger.info(
-        'poller.loop2: no new root candle signals found'
+        'poller.loop2: no new root flips found'
       );
-    }
-
-    for (const alert of alignmentAlerts) {
-      try {
-        notificationQueue.enqueueSignal(
-          alert,
-          'realtime'
-        );
-
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf
-          },
-          'poller.loop2: realtime alignment alert enqueued'
-        );
-      } catch (err) {
-        logger.warn(
-          {
-            err,
-            alert
-          },
-          'poller.loop2: failed to enqueue alignment alert'
-        );
-      }
     }
 
     logger.info(
       {
         newSignals: newSignals.length,
-        alignmentAlerts: alignmentAlerts.length
+        durationMs: Date.now() - startedAt
       },
-      'poller.loop2: exact five-minute boundary scan completed'
+      'poller.loop2: boundary scan completed'
     );
   },
 
-  getLoop2ProcessedCandleKey(symbol, tf) {
-    return `poller.loop2.lastRootOpen.${symbol}.${tf}`;
+  getLoop2ProcessedCandleKey(
+    symbol,
+    timeframe
+  ) {
+    return [
+      'poller.loop2.lastRootOpen',
+      symbol,
+      normalizeTimeframe(timeframe)
+    ].join('.');
   }
 };
