@@ -234,19 +234,8 @@ module.exports = {
       return;
     }
 
-    const title = SUMMARY_TITLE_MAP.midcandle_update || '⏳ Mid-Candle Update';
-    const msg = [
-      title,
-      '',
-      this.buildSignalMessage({
-        ...signal,
-        notificationType: 'midcandle_update'
-      })
-    ].join('\n');
-
-    await this._sendMessage(msg, {
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
+    await this.sendNewSignalSingleBlock({
+      ...signal,
       notificationType: 'midcandle_update'
     });
   },
@@ -256,19 +245,8 @@ module.exports = {
       return;
     }
 
-    const title = SUMMARY_TITLE_MAP.mtf_alignment || '⏱️ MTF Alignment Alert';
-    const msg = [
-      title,
-      '',
-      this.buildSignalMessage({
-        ...signal,
-        notificationType: 'mtf_alignment'
-      })
-    ].join('\n');
-
-    await this._sendMessage(msg, {
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
+    await this.sendNewSignalSingleBlock({
+      ...signal,
       notificationType: 'mtf_alignment'
     });
   },
