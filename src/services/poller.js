@@ -927,10 +927,10 @@ module.exports = {
             logger.debug(
               {
                 symbol,
-              tf
-            },
-            'scanSymbolRoots: still insufficient klines'
-          );
+                tf
+              },
+              'scanSymbolRoots: still insufficient klines'
+            );
 
             continue;
           }
@@ -1071,7 +1071,7 @@ module.exports = {
     const startedAt = Date.now();
     const db = dbModule.get();
 
-    const rows = db
+    const allRows = db
       .prepare(
         `
           SELECT symbol
@@ -1079,12 +1079,28 @@ module.exports = {
           ORDER BY symbol COLLATE NOCASE ASC
         `
       )
-      .all()
-      .filter((row) => isUsdtSymbol(row.symbol));
+      .all();
+
+    const rows = allRows.filter((row) =>
+      isUsdtSymbol(row.symbol)
+    );
 
     const rootTfs = buildRootTfs();
     const rootSignals = [];
     const alignmentAlerts = [];
+
+    logger.info(
+      {
+        totalSymbols: allRows.length,
+        validUsdtSymbols: rows.length,
+        invalidSymbols: allRows.length - rows.length,
+        sampleSymbols: allRows
+          .slice(0, 10)
+          .map((row) => row.symbol),
+        rootTfs
+      },
+      'poller.loop2: symbol diagnostic'
+    );
 
     logger.info(
       {
@@ -1245,6 +1261,17 @@ module.exports = {
               dbModule.getState(stateKey) || 0
             );
 
+          logger.info(
+            {
+              symbol,
+              tf,
+              latestOpen,
+              processedOpen,
+              hasNewCandle: latestOpen > processedOpen
+            },
+            'poller.loop2: candle state diagnostic'
+          );
+
           if (latestOpen <= processedOpen) {
             continue;
           }
@@ -1292,6 +1319,18 @@ module.exports = {
                   tf
                 );
 
+          logger.info(
+            {
+              symbol,
+              tf,
+              latestOpen,
+              processedOpen,
+              closedOpenTime,
+              flip
+            },
+            'poller.loop2: MACD flip result'
+          );
+
           logger.debug(
             {
               symbol,
@@ -1315,6 +1354,18 @@ module.exports = {
                 notificationType: 'new_root_candle',
                 skipTradeOpen: false
               });
+
+            logger.info(
+              {
+                symbol,
+                tf,
+                closedOpenTime,
+                signalCreated: Boolean(signal),
+                signalState: signal?.state || null,
+                signalDecision: signal?.meta?.decision || null
+              },
+              'poller.loop2: root signal result'
+            );
 
             if (signal) {
               signal.eventId = `root_candle:${String(symbol).toUpperCase()}:${tf}:${closedOpenTime}`;
