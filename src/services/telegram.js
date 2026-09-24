@@ -5,13 +5,6 @@ const dbModule = require('../db');
 
 let bot = null;
 
-const SUMMARY_TITLE_MAP = {
-  new_root_candle: '🕔 New Root Candle Open',
-  mtf_alignment: '⏱️ MTF Alignment Alert',
-  midcandle_update: '⏳ Mid-Candle Update',
-  startup: '📊 Startup Summary'
-};
-
 module.exports = {
   init() {
     if (!config.TELEGRAM_BOT_TOKEN) {
@@ -166,13 +159,7 @@ module.exports = {
     const mtfHeader = '🛰️ MTF Status:';
     const marketBlock = `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
 
-    const eventTitle =
-      signal && signal.notificationType
-        ? SUMMARY_TITLE_MAP[signal.notificationType] || null
-        : null;
-
     const msgParts = [
-      ...(eventTitle ? [eventTitle, ''] : []),
       `🎯 Signal: ${symbol} (${root_tf})`,
       `⏰ Time: ${timeStr}`,
       `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision} (reason: ${reason})`,
@@ -188,89 +175,37 @@ module.exports = {
     return msgParts.join('\n');
   },
 
-  async sendNewSignalSingleBlock(signal, forcedType = null) {
+  async sendNewSignalSingleBlock(signal) {
     if (!bot) return;
 
     try {
-      const normalizedSignal = signal
-        ? {
-            ...signal,
-            notificationType:
-              forcedType ||
-              signal.notificationType ||
-              null
-          }
-        : null;
-
-      const baseMsg = this.buildSignalMessage(normalizedSignal);
-      await this._sendMessage(baseMsg, {
-        symbol: normalizedSignal?.symbol,
-        root_tf: normalizedSignal?.root_tf,
-        notificationType: normalizedSignal?.notificationType || null
-      });
-
-      logger.debug(
-        {
-          symbol: normalizedSignal?.symbol,
-          root_tf: normalizedSignal?.root_tf,
-          notificationType: normalizedSignal?.notificationType || null
-        },
-        'Telegram: signal detail block sent'
-      );
+      const baseMsg = this.buildSignalMessage(signal);
+      await this._sendMessage(baseMsg, { symbol: signal?.symbol, root_tf: signal?.root_tf });
+      logger.debug({ symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram: signal detail block sent');
     } catch (err) {
-      logger.warn(
-        {
-          err,
-          symbol: signal?.symbol,
-          root_tf: signal?.root_tf
-        },
-        'Telegram: failed to send signal detail block'
-      );
+      logger.warn({ err, symbol: signal?.symbol, root_tf: signal?.root_tf }, 'Telegram: failed to send signal detail block');
     }
   },
 
-  async sendMidCandleUpdateBlock(signal) {
-    if (!signal) {
-      return;
-    }
-
-    await this.sendNewSignalSingleBlock({
-      ...signal,
-      notificationType: 'midcandle_update'
-    });
-  },
-
-  async sendMtfAlignmentAlert(signal) {
-    if (!signal) {
-      return;
-    }
-
-    await this.sendNewSignalSingleBlock({
-      ...signal,
-      notificationType: 'mtf_alignment'
-    });
-  },
-
-  async sendSummaryBlock({
-    snapshot = [],
-    title = '📊 Startup Summary',
-    signalType = null
-  } = {}) {
+  async sendStartupSummary({ snapshot = [] } = {}) {
     if (!bot) return;
 
     try {
-      const signals = Array.isArray(snapshot) ? snapshot : [];
+      const signals = Array.isArray(snapshot) && snapshot.length > 0 ? snapshot : [];
 
       if (signals.length === 0) {
-        logger.warn('Telegram: no signals provided to summary block');
+        logger.warn('Telegram: no signals provided to startup summary');
         return;
       }
+
+      logger.info({ signalCount: signals.length }, 'Telegram: starting startup summary flow');
 
       const delayMs = Math.max(
         500,
         Number(config.TELEGRAM_SEND_DELAY_MS) || 1000
       );
 
+      // STEP 1: Send startup header with summary counts
       const tfCounts = {};
       const symbolSet = new Set();
 
@@ -288,17 +223,16 @@ module.exports = {
         if (!orderedRootTfs.includes(tf)) orderedRootTfs.push(tf);
       }
 
-      const summaryParts = orderedRootTfs.map((tf) => `${tf}: ${tfCounts[tf] || 0}`);
-      const allSymbols = Array.from(symbolSet).sort((a, b) =>
-        a.localeCompare(b, undefined, { sensitivity: 'base' })
-      );
+      const summaryParts = orderedRootTfs.map(tf => `${tf}: ${tfCounts[tf] || 0}`);
+      const allSymbols = Array.from(symbolSet).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
       const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
 
-      const header = `${title} (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
+      const header = `📊 Startup Summary (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
       await this._sendMessage(header);
-      logger.info('Telegram: summary header sent');
+      logger.info('Telegram: startup header sent');
       await this._sleep(delayMs);
 
+      // STEP 2: Send individual signal detail blocks (one per signal, sorted A-Z)
       const sortedSignals = [...signals].sort((a, b) => {
         const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
         if (s !== 0) return s;
@@ -307,25 +241,15 @@ module.exports = {
 
       for (let i = 0; i < sortedSignals.length; i++) {
         try {
-          await this.sendNewSignalSingleBlock(sortedSignals[i], signalType);
-          logger.debug(
-            {
-              symbol: sortedSignals[i].symbol,
-              index: i + 1,
-              total: sortedSignals.length
-            },
-            'Telegram: signal block sent'
-          );
+          await this.sendNewSignalSingleBlock(sortedSignals[i]);
+          logger.debug({ symbol: sortedSignals[i].symbol, index: i + 1, total: sortedSignals.length }, 'Telegram: signal block sent');
         } catch (e) {
-          logger.warn(
-            { err: e, symbol: sortedSignals[i].symbol },
-            'Telegram: failed to send signal block'
-          );
+          logger.warn({ err: e, symbol: sortedSignals[i].symbol }, 'Telegram: failed to send signal block');
         }
-
         await this._sleep(delayMs);
       }
 
+      // STEP 3: Send recommended trades block
       let openCount = 0;
       try {
         const row = dbModule.get().prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
@@ -342,7 +266,7 @@ module.exports = {
       await this._sleep(delayMs);
 
       const candidates = signals
-        .map((s) => ({
+        .map(s => ({
           symbol: s.symbol,
           root_tf: s.root_tf,
           tvScore: Number(s.meta?.tvScore || 0),
@@ -350,7 +274,7 @@ module.exports = {
           acceptDecision: s.meta?.decision || 'monitor',
           reason: s.meta?.acceptReason || 'n/a'
         }))
-        .filter((c) => c.acceptDecision === 'accept')
+        .filter(c => c.acceptDecision === 'accept')
         .sort((a, b) => {
           if (b.tvScore !== a.tvScore) return b.tvScore - a.tvScore;
           return b.mtfScore - a.mtfScore;
@@ -370,45 +294,14 @@ module.exports = {
           const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${tvPercent}% MTF:${mtfPercent}% - ${r.reason}${simNote}`;
 
           await this._sendMessage(line);
-          logger.debug(
-            {
-              symbol: r.symbol,
-              index: i + 1,
-              total: recommended.length
-            },
-            'Telegram: recommended block sent'
-          );
+          logger.debug({ symbol: r.symbol, index: i + 1, total: recommended.length }, 'Telegram: recommended block sent');
           await this._sleep(delayMs);
         }
       }
 
-      logger.info('Telegram: summary flow completed');
+      logger.info('Telegram: startup summary flow completed');
     } catch (err) {
-      logger.error({ err }, 'Telegram: summary flow failed');
+      logger.error({ err }, 'Telegram: startup summary flow failed');
     }
-  },
-
-  async sendStartupSummary({ snapshot = [] } = {}) {
-    if (!bot) return;
-
-    await this.sendSummaryBlock({
-      snapshot,
-      title: '📊 Startup Summary',
-      signalType: null
-    });
-  },
-
-  async sendRootCandleSummary({ snapshot = [] } = {}) {
-    if (!bot) return;
-
-    await this.sendSummaryBlock({
-      snapshot,
-      title: '🕔 New Root Candle Open',
-      signalType: 'new_root_candle'
-    });
-  },
-
-  async sendNewSignalSingleBlockLegacy(signal) {
-    return this.sendNewSignalSingleBlock(signal);
   }
 };
