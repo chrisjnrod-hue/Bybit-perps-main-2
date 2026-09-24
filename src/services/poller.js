@@ -33,7 +33,6 @@ let wsListenerAttached = false;
 let restUpdaterTimer = null;
 let startupPromise = null;
 let mtfLoopTimer = null;
-let midCandleLoopTimer = null;
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -916,7 +915,6 @@ module.exports = {
       }
 
       const nextBoundary = this.getNextFiveMinuteBoundaryMs();
-
       const delay = Math.max(0, nextBoundary - Date.now());
 
       logger.debug(
@@ -941,6 +939,11 @@ module.exports = {
       boundaryScanInProgress = true;
 
       try {
+        /*
+         * Refresh root klines before evaluating the current candle state.
+         * This avoids stale boundary scans.
+         */
+        await updateAllKlinesFromRest();
         await this.runBoundaryScanOnce();
       } catch (err) {
         logger.error(
@@ -978,6 +981,12 @@ module.exports = {
       },
       'poller.loop2: boundary scan started'
     );
+
+    /*
+     * Mid-candle signal evaluation runs inside the five-minute loop.
+     * It sends one per signal, no summary, no trade opening.
+     */
+    await this.scanMidCandleSignals();
 
     for (const row of rows) {
       const symbol = row.symbol;
@@ -1044,7 +1053,7 @@ module.exports = {
             root_tf: timeframe,
             detected_at: Date.now(),
             candle_open_time: closedOpenTime,
-            notifyImmediately: true,
+            notifyImmediately: false,
             notificationType: 'new_root_candle',
             skipTradeOpen: false
           });
@@ -1080,97 +1089,75 @@ module.exports = {
     );
   },
 
-  startMidCandleLoop() {
-    if (midCandleLoopTimer) {
-      return;
-    }
-
-    const run = async () => {
-      if (!isRunning || !startupComplete) {
-        return;
-      }
-
-      try {
-        await this.scanMidCandleSignals();
-      } catch (err) {
-        logger.error(
-          { err },
-          'poller.midcandle: loop failed'
-        );
-      }
-
-      if (isRunning && startupComplete) {
-        midCandleLoopTimer = setTimeout(run, 60 * 1000);
-      } else {
-        midCandleLoopTimer = null;
-      }
-    };
-
-    void run();
-  },
-
   async scanMidCandleSignals() {
     const db = dbModule.get();
     const symbols = getSymbolsFromDb();
 
     for (const symbol of symbols) {
       for (const timeframe of buildRootTfs()) {
-        const latestOpen = getLatestOpenTime(db, symbol, timeframe);
-
-        if (latestOpen === null) {
-          continue;
-        }
-
-        const stateKey = getMidcandleKey(symbol, timeframe);
-        const seenOpen = Number(dbModule.getState(stateKey) || 0);
-
-        if (latestOpen <= seenOpen) {
-          continue;
-        }
-
-        const previousRow = db
+        const latestRow = db
           .prepare(
             `
-              SELECT open_time
+              SELECT
+                open_time,
+                open,
+                high,
+                low,
+                close,
+                volume
               FROM klines
               WHERE symbol = ?
                 AND timeframe = ?
-                AND open_time < ?
               ORDER BY open_time DESC
               LIMIT 1
             `
           )
-          .get(symbol, timeframe, latestOpen);
+          .get(symbol, timeframe);
 
-        if (!previousRow) {
-          dbModule.setState(stateKey, latestOpen);
+        if (!latestRow) {
           continue;
         }
 
-        const closedOpenTime = Number(previousRow.open_time);
+        const latestOpen = Number(latestRow.open_time);
+
+        if (!Number.isFinite(latestOpen)) {
+          continue;
+        }
+
+        const candleSignature = JSON.stringify([
+          latestOpen,
+          latestRow.open,
+          latestRow.high,
+          latestRow.low,
+          latestRow.close,
+          latestRow.volume
+        ]);
+
+        const stateKey = getMidcandleKey(symbol, timeframe);
+        const previousSignature = dbModule.getState(stateKey);
+
+        if (previousSignature === candleSignature) {
+          continue;
+        }
 
         const flip =
-          typeof macdUtil.isMacdFlipAtClosedCandle === 'function'
-            ? await macdUtil.isMacdFlipAtClosedCandle(
-                symbol,
-                timeframe,
-                closedOpenTime
-              )
-            : await macdUtil.isMacdFlip(symbol, timeframe);
+          typeof macdUtil.isMacdFlip === 'function'
+            ? await macdUtil.isMacdFlip(symbol, timeframe)
+            : false;
 
         if (flip) {
           await signalManager.handleRootSignal({
             symbol,
             root_tf: timeframe,
             detected_at: Date.now(),
-            candle_open_time: closedOpenTime,
+            candle_open_time: latestOpen,
             notifyImmediately: true,
             notificationType: 'midcandle_update',
             skipTradeOpen: true
           });
         }
 
-        dbModule.setState(stateKey, latestOpen);
+        dbModule.setState(stateKey, candleSignature);
       }
     }
   },
@@ -1182,6 +1169,7 @@ module.exports = {
 
     const run = async () => {
       if (!isRunning || !startupComplete) {
+        mtfLoopTimer = null;
         return;
       }
 
@@ -1212,14 +1200,20 @@ module.exports = {
         const alignment = await signalManager.evaluateMtfAlignment(symbol);
         const stateKey = `poller.mtf.lastAlignment.${symbol}`;
 
+        const currentState = JSON.stringify(alignment || {});
         const oldState = dbModule.getState(stateKey);
-        const currentState = JSON.stringify(alignment);
 
         if (oldState === currentState) {
           continue;
         }
 
-        dbModule.setState(stateKey, alignment);
+        dbModule.setState(stateKey, currentState);
+
+        const timeframes = Object.keys(alignment || {});
+        const positiveCount = timeframes.filter((timeframe) => {
+          return alignment[timeframe] &&
+            alignment[timeframe].positive;
+        }).length;
 
         const signal = {
           symbol,
@@ -1231,9 +1225,8 @@ module.exports = {
             alignment,
             decision: 'monitor',
             acceptReason: 'mtf_alignment_alert',
-            mtfScore: Object.keys(alignment || {}).length
-              ? Object.values(alignment).filter((v) => v && v.positive).length /
-                Object.keys(alignment).length
+            mtfScore: timeframes.length
+              ? positiveCount / timeframes.length
               : 0,
             tvScore: 0,
             tvSource: 'n/a',
