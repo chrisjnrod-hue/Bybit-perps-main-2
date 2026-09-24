@@ -7,7 +7,8 @@ let bot = null;
 
 const SUMMARY_TITLE_MAP = {
   new_root_candle: '🕔 New Root Candle Open',
-  mtf_alignment: '⏱️ Five-Minute MTF Alignment Alert',
+  mtf_alignment: '⏱️ MTF Alignment Alert',
+  midcandle_update: '⏳ Mid-Candle Update',
   startup: '📊 Startup Summary'
 };
 
@@ -226,6 +227,50 @@ module.exports = {
         'Telegram: failed to send signal detail block'
       );
     }
+  },
+
+  async sendMidCandleUpdateBlock(signal) {
+    if (!signal) {
+      return;
+    }
+
+    const title = SUMMARY_TITLE_MAP.midcandle_update || '⏳ Mid-Candle Update';
+    const msg = [
+      title,
+      '',
+      this.buildSignalMessage({
+        ...signal,
+        notificationType: 'midcandle_update'
+      })
+    ].join('\n');
+
+    await this._sendMessage(msg, {
+      symbol: signal.symbol,
+      root_tf: signal.root_tf,
+      notificationType: 'midcandle_update'
+    });
+  },
+
+  async sendMtfAlignmentAlert(signal) {
+    if (!signal) {
+      return;
+    }
+
+    const title = SUMMARY_TITLE_MAP.mtf_alignment || '⏱️ MTF Alignment Alert';
+    const msg = [
+      title,
+      '',
+      this.buildSignalMessage({
+        ...signal,
+        notificationType: 'mtf_alignment'
+      })
+    ].join('\n');
+
+    await this._sendMessage(msg, {
+      symbol: signal.symbol,
+      root_tf: signal.root_tf,
+      notificationType: 'mtf_alignment'
+    });
   },
 
   async sendSummaryBlock({
