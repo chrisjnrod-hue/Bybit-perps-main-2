@@ -32,6 +32,8 @@ let restUpdateInProgress = false;
 let wsListenerAttached = false;
 let restUpdaterTimer = null;
 let startupPromise = null;
+let mtfLoopTimer = null;
+let midCandleLoopTimer = null;
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -92,8 +94,7 @@ function buildRootTfs() {
   const seen = new Set();
 
   for (const timeframe of configured) {
-    const normalized =
-      normalizeTimeframe(timeframe);
+    const normalized = normalizeTimeframe(timeframe);
 
     if (!normalized || seen.has(normalized)) {
       continue;
@@ -120,8 +121,7 @@ function buildAllTfs() {
   const seen = new Set();
 
   for (const timeframe of configured) {
-    const normalized =
-      normalizeTimeframe(timeframe);
+    const normalized = normalizeTimeframe(timeframe);
 
     if (!normalized || seen.has(normalized)) {
       continue;
@@ -284,8 +284,7 @@ async function persistWsKline(kline) {
   }
 
   const symbol = kline.symbol;
-  const timeframe =
-    normalizeTimeframe(kline.timeframe);
+  const timeframe = normalizeTimeframe(kline.timeframe);
 
   if (
     !isUsdtSymbol(symbol) ||
@@ -294,11 +293,7 @@ async function persistWsKline(kline) {
     return;
   }
 
-  upsertKlines(
-    symbol,
-    timeframe,
-    [kline]
-  );
+  upsertKlines(symbol, timeframe, [kline]);
 
   logger.debug(
     {
@@ -311,29 +306,17 @@ async function persistWsKline(kline) {
   );
 }
 
-async function fetchAndPersistRestKlines(
-  symbol,
-  timeframe,
-  limit
-) {
+async function fetchAndPersistRestKlines(symbol, timeframe, limit) {
   try {
     const klines = await restLimiter.schedule(() => {
-      return bybit.fetchKlines(
-        symbol,
-        timeframe,
-        limit
-      );
+      return bybit.fetchKlines(symbol, timeframe, limit);
     });
 
     if (!Array.isArray(klines) || klines.length === 0) {
       return 0;
     }
 
-    return upsertKlines(
-      symbol,
-      timeframe,
-      klines
-    );
+    return upsertKlines(symbol, timeframe, klines);
   } catch (err) {
     logger.debug(
       {
@@ -362,11 +345,6 @@ async function updateAllKlinesFromRest() {
     isWsEnabled() &&
     wsManager.isHealthy(getWsStaleMs());
 
-  /*
-   * When WS is healthy, REST reconciles root timeframes.
-   * When WS is unavailable or stale, REST updates all
-   * configured root and MTF timeframes.
-   */
   const timeframes = wsHealthy
     ? buildRootTfs()
     : buildAllTfs();
@@ -404,30 +382,17 @@ async function updateAllKlinesFromRest() {
         25
       );
 
-      const batch = symbols.slice(
-        index,
-        index + batchSize
-      );
-
+      const batch = symbols.slice(index, index + batchSize);
       const jobs = [];
 
       for (const symbol of batch) {
         for (const timeframe of timeframes) {
-          jobs.push(
-            fetchAndPersistRestKlines(
-              symbol,
-              timeframe,
-              limit
-            )
-          );
+          jobs.push(fetchAndPersistRestKlines(symbol, timeframe, limit));
         }
       }
 
       const results = await Promise.all(jobs);
-      completed += results.reduce(
-        (total, value) => total + value,
-        0
-      );
+      completed += results.reduce((total, value) => total + value, 0);
     }
 
     logger.info(
@@ -461,18 +426,13 @@ function startRestUpdater() {
       await updateAllKlinesFromRest();
     } catch (err) {
       logger.error(
-        {
-          err
-        },
+        { err },
         'poller: REST updater failed'
       );
     }
 
     if (isRunning) {
-      restUpdaterTimer = setTimeout(
-        run,
-        interval
-      );
+      restUpdaterTimer = setTimeout(run, interval);
     } else {
       restUpdaterTimer = null;
     }
@@ -499,9 +459,7 @@ function attachWsListener() {
     void persistWsKline(kline)
       .catch((err) => {
         logger.debug(
-          {
-            err
-          },
+          { err },
           'poller: WebSocket kline persistence failed'
         );
       });
@@ -510,10 +468,7 @@ function attachWsListener() {
 
 function subscribeAllSymbolsToWs() {
   if (!isWsEnabled()) {
-    logger.info(
-      'poller: WebSocket disabled; REST fallback active'
-    );
-
+    logger.info('poller: WebSocket disabled; REST fallback active');
     return 0;
   }
 
@@ -524,11 +479,7 @@ function subscribeAllSymbolsToWs() {
   const symbols = getSymbolsFromDb();
   const timeframes = buildAllTfs();
 
-  const subscribed =
-    wsManager.subscribeSymbols(
-      symbols,
-      timeframes
-    );
+  const subscribed = wsManager.subscribeSymbols(symbols, timeframes);
 
   logger.info(
     {
@@ -549,10 +500,7 @@ async function discoverAndPersistSymbols() {
     !Array.isArray(symbols) ||
     symbols.length === 0
   ) {
-    logger.warn(
-      'poller: REST symbol discovery returned no symbols'
-    );
-
+    logger.warn('poller: REST symbol discovery returned no symbols');
     return [];
   }
 
@@ -616,13 +564,26 @@ async function seedSymbolTimeframes(symbol) {
   }
 }
 
+function getRootSignalStateKey(symbol, timeframe) {
+  return [
+    'poller.loop2.lastRootOpen',
+    symbol,
+    normalizeTimeframe(timeframe)
+  ].join('.');
+}
+
+function getMidcandleKey(symbol, timeframe) {
+  return [
+    'poller.midcandle.lastOpen',
+    symbol,
+    normalizeTimeframe(timeframe)
+  ].join('.');
+}
+
 module.exports = {
   start() {
     if (isRunning) {
-      logger.debug(
-        'poller.start: poller already running'
-      );
-
+      logger.debug('poller.start: poller already running');
       return;
     }
 
@@ -630,31 +591,8 @@ module.exports = {
 
     attachWsListener();
     startRestUpdater();
-    this.startBoundaryScanLoop();
 
-    /*
-     * This makes start() safe even when the caller did not
-     * explicitly run initialScan(). If the caller already ran
-     * initialScan(), the same startup promise is reused.
-     */
-    if (!startupPromise) {
-      startupPromise = this.initialScan({
-        seed: true
-      }).catch((err) => {
-        logger.error(
-          {
-            err
-          },
-          'poller.start: startup initialization failed'
-        );
-
-        return [];
-      });
-    }
-
-    logger.info(
-      'poller.start: boundary scan and continuous updater started'
-    );
+    logger.info('poller.start: continuous services started');
   },
 
   async initialScan(options = {}) {
@@ -672,19 +610,15 @@ module.exports = {
         'poller.initialScan: starting'
       );
 
-      const symbols =
-        await discoverAndPersistSymbols();
+      const symbols = await discoverAndPersistSymbols();
 
       attachWsListener();
       subscribeAllSymbolsToWs();
 
-      const seedSymbols =
-        bybit.getSeedSymbols(symbols);
+      const seedSymbols = bybit.getSeedSymbols(symbols);
 
       if (seed && seedSymbols.length > 0) {
-        await this.backgroundSeedKlines(
-          seedSymbols
-        );
+        await this.backgroundSeedKlines(seedSymbols);
       }
 
       logger.info(
@@ -708,12 +642,9 @@ module.exports = {
 
   async performWsInitialScan() {
     try {
-      const result =
-        await wsManager.performInitialScan();
+      const result = await wsManager.performInitialScan();
 
-      return Array.isArray(result)
-        ? result
-        : [];
+      return Array.isArray(result) ? result : [];
     } catch (err) {
       logger.debug(
         {
@@ -731,10 +662,7 @@ module.exports = {
       !Array.isArray(symbols) ||
       symbols.length === 0
     ) {
-      logger.info(
-        'poller.backgroundSeedKlines: no symbols'
-      );
-
+      logger.info('poller.backgroundSeedKlines: no symbols');
       return;
     }
 
@@ -758,10 +686,7 @@ module.exports = {
       index < symbols.length;
       index += concurrency
     ) {
-      const batch = symbols.slice(
-        index,
-        index + concurrency
-      );
+      const batch = symbols.slice(index, index + concurrency);
 
       await Promise.all(
         batch.map((item) => {
@@ -775,15 +700,10 @@ module.exports = {
       );
     }
 
-    logger.info(
-      'poller.backgroundSeedKlines: completed'
-    );
+    logger.info('poller.backgroundSeedKlines: completed');
   },
 
-  async seedKlinesForSymbol(
-    symbol,
-    timeframe = null
-  ) {
+  async seedKlinesForSymbol(symbol, timeframe = null) {
     if (!isUsdtSymbol(symbol)) {
       logger.warn(
         {
@@ -818,10 +738,7 @@ module.exports = {
 
   async scanAllForStartup() {
     if (startupComplete) {
-      logger.debug(
-        'poller.scanAllForStartup: already completed'
-      );
-
+      logger.debug('poller.scanAllForStartup: already completed');
       return [];
     }
 
@@ -850,17 +767,10 @@ module.exports = {
       index < rows.length;
       index += pageSize
     ) {
-      const page = rows.slice(
-        index,
-        index + pageSize
-      );
+      const page = rows.slice(index, index + pageSize);
 
       const results = await Promise.all(
-        page.map((row) => {
-          return this.scanSymbolRoots(
-            row.symbol
-          );
-        })
+        page.map((row) => this.scanSymbolRoots(row.symbol))
       );
 
       for (const result of results) {
@@ -869,20 +779,10 @@ module.exports = {
     }
 
     if (signals.length > 0) {
-      notificationQueue.enqueueStartupBatch(
-        signals
-      );
+      notificationQueue.enqueueStartupBatch(signals);
     }
 
-    /*
-     * Establish the baseline only after stored data has
-     * been scanned. Future scans process newer candles only.
-     */
-    this.initializeBoundaryCandleState(
-      rows,
-      db
-    );
-
+    this.initializeBoundaryCandleState(rows, db);
     startupComplete = true;
 
     logger.info(
@@ -901,21 +801,14 @@ module.exports = {
 
     for (const row of rows) {
       for (const timeframe of rootTfs) {
-        const latestOpen = getLatestOpenTime(
-          db,
-          row.symbol,
-          timeframe
-        );
+        const latestOpen = getLatestOpenTime(db, row.symbol, timeframe);
 
         if (latestOpen === null) {
           continue;
         }
 
         dbModule.setState(
-          this.getLoop2ProcessedCandleKey(
-            row.symbol,
-            timeframe
-          ),
+          getRootSignalStateKey(row.symbol, timeframe),
           latestOpen
         );
       }
@@ -956,35 +849,29 @@ module.exports = {
         continue;
       }
 
-      const closedOpenTime =
-        Number(rows[0].open_time);
+      const closedOpenTime = Number(rows[0].open_time);
 
       const flip =
-        typeof macdUtil.isMacdFlipAtClosedCandle ===
-        'function'
+        typeof macdUtil.isMacdFlipAtClosedCandle === 'function'
           ? await macdUtil.isMacdFlipAtClosedCandle(
               symbol,
               timeframe,
               closedOpenTime
             )
-          : await macdUtil.isMacdFlip(
-              symbol,
-              timeframe
-            );
+          : await macdUtil.isMacdFlip(symbol, timeframe);
 
       if (!flip) {
         continue;
       }
 
-      const signal =
-        await signalManager.handleRootSignal({
-          symbol,
-          root_tf: timeframe,
-          detected_at: Date.now(),
-          candle_open_time: closedOpenTime,
-          notifyImmediately: false,
-          notificationType: 'startup'
-        });
+      const signal = await signalManager.handleRootSignal({
+        symbol,
+        root_tf: timeframe,
+        detected_at: Date.now(),
+        candle_open_time: closedOpenTime,
+        notifyImmediately: false,
+        notificationType: 'startup'
+      });
 
       if (signal) {
         results.push(signal);
@@ -994,11 +881,8 @@ module.exports = {
     return results;
   },
 
-  getNextFiveMinuteBoundaryMs(
-    nowMs = Date.now()
-  ) {
-    const remainder =
-      nowMs % FIVE_MINUTES_MS;
+  getNextFiveMinuteBoundaryMs(nowMs = Date.now()) {
+    const remainder = nowMs % FIVE_MINUTES_MS;
 
     return nowMs + (
       remainder === 0
@@ -1008,13 +892,15 @@ module.exports = {
   },
 
   startBoundaryScanLoop() {
+    if (boundaryScanInProgress) {
+      return;
+    }
+
     setImmediate(() => {
       this.runBoundaryScanLoop()
         .catch((err) => {
           logger.error(
-            {
-              err
-            },
+            { err },
             'poller: boundary loop crashed'
           );
         });
@@ -1023,19 +909,19 @@ module.exports = {
 
   async runBoundaryScanLoop() {
     while (isRunning) {
-      const nextBoundary =
-        this.getNextFiveMinuteBoundaryMs();
+      if (!startupComplete) {
+        logger.debug('poller.loop2: startup not complete; waiting');
+        await sleep(5000);
+        continue;
+      }
 
-      const delay = Math.max(
-        0,
-        nextBoundary - Date.now()
-      );
+      const nextBoundary = this.getNextFiveMinuteBoundaryMs();
+
+      const delay = Math.max(0, nextBoundary - Date.now());
 
       logger.debug(
         {
-          nextBoundary: new Date(
-            nextBoundary
-          ).toISOString(),
+          nextBoundary: new Date(nextBoundary).toISOString(),
           delayMs: delay
         },
         'poller.loop2: waiting for boundary'
@@ -1048,10 +934,7 @@ module.exports = {
       }
 
       if (boundaryScanInProgress) {
-        logger.warn(
-          'poller.loop2: previous scan still running'
-        );
-
+        logger.warn('poller.loop2: previous scan still running');
         continue;
       }
 
@@ -1061,9 +944,7 @@ module.exports = {
         await this.runBoundaryScanOnce();
       } catch (err) {
         logger.error(
-          {
-            err
-          },
+          { err },
           'poller.loop2: boundary scan failed'
         );
       } finally {
@@ -1098,48 +979,23 @@ module.exports = {
       'poller.loop2: boundary scan started'
     );
 
-    /*
-     * Important:
-     * This method does not call REST and does not call WS.
-     * It only reads the latest stored candle.
-     */
     for (const row of rows) {
       const symbol = row.symbol;
 
       for (const timeframe of rootTfs) {
-        const latestOpen = getLatestOpenTime(
-          db,
-          symbol,
-          timeframe
-        );
+        const latestOpen = getLatestOpenTime(db, symbol, timeframe);
 
         if (latestOpen === null) {
           continue;
         }
 
-        const stateKey =
-          this.getLoop2ProcessedCandleKey(
-            symbol,
-            timeframe
-          );
+        const stateKey = getRootSignalStateKey(symbol, timeframe);
+        const processedOpen = Number(dbModule.getState(stateKey) || 0);
 
-        const processedOpen = Number(
-          dbModule.getState(stateKey) || 0
-        );
-
-        /*
-         * Process only symbols/timeframes with a newer
-         * stored candle.
-         */
         if (latestOpen <= processedOpen) {
           continue;
         }
 
-        /*
-         * The latest candle is the newly opened candle.
-         * The previous candle is the one that just closed and
-         * is the candle used for the MACD flip decision.
-         */
         const previousRow = db
           .prepare(
             `
@@ -1155,29 +1011,20 @@ module.exports = {
           .get(symbol, timeframe, latestOpen);
 
         if (!previousRow) {
-          dbModule.setState(
-            stateKey,
-            latestOpen
-          );
-
+          dbModule.setState(stateKey, latestOpen);
           continue;
         }
 
-        const closedOpenTime =
-          Number(previousRow.open_time);
+        const closedOpenTime = Number(previousRow.open_time);
 
         const flip =
-          typeof macdUtil.isMacdFlipAtClosedCandle ===
-          'function'
+          typeof macdUtil.isMacdFlipAtClosedCandle === 'function'
             ? await macdUtil.isMacdFlipAtClosedCandle(
                 symbol,
                 timeframe,
                 closedOpenTime
               )
-            : await macdUtil.isMacdFlip(
-                symbol,
-                timeframe
-              );
+            : await macdUtil.isMacdFlip(symbol, timeframe);
 
         logger.info(
           {
@@ -1192,40 +1039,28 @@ module.exports = {
         );
 
         if (flip) {
-          const signal =
-            await signalManager.handleRootSignal({
-              symbol,
-              root_tf: timeframe,
-              detected_at: Date.now(),
-              candle_open_time: closedOpenTime,
-              notifyImmediately: false,
-              notificationType: 'new_root_candle'
-            });
+          const signal = await signalManager.handleRootSignal({
+            symbol,
+            root_tf: timeframe,
+            detected_at: Date.now(),
+            candle_open_time: closedOpenTime,
+            notifyImmediately: true,
+            notificationType: 'new_root_candle',
+            skipTradeOpen: false
+          });
 
           if (signal) {
-            signal.notificationType =
-              'new_root_candle';
-
+            signal.notificationType = 'new_root_candle';
             newSignals.push(signal);
           }
         }
 
-        /*
-         * Mark the new candle processed after its previous
-         * candle has been evaluated.
-         */
-        dbModule.setState(
-          stateKey,
-          latestOpen
-        );
+        dbModule.setState(stateKey, latestOpen);
       }
     }
 
     if (newSignals.length > 0) {
-      notificationQueue.enqueueRootCandleBatch(
-        newSignals
-      );
-
+      notificationQueue.enqueueRootCandleBatch(newSignals);
       logger.info(
         {
           count: newSignals.length
@@ -1233,9 +1068,7 @@ module.exports = {
         'poller.loop2: root candle batch enqueued'
       );
     } else {
-      logger.info(
-        'poller.loop2: no new root flips found'
-      );
+      logger.info('poller.loop2: no new root flips found');
     }
 
     logger.info(
@@ -1247,14 +1080,186 @@ module.exports = {
     );
   },
 
-  getLoop2ProcessedCandleKey(
-    symbol,
-    timeframe
-  ) {
-    return [
-      'poller.loop2.lastRootOpen',
-      symbol,
-      normalizeTimeframe(timeframe)
-    ].join('.');
+  startMidCandleLoop() {
+    if (midCandleLoopTimer) {
+      return;
+    }
+
+    const run = async () => {
+      if (!isRunning || !startupComplete) {
+        return;
+      }
+
+      try {
+        await this.scanMidCandleSignals();
+      } catch (err) {
+        logger.error(
+          { err },
+          'poller.midcandle: loop failed'
+        );
+      }
+
+      if (isRunning && startupComplete) {
+        midCandleLoopTimer = setTimeout(run, 60 * 1000);
+      } else {
+        midCandleLoopTimer = null;
+      }
+    };
+
+    void run();
+  },
+
+  async scanMidCandleSignals() {
+    const db = dbModule.get();
+    const symbols = getSymbolsFromDb();
+
+    for (const symbol of symbols) {
+      for (const timeframe of buildRootTfs()) {
+        const latestOpen = getLatestOpenTime(db, symbol, timeframe);
+
+        if (latestOpen === null) {
+          continue;
+        }
+
+        const stateKey = getMidcandleKey(symbol, timeframe);
+        const seenOpen = Number(dbModule.getState(stateKey) || 0);
+
+        if (latestOpen <= seenOpen) {
+          continue;
+        }
+
+        const previousRow = db
+          .prepare(
+            `
+              SELECT open_time
+              FROM klines
+              WHERE symbol = ?
+                AND timeframe = ?
+                AND open_time < ?
+              ORDER BY open_time DESC
+              LIMIT 1
+            `
+          )
+          .get(symbol, timeframe, latestOpen);
+
+        if (!previousRow) {
+          dbModule.setState(stateKey, latestOpen);
+          continue;
+        }
+
+        const closedOpenTime = Number(previousRow.open_time);
+
+        const flip =
+          typeof macdUtil.isMacdFlipAtClosedCandle === 'function'
+            ? await macdUtil.isMacdFlipAtClosedCandle(
+                symbol,
+                timeframe,
+                closedOpenTime
+              )
+            : await macdUtil.isMacdFlip(symbol, timeframe);
+
+        if (flip) {
+          await signalManager.handleRootSignal({
+            symbol,
+            root_tf: timeframe,
+            detected_at: Date.now(),
+            candle_open_time: closedOpenTime,
+            notifyImmediately: true,
+            notificationType: 'midcandle_update',
+            skipTradeOpen: true
+          });
+        }
+
+        dbModule.setState(stateKey, latestOpen);
+      }
+    }
+  },
+
+  startMtfAlignmentLoop() {
+    if (mtfLoopTimer) {
+      return;
+    }
+
+    const run = async () => {
+      if (!isRunning || !startupComplete) {
+        return;
+      }
+
+      try {
+        await this.scanMtfAlignmentAlerts();
+      } catch (err) {
+        logger.error(
+          { err },
+          'poller.mtf: loop failed'
+        );
+      }
+
+      if (isRunning && startupComplete) {
+        mtfLoopTimer = setTimeout(run, 75 * 1000);
+      } else {
+        mtfLoopTimer = null;
+      }
+    };
+
+    void run();
+  },
+
+  async scanMtfAlignmentAlerts() {
+    const symbols = getSymbolsFromDb();
+
+    for (const symbol of symbols) {
+      try {
+        const alignment = await signalManager.evaluateMtfAlignment(symbol);
+        const stateKey = `poller.mtf.lastAlignment.${symbol}`;
+
+        const oldState = dbModule.getState(stateKey);
+        const currentState = JSON.stringify(alignment);
+
+        if (oldState === currentState) {
+          continue;
+        }
+
+        dbModule.setState(stateKey, alignment);
+
+        const signal = {
+          symbol,
+          root_tf: buildRootTfs()[0] || '60',
+          detected_at: Date.now(),
+          candle_open_time: null,
+          notificationType: 'mtf_alignment',
+          meta: {
+            alignment,
+            decision: 'monitor',
+            acceptReason: 'mtf_alignment_alert',
+            mtfScore: Object.keys(alignment || {}).length
+              ? Object.values(alignment).filter((v) => v && v.positive).length /
+                Object.keys(alignment).length
+              : 0,
+            tvScore: 0,
+            tvSource: 'n/a',
+            marketData: {
+              price: 0,
+              volume_24h_usdt: 0,
+              volume_change_pct: null,
+              market_cap: null
+            }
+          }
+        };
+
+        notificationQueue.enqueueSignal(signal, 'mtf_alignment');
+      } catch (err) {
+        logger.debug(
+          {
+            err,
+            symbol
+          },
+          'poller.mtf: alignment alert failed'
+        );
+      }
+    }
+  },
+
+  getLoop2ProcessedCandleKey(symbol, timeframe) {
+    return getRootSignalStateKey(symbol, timeframe);
   }
 };
