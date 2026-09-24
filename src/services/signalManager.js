@@ -1,6 +1,8 @@
+// src/services/signalManager.js
 const dbModule = require('../db');
 const wsManager = require('./bybitWs');
 const macd = require('./macd');
+const telegram = require('./telegram');
 const tradeManager = require('./tradeManager');
 const marketData = require('./marketData');
 const tradingview = require('./tradingview');
@@ -10,27 +12,12 @@ const logger = require('pino')();
 
 let openTradesAllowed = true;
 
-function setOpenTradesAllowed(value) {
-  openTradesAllowed = !!value;
+function setOpenTradesAllowed(v) {
+  openTradesAllowed = !!v;
   logger.info({ openTradesAllowed }, 'signalManager: openTradesAllowed set');
 }
 
 const inProgress = new Map();
-
-function getProcessingKey({ symbol, root_tf, candle_open_time }) {
-  const candlePart =
-    candle_open_time !== null && candle_open_time !== undefined
-      ? String(candle_open_time)
-      : 'live';
-
-  return `${symbol}:${root_tf}:${candlePart}`;
-}
-
-function normalizeScore(value, fallback = 0) {
-  const number = Number(value);
-
-  return Number.isFinite(number) ? number : fallback;
-}
 
 module.exports = {
   start() {
@@ -39,424 +26,206 @@ module.exports = {
 
   setOpenTradesAllowed,
 
-  async handleRootSignal({
-    symbol,
-    root_tf,
-    detected_at = Date.now(),
-    candle_open_time = null,
-    notifyImmediately = true,
-    notificationType = 'signal',
-    skipTradeOpen = false
-  } = {}) {
-    if (!symbol || !root_tf) {
-      logger.warn(
-        { symbol, root_tf },
-        'handleRootSignal: missing symbol or root timeframe'
-      );
-
-      return null;
-    }
-
-    const key = getProcessingKey({ symbol, root_tf, candle_open_time });
-
+  /**
+   * handleRootSignal:
+   * - notifyImmediately: if true (default) enqueue to notification queue; if false, return signal object for caller
+   * - returns the persisted signal object
+   * - ALWAYS fetches fresh market data and TV rating for complete signal block
+   */
+  async handleRootSignal({ symbol, root_tf, detected_at = Date.now(), notifyImmediately = true } = {}) {
+    const key = `${symbol}:${root_tf}`;
     if (inProgress.has(key)) {
-      logger.debug(
-        { key, symbol, root_tf, candle_open_time },
-        'handleRootSignal: identical signal is already being processed'
-      );
-
+      logger.debug({ key }, 'handleRootSignal: already in progress');
       return null;
     }
-
     inProgress.set(key, true);
-
     try {
-      logger.info(
-        {
-          symbol,
-          root_tf,
-          candle_open_time,
-          notificationType,
-          notifyImmediately,
-          skipTradeOpen
-        },
-        'Root signal received'
-      );
+      logger.info({ symbol, root_tf }, 'Root signal received');
 
-      let marketDataResult = null;
-
+      // ALWAYS fetch fresh market data (best-effort, with fallbacks)
+      let mdata = null;
       try {
-        marketDataResult = await marketData.updateSymbolMarketData(symbol);
-
-        if (!marketDataResult) {
-          marketDataResult = {
-            price: 0,
-            volume_24h_usdt: 0,
-            volume_change_pct: null,
-            market_cap: null
-          };
+        mdata = await marketData.updateSymbolMarketData(symbol);
+        if (!mdata) {
+          mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
         }
       } catch (err) {
-        logger.warn(
-          { err, symbol },
-          'handleRootSignal: market data fetch failed; using fallback values'
-        );
-
-        marketDataResult = {
-          price: 0,
-          volume_24h_usdt: 0,
-          volume_change_pct: null,
-          market_cap: null
-        };
+        logger.warn({ err, symbol }, 'handleRootSignal: market data fetch failed, using zeros');
+        mdata = { price: 0, volume_24h_usdt: 0, volume_change_pct: null, market_cap: null };
       }
 
+      // FETCH TV RATING WITH CACHING (checks DB first, retries if needed)
       let tv = { score: 0, source: 'error' };
-
       try {
-        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating');
-
-        const tvResult = await tradingview.getOrFetchTvRatingCached(symbol);
-
-        if (tvResult && typeof tvResult.score === 'number' && Number.isFinite(tvResult.score)) {
-          tv = {
-            score: tvResult.score,
-            source: tvResult.source || 'unknown'
-          };
-
-          logger.info(
-            { symbol, score: tv.score, source: tv.source },
-            'TV rating acquired'
-          );
+        logger.debug({ symbol }, 'handleRootSignal: fetching TV rating (cached or fresh)');
+        const tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
+        if (tvRes && typeof tvRes.score === 'number') {
+          tv = { score: tvRes.score, source: tvRes.source || 'unknown' };
+          logger.info({ symbol, score: tv.score, source: tv.source }, 'TV rating acquired');
         } else {
-          logger.warn(
-            { symbol, tvResult },
-            'TV rating fetch returned invalid result; using zero'
-          );
+          logger.warn({ symbol }, 'TV rating fetch returned invalid result, using zero');
+          tv = { score: 0, source: 'error' };
         }
       } catch (err) {
-        logger.warn(
-          {
-            err: err && err.message ? err.message : err,
-            symbol
-          },
-          'handleRootSignal: TV rating fetch failed; using zero'
-        );
+        logger.warn({ err: err && err.message, symbol }, 'handleRootSignal: TV rating fetch error, using zero');
+        tv = { score: 0, source: 'error' };
       }
 
-      try {
-        if (wsManager && typeof wsManager.subscribeSymbolMTF === 'function') {
-          wsManager.subscribeSymbolMTF(
-            symbol,
-            Array.isArray(config.MTF_TFS) ? config.MTF_TFS : []
-          );
-        }
-      } catch (err) {
-        logger.debug(
-          { err, symbol },
-          'handleRootSignal: failed to subscribe symbol MTF data'
-        );
-      }
+      // Subscribe to MTF websockets (for alignment updates)
+      try { wsManager.subscribeSymbolMTF(symbol, config.MTF_TFS); } catch (e) { /* ignore */ }
 
+      // Evaluate MTF alignment
       const alignment = await this.evaluateMtfAlignment(symbol);
-      const alignmentTimeframes = Object.keys(alignment || {});
+      const mtfTfs = Object.keys(alignment || {});
+      const positiveCount = mtfTfs.reduce((acc, t) => acc + (alignment[t] && alignment[t].positive ? 1 : 0), 0);
+      const mtfScore = mtfTfs.length ? (positiveCount / mtfTfs.length) : 0;
 
-      const positiveCount = alignmentTimeframes.reduce((count, timeframe) => {
-        return count + (
-          alignment[timeframe] && alignment[timeframe].positive
-            ? 1
-            : 0
-        );
-      }, 0);
+      // Apply decision rules
+      const accept = await this.applyDecision(alignment);
 
-      const mtfScore =
-        alignmentTimeframes.length > 0
-          ? positiveCount / alignmentTimeframes.length
-          : 0;
-
-      const decision = await this.applyDecision(alignment);
-
+      // Compose meta and persist signal to DB
       const meta = {
-        tvScore: normalizeScore(tv.score),
+        tvScore: tv.score || 0,
         tvSource: tv.source || 'error',
         mtfScore,
         alignment,
-        acceptReason: decision?.reason || null,
-        decision: decision?.decision || 'monitor',
-        marketData: marketDataResult || {}
+        acceptReason: accept && accept.reason ? accept.reason : null,
+        decision: accept && accept.decision ? accept.decision : 'monitor',
+        marketData: mdata || {}
       };
 
-      dbModule.insertSignal({
-        symbol,
-        root_tf,
-        detected_at,
-        state: 'detected',
-        meta
-      });
+      dbModule.insertSignal({ symbol, root_tf, detected_at, state: 'detected', meta });
 
       const signalObj = {
         key,
         symbol,
         root_tf,
-        candle_open_time,
         detected_at,
         state: 'detected',
-        meta,
-        notificationType
+        meta
       };
 
+      // ENQUEUE TO NOTIFICATION QUEUE instead of sending telegram directly
       if (notifyImmediately) {
-        logger.debug(
-          { symbol, root_tf, candle_open_time, notificationType },
-          'handleRootSignal: enqueueing signal'
-        );
-
-        const queueType =
-          notificationType === 'midcandle_update'
-            ? 'midcandle_update'
-            : notificationType === 'mtf_alignment'
-              ? 'mtf_alignment'
-              : 'realtime';
-
-        notificationQueue.enqueueSignal(signalObj, queueType);
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: enqueuing realtime signal to notification queue');
+        notificationQueue.enqueueSignal(signalObj, 'realtime');
       } else {
-        logger.debug(
-          { symbol, root_tf, candle_open_time, notificationType },
-          'handleRootSignal: returning signal for batch notification'
-        );
+        logger.debug({ symbol, root_tf }, 'handleRootSignal: notifyImmediately=false, returning signal object');
+        return signalObj;
       }
 
-      if (
-        !skipTradeOpen &&
-        decision &&
-        decision.decision === 'accept'
-      ) {
+      // Only when decision is 'accept' do we attempt to open a trade
+      if (accept && accept.decision === 'accept') {
         if (!config.OPENTRADE) {
-          logger.info(
-            { symbol },
-            'Accepted signal but OPENTRADE is disabled'
-          );
+          logger.info({ symbol }, 'Accept but OPENTRADE disabled; skipping openTrade');
         } else if (!openTradesAllowed) {
-          logger.info(
-            { symbol },
-            'Accepted signal but opening trades is currently disabled'
-          );
+          logger.info({ symbol }, 'Accept but open trades not yet enabled (waiting for first boundary)');
         } else {
-          let passesMarketFilters = true;
-
-          const minMarketCap = Number(config.MIN_MARKET_CAP) || 0;
-
-          if (minMarketCap > 0) {
-            const marketCap = Number(marketDataResult?.market_cap);
-
-            if (!Number.isFinite(marketCap) || marketCap < minMarketCap) {
-              passesMarketFilters = false;
-
-              logger.info(
-                {
-                  symbol,
-                  market_cap: marketDataResult?.market_cap,
-                  minimum: minMarketCap
-                },
-                'Signal filtered by MIN_MARKET_CAP for trade opening'
-              );
+          // Apply market-level filters
+          let passFilters = true;
+          if (config.MIN_MARKET_CAP > 0) {
+            if (!mdata || !mdata.market_cap || Number(mdata.market_cap) < config.MIN_MARKET_CAP) {
+              passFilters = false;
+              logger.info({ symbol, market_cap: mdata?.market_cap }, 'Filtered out by MIN_MARKET_CAP (for opening only)');
             }
           }
-
-          const minVolume = Number(config.MIN_24H_USDT_VOLUME) || 0;
-
-          if (minVolume > 0) {
-            const volume = Number(marketDataResult?.volume_24h_usdt);
-
-            if (!Number.isFinite(volume) || volume < minVolume) {
-              passesMarketFilters = false;
-
-              logger.info(
-                {
-                  symbol,
-                  volume_24h_usdt: marketDataResult?.volume_24h_usdt,
-                  minimum: minVolume
-                },
-                'Signal filtered by MIN_24H_USDT_VOLUME for trade opening'
-              );
+          if (config.MIN_24H_USDT_VOLUME > 0) {
+            if (!mdata || !mdata.volume_24h_usdt || Number(mdata.volume_24h_usdt) < config.MIN_24H_USDT_VOLUME) {
+              passFilters = false;
+              logger.info({ symbol, volume_24h_usdt: mdata?.volume_24h_usdt }, 'Filtered out by MIN_24H_USDT_VOLUME (for opening only)');
             }
           }
-
-          const minVolumeChange = Number(config.MIN_24H_VOLUME_CHANGE_PCT);
-
-          if (Number.isFinite(minVolumeChange)) {
-            const volumeChange = marketDataResult?.volume_change_pct;
-
-            if (
-              volumeChange === null ||
-              volumeChange === undefined
-            ) {
-              if (minVolumeChange > 0) {
-                passesMarketFilters = false;
-                logger.info(
-                  { symbol },
-                  'Signal filtered because volume change is unavailable'
-                );
+          if (isFinite(config.MIN_24H_VOLUME_CHANGE_PCT)) {
+            const change = mdata?.volume_change_pct;
+            if (change === null || change === undefined) {
+              if (config.MIN_24H_VOLUME_CHANGE_PCT > 0) {
+                passFilters = false;
+                logger.info({ symbol }, 'No previous volume to compute change; filtered by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
               }
-            } else if (Number(volumeChange) < minVolumeChange) {
-              passesMarketFilters = false;
-
-              logger.info(
-                {
-                  symbol,
-                  volume_change_pct: volumeChange,
-                  minimum: minVolumeChange
-                },
-                'Signal filtered by MIN_24H_VOLUME_CHANGE_PCT for trade opening'
-              );
+            } else {
+              if (change < config.MIN_24H_VOLUME_CHANGE_PCT) {
+                passFilters = false;
+                logger.info({ symbol, volume_change_pct: change }, 'Filtered out by MIN_24H_VOLUME_CHANGE_PCT (for opening only)');
+              }
             }
           }
 
-          if (passesMarketFilters) {
+          if (passFilters) {
             try {
-              await tradeManager.openTrade({
-                symbol,
-                root_tf,
-                alignment,
-                meta
-              });
-
-              logger.info(
-                {
-                  symbol,
-                  root_tf,
-                  candle_open_time
-                },
-                'handleRootSignal: trade opening initiated'
-              );
+              await tradeManager.openTrade({ symbol, root_tf, alignment, meta });
+              logger.info({ symbol }, 'handleRootSignal: trade opening initiated');
             } catch (err) {
-              logger.error(
-                {
-                  err,
-                  symbol,
-                  root_tf
-                },
-                'handleRootSignal: trade opening failed'
-              );
+              logger.error({ err, symbol }, 'handleRootSignal: openTrade error');
             }
           } else {
-            logger.info(
-              { symbol },
-              'Accepted signal but market filters prevented trade opening'
-            );
+            logger.info({ symbol }, 'Decision accepted but market filters prevented opening a trade');
           }
         }
       }
 
       return signalObj;
     } catch (err) {
-      logger.error(
-        {
-          err,
-          symbol,
-          root_tf,
-          candle_open_time
-        },
-        'handleRootSignal: unexpected error'
-      );
-
+      logger.error({ err, symbol, root_tf }, 'handleRootSignal error');
       return null;
     } finally {
-      inProgress.delete(key);
+      setTimeout(() => inProgress.delete(key), 60 * 60 * 1000);
     }
   },
 
+  /**
+   * evaluateMtfAlignment: Returns detailed alignment object with histogram, MACD, signal, rising, positive
+   */
   async evaluateMtfAlignment(symbol) {
     const result = {};
-    const timeframes = Array.isArray(config.MTF_TFS) ? config.MTF_TFS : [];
-
-    for (const timeframe of timeframes) {
-      const tf = String(timeframe);
-
+    for (const tf of config.MTF_TFS) {
       try {
-        const histogram = await macd.computeMacdHistogram(symbol, tf);
-
-        if (!Array.isArray(histogram) || histogram.length === 0) {
+        const hist = await macd.computeMacdHistogram(symbol, tf);
+        if (!hist || hist.length === 0) {
           result[tf] = { ok: false, positive: false };
           continue;
         }
-
-        const last = histogram[histogram.length - 1];
-        const previous = histogram[histogram.length - 2] || last;
-
-        const lastHistogram = Number(last?.histogram);
-        const previousHistogram = Number(previous?.histogram);
-
-        const validLastHistogram = Number.isFinite(lastHistogram);
-        const validPreviousHistogram = Number.isFinite(previousHistogram);
-
+        const last = hist[hist.length - 1];
+        const prev = hist[hist.length - 2] || last;
         result[tf] = {
-          histogram: validLastHistogram ? lastHistogram : null,
-          macd: last?.MACD ?? null,
-          signal: last?.signal ?? null,
-          rising:
-            validLastHistogram && validPreviousHistogram
-              ? lastHistogram > previousHistogram
-              : false,
-          positive: validLastHistogram ? lastHistogram > 0 : false,
-          ok: validLastHistogram
+          histogram: last.histogram,
+          macd: last.MACD,
+          signal: last.signal,
+          rising: last.histogram > prev.histogram,
+          positive: last.histogram > 0,
+          ok: true
         };
       } catch (err) {
-        logger.debug(
-          {
-            err,
-            symbol,
-            tf
-          },
-          'evaluateMtfAlignment: timeframe evaluation failed'
-        );
-
-        result[tf] = {
-          ok: false,
-          positive: false
-        };
+        logger.debug({ err, symbol, tf }, 'evaluateMtfAlignment error for timeframe');
+        result[tf] = { ok: false, positive: false };
       }
     }
-
     return result;
   },
 
-  async applyDecision(alignment = {}) {
-    const timeframes =
-      alignment && typeof alignment === 'object'
-        ? Object.keys(alignment)
-        : [];
-
-    if (timeframes.length === 0) {
+  /**
+   * applyDecision: Determine signal acceptance based on alignment
+   * - All positive: accept
+   * - Only daily negative and rising: accept
+   * - Some negative: monitor
+   * - Otherwise: reject
+   */
+  async applyDecision(alignment) {
+    const tfList = Object.keys(alignment);
+    if (!tfList || tfList.length === 0) {
       return { decision: 'reject', reason: 'no_mtf_data' };
     }
 
-    const allPositive = timeframes.every((timeframe) => {
-      return alignment[timeframe] && alignment[timeframe].positive;
-    });
+    let allPositive = tfList.every(tf => alignment[tf] && alignment[tf].positive);
+    if (allPositive) return { decision: 'accept', reason: 'all_positive' };
 
-    if (allPositive) {
-      return { decision: 'accept', reason: 'all_positive' };
-    }
-
-    const negativeTimeframes = timeframes.filter((timeframe) => {
-      return alignment[timeframe] && !alignment[timeframe].positive;
-    });
-
-    const onlyNegativeTimeframeIsDaily =
-      negativeTimeframes.length === 1 &&
-      negativeTimeframes[0].toUpperCase() === 'D';
-
-    if (onlyNegativeTimeframeIsDaily) {
-      const daily = alignment[negativeTimeframes[0]];
-
-      if (daily && daily.rising) {
-        return { decision: 'accept', reason: 'daily_rising' };
-      }
-
+    const negatives = tfList.filter(tf => alignment[tf] && !alignment[tf].positive);
+    if (negatives.length === 1 && negatives[0].toUpperCase() === 'D') {
+      const d = alignment['D'];
+      if (d && d.rising) return { decision: 'accept', reason: 'daily_rising' };
       return { decision: 'monitor', reason: 'daily_not_rising' };
     }
 
-    if (negativeTimeframes.length >= 1) {
+    if (negatives.length >= 1) {
       return { decision: 'monitor', reason: 'some_negative' };
     }
 
