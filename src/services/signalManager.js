@@ -45,7 +45,8 @@ module.exports = {
     detected_at = Date.now(),
     candle_open_time = null,
     notifyImmediately = true,
-    notificationType = 'signal'
+    notificationType = 'signal',
+    skipTradeOpen = false
   } = {}) {
     if (!symbol || !root_tf) {
       logger.warn(
@@ -76,7 +77,8 @@ module.exports = {
           root_tf,
           candle_open_time,
           notificationType,
-          notifyImmediately
+          notifyImmediately,
+          skipTradeOpen
         },
         'Root signal received'
       );
@@ -187,7 +189,6 @@ module.exports = {
         symbol,
         root_tf,
         detected_at,
-        candle_open_time,
         state: 'detected',
         meta
       });
@@ -206,10 +207,17 @@ module.exports = {
       if (notifyImmediately) {
         logger.debug(
           { symbol, root_tf, candle_open_time, notificationType },
-          'handleRootSignal: enqueueing realtime signal'
+          'handleRootSignal: enqueueing signal'
         );
 
-        notificationQueue.enqueueSignal(signalObj, 'realtime');
+        notificationQueue.enqueueSignal(
+          signalObj,
+          notificationType === 'midcandle_update'
+            ? 'midcandle_update'
+            : notificationType === 'mtf_alignment'
+              ? 'mtf_alignment'
+              : 'realtime'
+        );
       } else {
         logger.debug(
           { symbol, root_tf, candle_open_time, notificationType },
@@ -217,7 +225,11 @@ module.exports = {
         );
       }
 
-      if (decision && decision.decision === 'accept') {
+      if (
+        !skipTradeOpen &&
+        decision &&
+        decision.decision === 'accept'
+      ) {
         if (!config.OPENTRADE) {
           logger.info(
             { symbol },
