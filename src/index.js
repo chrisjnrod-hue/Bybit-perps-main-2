@@ -45,9 +45,11 @@ async function runStartup() {
   logger.info('Startup: initializing database');
   db.init();
 
+  // Initialize Telegram before any notification can be queued.
   logger.info('Startup: initializing Telegram');
   telegram.init();
 
+  // This probe is intentionally non-blocking.
   try {
     const bybitRest = require('./services/bybitRest');
 
@@ -78,9 +80,18 @@ async function runStartup() {
     );
   }
 
+  /*
+   * Discover symbols only. Do not start background seeding here because
+   * startup must complete its controlled seed before the startup flip pass.
+   */
   try {
-    logger.info('Startup: discovering symbols');
-    await poller.initialScan({ seed: false });
+    logger.info(
+      'Startup: discovering symbols'
+    );
+
+    await poller.initialScan({
+      seed: false
+    });
   } catch (err) {
     logger.warn(
       { err },
@@ -88,6 +99,11 @@ async function runStartup() {
     );
   }
 
+  /*
+   * Seed the configured startup subset synchronously. This prevents
+   * scanAllForStartup() from racing with the background seed started by
+   * initialScan().
+   */
   try {
     const startupSeedCount = Number(
       process.env.STARTUP_SEED_SYMBOLS ||
@@ -125,7 +141,9 @@ async function runStartup() {
 
       await poller.backgroundSeedKlines(seedList);
     } else {
-      logger.info('Startup: no symbols available for targeted seeding');
+      logger.info(
+        'Startup: no symbols available for targeted seeding'
+      );
     }
   } catch (err) {
     logger.warn(
@@ -134,10 +152,23 @@ async function runStartup() {
     );
   }
 
+  /*
+   * This is the only startup signal scan.
+   *
+   * scanAllForStartup() enqueues the startup batch. The notification queue
+   * owns delivery of the startup summary. Do not call
+   * signalManager.sendStartupSummary() here as well.
+   */
   try {
-    logger.info('Startup: running full startup flip pass');
+    logger.info(
+      'Startup: running full startup flip pass'
+    );
+
     await poller.scanAllForStartup();
-    logger.info('Startup: full startup flip pass completed');
+
+    logger.info(
+      'Startup: full startup flip pass completed'
+    );
   } catch (err) {
     logger.warn(
       { err },
@@ -145,10 +176,10 @@ async function runStartup() {
     );
   }
 
+  /*
+   * Start recurring services only after the startup scan has completed.
+   */
   poller.start();
-  poller.startBoundaryScanLoop();
-  poller.startMtfAlignmentLoop();
-
   wsManager.start();
   signalManager.start();
   tradeManager.registerWs(wsManager);
