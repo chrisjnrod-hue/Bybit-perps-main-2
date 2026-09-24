@@ -147,7 +147,6 @@ async function runStartup() {
 
   poller.start();
   poller.startBoundaryScanLoop();
-  poller.startMidCandleLoop();
   poller.startMtfAlignmentLoop();
 
   wsManager.start();
