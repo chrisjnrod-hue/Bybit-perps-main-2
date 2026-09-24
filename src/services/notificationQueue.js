@@ -28,13 +28,17 @@ function getSignalId(signal) {
     return null;
   }
 
+  const notificationType = getNotificationType(signal);
+
   const candleValue =
-    signal.candle_open_time !== undefined && signal.candle_open_time !== null
+    signal.candle_open_time !== undefined &&
+    signal.candle_open_time !== null
       ? Number(signal.candle_open_time)
       : null;
 
   if (Number.isFinite(candleValue)) {
     return [
+      notificationType,
       signal.symbol,
       signal.root_tf,
       candleValue
@@ -42,9 +46,11 @@ function getSignalId(signal) {
   }
 
   return [
+    notificationType,
     signal.symbol,
     signal.root_tf,
-    signal.detected_at !== undefined && signal.detected_at !== null
+    signal.detected_at !== undefined &&
+    signal.detected_at !== null
       ? Number(signal.detected_at)
       : Date.now()
   ].join('_');
