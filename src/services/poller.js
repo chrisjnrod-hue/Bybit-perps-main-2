@@ -22,6 +22,10 @@ let startupComplete = false;
 let boundaryScanInProgress = false;
 let startupScanInProgress = false;
 
+logger.info(
+  'poller diagnostic version: 2026-09-24-v2'
+);
+
 function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms || 0);
@@ -138,16 +142,27 @@ function buildStableMtfEventId(symbol, alignment) {
     .sort()
     .map((tf) => {
       const row = normalized[tf];
+
       return [
         tf,
-        row && typeof row.histogram !== 'undefined' ? String(Number(row.histogram)) : 'null',
-        row && row.positive !== undefined ? String(Boolean(row.positive)) : 'null',
-        row && row.rising !== undefined ? String(Boolean(row.rising)) : 'null'
+        row && typeof row.histogram !== 'undefined'
+          ? String(Number(row.histogram))
+          : 'null',
+        row && row.positive !== undefined
+          ? String(Boolean(row.positive))
+          : 'null',
+        row && row.rising !== undefined
+          ? String(Boolean(row.rising))
+          : 'null'
       ].join(':');
     })
     .join('|');
 
-  return `mtf_alignment:${String(symbol).toUpperCase()}:${signature}`;
+  return [
+    'mtf_alignment',
+    String(symbol).toUpperCase(),
+    signature
+  ].join(':');
 }
 
 function isActiveOrMonitoredSignal(signal) {
@@ -238,6 +253,7 @@ module.exports = {
 
     try {
       signalManager.setOpenTradesAllowed(true);
+
       logger.info(
         'poller.start: open trades enabled'
       );
@@ -824,6 +840,7 @@ module.exports = {
       );
 
       startupComplete = false;
+
       return [];
     } finally {
       startupScanInProgress = false;
@@ -942,6 +959,18 @@ module.exports = {
             tf
           );
 
+        logger.info(
+          {
+            symbol,
+            tf,
+            candleOpenTime: Number(
+              rows[0].open_time
+            ),
+            flip
+          },
+          'poller.startup: MACD flip result'
+        );
+
         if (!flip) {
           continue;
         }
@@ -958,6 +987,17 @@ module.exports = {
             notificationType: 'startup',
             skipTradeOpen: false
           });
+
+        logger.info(
+          {
+            symbol,
+            tf,
+            signalCreated: Boolean(signal),
+            signalState: signal?.state || null,
+            signalDecision: signal?.meta?.decision || null
+          },
+          'poller.startup: root signal result'
+        );
 
         if (signal) {
           results.push(signal);
@@ -1088,6 +1128,7 @@ module.exports = {
     const rootTfs = buildRootTfs();
     const rootSignals = [];
     const alignmentAlerts = [];
+    const pendingRootStates = [];
 
     logger.info(
       {
@@ -1143,6 +1184,14 @@ module.exports = {
     const monitoredSymbols =
       getActiveMonitoredSymbols();
 
+    logger.info(
+      {
+        count: monitoredSymbols.length,
+        symbols: monitoredSymbols.slice(0, 20)
+      },
+      'poller.loop2: monitored symbols diagnostic'
+    );
+
     for (const symbol of monitoredSymbols) {
       try {
         const alignment =
@@ -1159,16 +1208,36 @@ module.exports = {
         const previousState =
           dbModule.getState(stateKey);
 
+        logger.info(
+          {
+            symbol,
+            hasPreviousState: previousState !== null &&
+              previousState !== undefined,
+            currentState,
+            previousState
+          },
+          'poller.loop2: MTF state diagnostic'
+        );
+
         /*
          * Do not emit MTF alerts on unchanged state.
-         * This is the exact correctness fix that prevents repeated
-         * duplicate MTF notifications.
          */
         if (previousState === currentState) {
+          logger.debug(
+            {
+              symbol
+            },
+            'poller.loop2: MTF state unchanged'
+          );
+
           continue;
         }
 
-        const eventId = buildStableMtfEventId(symbol, alignment);
+        const eventId =
+          buildStableMtfEventId(
+            symbol,
+            alignment
+          );
 
         const alert = {
           symbol,
@@ -1208,19 +1277,15 @@ module.exports = {
           }
         };
 
-        const queued = notificationQueue.enqueueSignal(
-          alert,
-          'mtf_alignment'
-        );
-
-        if (queued) {
-          dbModule.setState(
-            stateKey,
-            currentState
-          );
-        }
-
         alignmentAlerts.push(alert);
+
+        logger.info(
+          {
+            symbol,
+            eventId
+          },
+          'poller.loop2: MTF alert prepared'
+        );
       } catch (err) {
         logger.debug(
           {
@@ -1250,6 +1315,14 @@ module.exports = {
             );
 
           if (latestOpen === null) {
+            logger.warn(
+              {
+                symbol,
+                tf
+              },
+              'poller.loop2: no latest candle found'
+            );
+
             continue;
           }
 
@@ -1273,6 +1346,16 @@ module.exports = {
           );
 
           if (latestOpen <= processedOpen) {
+            logger.debug(
+              {
+                symbol,
+                tf,
+                latestOpen,
+                processedOpen
+              },
+              'poller.loop2: candle already processed'
+            );
+
             continue;
           }
 
@@ -1295,6 +1378,15 @@ module.exports = {
             );
 
           if (!previousRow) {
+            logger.warn(
+              {
+                symbol,
+                tf,
+                latestOpen
+              },
+              'poller.loop2: previous candle not found'
+            );
+
             dbModule.setState(
               stateKey,
               latestOpen
@@ -1368,22 +1460,59 @@ module.exports = {
             );
 
             if (signal) {
-              signal.eventId = `root_candle:${String(symbol).toUpperCase()}:${tf}:${closedOpenTime}`;
-              rootSignals.push(signal);
-            }
-          }
+              signal.eventId = [
+                'root_candle',
+                String(symbol).toUpperCase(),
+                tf,
+                closedOpenTime
+              ].join(':');
 
-          /*
-           * Do not move the root state forward if a signal was created
-           * but the queued batch never got accepted by notificationQueue.
-           * This keeps the system safe under queue or dispatch failures.
-           */
-          dbModule.setState(
-            stateKey,
-            latestOpen
-          );
+              rootSignals.push(signal);
+
+              pendingRootStates.push({
+                stateKey,
+                latestOpen
+              });
+
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  stateKey,
+                  latestOpen
+                },
+                'poller.loop2: root state update deferred until queue succeeds'
+              );
+            } else {
+              /*
+               * No signal was created, so there is nothing to retry.
+               * Mark this candle as processed.
+               */
+              dbModule.setState(
+                stateKey,
+                latestOpen
+              );
+
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  latestOpen
+                },
+                'poller.loop2: root candle marked processed without signal'
+              );
+            }
+          } else {
+            /*
+             * No flip was detected, so mark this candle as processed.
+             */
+            dbModule.setState(
+              stateKey,
+              latestOpen
+            );
+          }
         } catch (err) {
-          logger.debug(
+          logger.error(
             {
               err,
               symbol,
@@ -1397,12 +1526,25 @@ module.exports = {
 
     /*
      * New-root notifications are sent as one summary batch.
-     * They are not sent immediately as individual realtime messages.
+     * Root state is advanced only after the batch is accepted.
      */
     if (rootSignals.length > 0) {
-      const queued = notificationQueue.enqueueRootCandleBatch(
-        rootSignals
-      );
+      let queued = false;
+
+      try {
+        queued =
+          notificationQueue.enqueueRootCandleBatch(
+            rootSignals
+          );
+      } catch (err) {
+        logger.error(
+          {
+            err,
+            count: rootSignals.length
+          },
+          'poller.loop2: root candle batch enqueue failed'
+        );
+      }
 
       logger.info(
         {
@@ -1411,6 +1553,29 @@ module.exports = {
         },
         'poller.loop2: root candle batch enqueued'
       );
+
+      if (queued) {
+        for (const pendingState of pendingRootStates) {
+          dbModule.setState(
+            pendingState.stateKey,
+            pendingState.latestOpen
+          );
+        }
+
+        logger.info(
+          {
+            count: pendingRootStates.length
+          },
+          'poller.loop2: deferred root states committed'
+        );
+      } else {
+        logger.warn(
+          {
+            count: pendingRootStates.length
+          },
+          'poller.loop2: root states not advanced because queue rejected batch'
+        );
+      }
     } else {
       logger.info(
         'poller.loop2: no new root flips found'
@@ -1419,32 +1584,45 @@ module.exports = {
 
     /*
      * MTF alignment notifications are sent as individual blocks.
+     * This is the only MTF enqueue location.
      */
     for (const alert of alignmentAlerts) {
       try {
         if (!alert.eventId) {
+          logger.warn(
+            {
+              symbol: alert.symbol
+            },
+            'poller.loop2: MTF alert has no event ID'
+          );
+
           continue;
         }
 
-        const queued = notificationQueue.enqueueSignal(
-          alert,
-          'mtf_alignment'
+        const queued =
+          notificationQueue.enqueueSignal(
+            alert,
+            'mtf_alignment'
+          );
+
+        logger.info(
+          {
+            symbol: alert.symbol,
+            root_tf: alert.root_tf,
+            eventId: alert.eventId,
+            queued
+          },
+          'poller.loop2: alignment alert enqueued'
         );
 
         if (queued) {
           dbModule.setState(
             getMtfStateKey(alert.symbol),
-            JSON.stringify(alert.meta?.alignment || {})
+            JSON.stringify(
+              alert.meta?.alignment || {}
+            )
           );
         }
-
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf
-          },
-          'poller.loop2: alignment alert enqueued'
-        );
       } catch (err) {
         logger.warn(
           {
