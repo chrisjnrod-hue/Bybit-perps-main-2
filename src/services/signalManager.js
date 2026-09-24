@@ -210,14 +210,14 @@ module.exports = {
           'handleRootSignal: enqueueing signal'
         );
 
-        notificationQueue.enqueueSignal(
-          signalObj,
+        const queueType =
           notificationType === 'midcandle_update'
             ? 'midcandle_update'
             : notificationType === 'mtf_alignment'
               ? 'mtf_alignment'
-              : 'realtime'
-        );
+              : 'realtime';
+
+        notificationQueue.enqueueSignal(signalObj, queueType);
       } else {
         logger.debug(
           { symbol, root_tf, candle_open_time, notificationType },
