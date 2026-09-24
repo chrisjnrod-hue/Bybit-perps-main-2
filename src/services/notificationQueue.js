@@ -24,7 +24,19 @@ function getNotificationType(signal) {
 }
 
 function getSignalId(signal) {
-  if (!signal || !signal.symbol || !signal.root_tf) {
+  if (!signal) {
+    return null;
+  }
+
+  if (
+    signal.eventId !== undefined &&
+    signal.eventId !== null &&
+    String(signal.eventId).trim()
+  ) {
+    return String(signal.eventId).trim();
+  }
+
+  if (!signal.symbol || !signal.root_tf) {
     return null;
   }
 
@@ -115,6 +127,13 @@ class NotificationQueue {
       getNotificationType(signal);
 
     nextSignal.notificationType = resolvedType;
+
+    if (
+      signal.eventId !== undefined &&
+      signal.eventId !== null
+    ) {
+      nextSignal.eventId = String(signal.eventId);
+    }
 
     return nextSignal;
   }
@@ -459,6 +478,7 @@ class NotificationQueue {
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
+        eventId: signal.eventId,
         notificationType: signal.notificationType
       },
       'NotificationQueue: sending MTF alignment alert'
@@ -470,6 +490,7 @@ class NotificationQueue {
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
+        eventId: signal.eventId,
         notificationType: signal.notificationType
       },
       'NotificationQueue: MTF alignment alert sent'
