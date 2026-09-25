@@ -23,7 +23,7 @@ let boundaryScanInProgress = false;
 let startupScanInProgress = false;
 
 logger.info(
-  'poller diagnostic version: 2026-09-24-v3'
+  'poller diagnostic version: 2026-09-24-v4'
 );
 
 function sleep(ms) {
@@ -761,20 +761,13 @@ module.exports = {
         config.PAGE_SIZE || 25
       );
 
-      // TEMP DIAGNOSTIC: limit startup scan for debugging
-      const diagnosticLimit = 5;
-      const rowsToScan = validRows.slice(
-        0,
-        diagnosticLimit
-      );
+      const rowsToScan = validRows;
 
-      logger.warn(
+      logger.info(
         {
-          totalValidSymbols: validRows.length,
-          diagnosticLimit,
-          rowsToScan: rowsToScan.length
+          totalValidSymbols: validRows.length
         },
-        'scanAllForStartup: diagnostic startup limit active'
+        'scanAllForStartup: full symbol scan enabled'
       );
 
       for (
@@ -1153,20 +1146,13 @@ module.exports = {
       'poller.loop2: exact five-minute boundary scan started'
     );
 
-    // TEMP DIAGNOSTIC LIMIT
-    const diagnosticLimit = 5;
-    const rowsToProcess = rows.slice(
-      0,
-      diagnosticLimit
-    );
+    const rowsToProcess = rows;
 
-    logger.warn(
+    logger.info(
       {
-        totalValidSymbols: rows.length,
-        diagnosticLimit,
-        rowsToProcess: rowsToProcess.length
+        totalValidSymbols: rows.length
       },
-      'poller.loop2: diagnostic symbol limit active'
+      'poller.loop2: full symbol scan enabled'
     );
 
     const refreshStartedAt = Date.now();
