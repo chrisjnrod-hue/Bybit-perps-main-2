@@ -8,15 +8,9 @@ function envBool(name, defaultValue = false) {
     return defaultValue;
   }
 
-  const value = String(process.env[name])
-    .trim()
-    .toLowerCase();
+  const value = String(process.env[name]).trim().toLowerCase();
 
-  return (
-    value === '1' ||
-    value === 'true' ||
-    value === 'yes'
-  );
+  return value === '1' || value === 'true' || value === 'yes';
 }
 
 function configBool(value, defaultValue = false) {
@@ -28,9 +22,7 @@ function configBool(value, defaultValue = false) {
     return value;
   }
 
-  const normalized = String(value)
-    .trim()
-    .toLowerCase();
+  const normalized = String(value).trim().toLowerCase();
 
   if (['1', 'true', 'yes', 'on'].includes(normalized)) {
     return true;
@@ -64,9 +56,7 @@ function normalizeTimeframe(timeframe) {
     return null;
   }
 
-  const value = String(timeframe)
-    .trim()
-    .toUpperCase();
+  const value = String(timeframe).trim().toUpperCase();
 
   if (value === '1H' || value === 'H') {
     return '60';
@@ -108,7 +98,7 @@ function validateSymbol(symbol) {
     logger.warn(
       {
         filter: config.SYMBOL_FILTER,
-        err: err.message
+        err: err && err.message ? err.message : String(err)
       },
       'bybitWs: invalid SYMBOL_FILTER regex'
     );
@@ -120,9 +110,7 @@ function validateSymbol(symbol) {
 function toNumber(value) {
   const number = Number(value);
 
-  return Number.isFinite(number)
-    ? number
-    : null;
+  return Number.isFinite(number) ? number : null;
 }
 
 function normalizeOpenTime(value) {
@@ -133,9 +121,7 @@ function normalizeOpenTime(value) {
   }
 
   // Convert seconds to milliseconds when necessary.
-  return number < 100000000000
-    ? number * 1000
-    : number;
+  return number < 100000000000 ? number * 1000 : number;
 }
 
 function normalizeKlinePayload(payload, timeframe, symbol) {
@@ -294,8 +280,6 @@ class WSManager extends EventEmitter {
       return false;
     }
 
-    // A connected socket with no received kline is not considered healthy
-    // once it has been running longer than the allowed stale period.
     if (this.lastKlineAt === 0) {
       return true;
     }
@@ -305,6 +289,31 @@ class WSManager extends EventEmitter {
 
   intervalToTopicPart(timeframe) {
     return normalizeTimeframe(timeframe);
+  }
+
+  safeSendJson(connection, payload) {
+    if (!connection || !connection.ws) {
+      return false;
+    }
+
+    if (connection.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    try {
+      connection.ws.send(JSON.stringify(payload));
+      return true;
+    } catch (err) {
+      logger.debug(
+        {
+          connId: connection.id,
+          err: err && err.message ? err.message : String(err)
+        },
+        'bybitWs: safe send failed'
+      );
+
+      return false;
+    }
   }
 
   createConnection() {
@@ -323,9 +332,7 @@ class WSManager extends EventEmitter {
 
     const connection = {
       ws,
-      id: `${Date.now()}-${Math.random()
-        .toString(16)
-        .slice(2)}`,
+      id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
       symbols: new Set(),
       topics: new Set(),
       pendingTopics: new Set(),
@@ -361,7 +368,7 @@ class WSManager extends EventEmitter {
             logger.debug(
               {
                 connId: connection.id,
-                err
+                err: err && err.message ? err.message : String(err)
               },
               'bybitWs: ping failed'
             );
@@ -380,9 +387,7 @@ class WSManager extends EventEmitter {
       logger.error(
         {
           connId: connection.id,
-          err: err && err.message
-            ? err.message
-            : String(err)
+          err: err && err.message ? err.message : String(err)
         },
         'bybitWs: socket error'
       );
@@ -396,6 +401,11 @@ class WSManager extends EventEmitter {
         connection.pingTimer = null;
       }
 
+      if (connection.reconnectTimer) {
+        clearTimeout(connection.reconnectTimer);
+        connection.reconnectTimer = null;
+      }
+
       logger.warn(
         {
           connId: connection.id,
@@ -405,9 +415,11 @@ class WSManager extends EventEmitter {
         'bybitWs: connection closed'
       );
 
-      const symbolsToRecover = Array.from(
-        connection.symbols
-      );
+      const symbolsToRecover = Array.from(connection.symbols);
+
+      // Prevent stale subscriptions from being retried on a dead socket.
+      connection.pendingTopics.clear();
+      connection.topics.clear();
 
       this.connections = this.connections.filter(
         (item) => item !== connection
@@ -424,10 +436,6 @@ class WSManager extends EventEmitter {
         symbolsToRecover.length === 0
       ) {
         return;
-      }
-
-      if (connection.reconnectTimer) {
-        clearTimeout(connection.reconnectTimer);
       }
 
       connection.reconnectTimer = setTimeout(() => {
@@ -462,7 +470,7 @@ class WSManager extends EventEmitter {
     } catch (err) {
       logger.debug(
         {
-          err: err.message
+          err: err && err.message ? err.message : String(err)
         },
         'bybitWs: failed to parse message'
       );
@@ -472,16 +480,9 @@ class WSManager extends EventEmitter {
 
     if (data && data.op === 'ping') {
       try {
-        connection.ws.send(
-          JSON.stringify({
-            op: 'pong'
-          })
-        );
+        this.safeSendJson(connection, { op: 'pong' });
       } catch (err) {
-        logger.debug(
-          { err },
-          'bybitWs: failed to send pong'
-        );
+        logger.debug({ err }, 'bybitWs: failed to send pong');
       }
 
       return;
@@ -540,28 +541,17 @@ class WSManager extends EventEmitter {
       return;
     }
 
-    const timeframe = normalizeTimeframe(
-      topicParts[1]
-    );
-
-    const symbol = topicParts
-      .slice(2)
-      .join('.');
+    const timeframe = normalizeTimeframe(topicParts[1]);
+    const symbol = topicParts.slice(2).join('.');
 
     if (!validateSymbol(symbol)) {
       return;
     }
 
-    const payloads = Array.isArray(data.data)
-      ? data.data
-      : [data.data];
+    const payloads = Array.isArray(data.data) ? data.data : [data.data];
 
     for (const payload of payloads) {
-      const kline = normalizeKlinePayload(
-        payload,
-        timeframe,
-        symbol
-      );
+      const kline = normalizeKlinePayload(payload, timeframe, symbol);
 
       if (!kline) {
         continue;
@@ -573,9 +563,7 @@ class WSManager extends EventEmitter {
         this.klineBuffer.set(symbol, new Map());
       }
 
-      this.klineBuffer
-        .get(symbol)
-        .set(timeframe, kline);
+      this.klineBuffer.get(symbol).set(timeframe, kline);
 
       this.emit('kline', {
         ...kline,
@@ -594,23 +582,42 @@ class WSManager extends EventEmitter {
       return;
     }
 
+    const validTopics = topics.filter(
+      (topic) => typeof topic === 'string' && topic.trim()
+    );
+
+    if (validTopics.length === 0) {
+      return;
+    }
+
+    if (!['subscribe', 'unsubscribe'].includes(operation)) {
+      logger.warn(
+        {
+          connId: connection.id,
+          operation
+        },
+        'bybitWs: unsupported websocket op'
+      );
+      return;
+    }
+
     if (connection.ws.readyState !== WebSocket.OPEN) {
-      for (const topic of topics) {
+      for (const topic of validTopics) {
         connection.pendingTopics.add(topic);
       }
 
       return;
     }
 
-    const payload = JSON.stringify({
+    const payload = {
       op: operation,
-      args: topics
-    });
+      args: validTopics
+    };
 
     try {
-      connection.ws.send(payload, (err) => {
+      connection.ws.send(JSON.stringify(payload), (err) => {
         if (err) {
-          for (const topic of topics) {
+          for (const topic of validTopics) {
             connection.pendingTopics.add(topic);
           }
 
@@ -618,7 +625,7 @@ class WSManager extends EventEmitter {
             {
               connId: connection.id,
               operation,
-              err: err.message
+              err: err && err.message ? err.message : String(err)
             },
             'bybitWs: topic batch send failed'
           );
@@ -626,7 +633,7 @@ class WSManager extends EventEmitter {
           return;
         }
 
-        for (const topic of topics) {
+        for (const topic of validTopics) {
           connection.pendingTopics.delete(topic);
 
           if (operation === 'subscribe') {
@@ -640,7 +647,7 @@ class WSManager extends EventEmitter {
           {
             connId: connection.id,
             operation,
-            count: topics.length
+            count: validTopics.length
           },
           'bybitWs: topic batch sent'
         );
@@ -649,10 +656,14 @@ class WSManager extends EventEmitter {
       logger.warn(
         {
           connId: connection.id,
-          err
+          err: err && err.message ? err.message : String(err)
         },
         'bybitWs: topic batch send threw'
       );
+
+      for (const topic of validTopics) {
+        connection.pendingTopics.add(topic);
+      }
     }
   }
 
@@ -665,9 +676,7 @@ class WSManager extends EventEmitter {
       return;
     }
 
-    const topics = Array.from(
-      connection.pendingTopics
-    );
+    const topics = Array.from(connection.pendingTopics);
 
     for (
       let index = 0;
@@ -676,10 +685,7 @@ class WSManager extends EventEmitter {
     ) {
       this.sendTopics(
         connection,
-        topics.slice(
-          index,
-          index + this.subscribeChunk
-        ),
+        topics.slice(index, index + this.subscribeChunk),
         'subscribe'
       );
     }
@@ -687,9 +693,7 @@ class WSManager extends EventEmitter {
 
   getTargetConnection() {
     let target = this.connections.find((connection) => {
-      return (
-        connection.symbols.size < this.batchSize
-      );
+      return connection.symbols.size < this.batchSize;
     });
 
     if (!target) {
@@ -710,7 +714,18 @@ class WSManager extends EventEmitter {
     }
 
     if (this.symbolToConn.has(symbol)) {
-      return this.symbolToConn.get(symbol);
+      const existing = this.symbolToConn.get(symbol);
+
+      if (
+        existing &&
+        existing.ws &&
+        existing.ws.readyState === WebSocket.OPEN
+      ) {
+        return existing;
+      }
+
+      // Existing connection is stale/dead; remove it.
+      this.symbolToConn.delete(symbol);
     }
 
     const connection = this.getTargetConnection();
@@ -787,9 +802,7 @@ class WSManager extends EventEmitter {
       return false;
     }
 
-    const topics = Array.from(
-      connection.topics
-    ).filter((topic) => {
+    const topics = Array.from(connection.topics).filter((topic) => {
       return topic.endsWith(`.${symbol}`);
     });
 
@@ -801,10 +814,7 @@ class WSManager extends EventEmitter {
       ) {
         this.sendTopics(
           connection,
-          topics.slice(
-            index,
-            index + this.subscribeChunk
-          ),
+          topics.slice(index, index + this.subscribeChunk),
           'unsubscribe'
         );
       }
@@ -862,13 +872,16 @@ class WSManager extends EventEmitter {
         connection.pingTimer = null;
       }
 
+      connection.pendingTopics.clear();
+      connection.topics.clear();
+
       try {
         connection.ws.close();
       } catch (err) {
         logger.debug(
           {
             connId: connection.id,
-            err
+            err: err && err.message ? err.message : String(err)
           },
           'bybitWs: close failed'
         );
