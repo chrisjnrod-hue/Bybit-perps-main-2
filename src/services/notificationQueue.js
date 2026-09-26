@@ -7,6 +7,8 @@ const QUEUE_STATE = {
   PROCESSING: 'processing'
 };
 
+const SIGNAL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
 function getNotificationType(signal) {
   if (!signal) {
     return 'signal';
@@ -72,9 +74,23 @@ class NotificationQueue {
 
     this.sentSignalIds = new Set();
     this.pendingSignalIds = new Set();
+    this.sentSignalTimestamps = new Map();
+  }
+
+  clearExpiredSignalCache(ttlMs = SIGNAL_CACHE_TTL_MS) {
+    const now = Date.now();
+
+    for (const [signalId, sentAt] of this.sentSignalTimestamps.entries()) {
+      if (now - sentAt > ttlMs) {
+        this.sentSignalIds.delete(signalId);
+        this.sentSignalTimestamps.delete(signalId);
+      }
+    }
   }
 
   isKnownSignal(signal) {
+    this.clearExpiredSignalCache();
+
     const signalId = getSignalId(signal);
 
     if (!signalId) {
@@ -104,6 +120,7 @@ class NotificationQueue {
 
     this.pendingSignalIds.delete(signalId);
     this.sentSignalIds.add(signalId);
+    this.sentSignalTimestamps.set(signalId, Date.now());
   }
 
   releaseSignal(signalId) {
@@ -239,6 +256,96 @@ class NotificationQueue {
     });
   }
 
+  enqueueRootCandleOpenBatch(signals, tf = null) {
+    if (!Array.isArray(signals)) {
+      logger.warn('NotificationQueue: invalid root candle open batch');
+      return false;
+    }
+
+    const uniqueSignals = [];
+    const reservedIds = new Set();
+
+    for (const signal of signals) {
+      const normalized = this.normalizeSignal(
+        signal,
+        'new_root_candle'
+      );
+
+      if (!normalized) {
+        continue;
+      }
+
+      const normalizedTf =
+        normalized.root_tf || tf;
+
+      const signalId = getSignalId({
+        ...normalized,
+        root_tf: normalizedTf
+      });
+
+      if (
+        reservedIds.has(signalId) ||
+        this.isKnownSignal({
+          ...normalized,
+          root_tf: normalizedTf
+        })
+      ) {
+        logger.debug(
+          {
+            signalId,
+            notificationType: normalized.notificationType
+          },
+          'NotificationQueue: filtering duplicate root TF candle-open signal'
+        );
+
+        continue;
+      }
+
+      reservedIds.add(signalId);
+      this.reserveSignal({
+        ...normalized,
+        root_tf: normalizedTf
+      });
+
+      uniqueSignals.push({
+        ...normalized,
+        root_tf: normalizedTf
+      });
+    }
+
+    if (uniqueSignals.length === 0) {
+      logger.info(
+        {
+          tf
+        },
+        'NotificationQueue: root TF candle-open batch contained no new signals'
+      );
+      return false;
+    }
+
+    this.queue.push({
+      type: 'root_candle_open_batch',
+      signals: uniqueSignals,
+      signalIds: uniqueSignals.map((signal) => getSignalId(signal)),
+      tf,
+      timestamp: Date.now()
+    });
+
+    logger.info(
+      {
+        tf,
+        total: signals.length,
+        unique: uniqueSignals.length,
+        queueLength: this.queue.length
+      },
+      'NotificationQueue: root TF candle-open batch enqueued'
+    );
+
+    this.startProcessing();
+
+    return true;
+  }
+
   enqueueSummaryBatch({
     signals,
     batchType,
@@ -355,6 +462,15 @@ class NotificationQueue {
             for (const signalId of item.signalIds || []) {
               this.markSignalSent(signalId);
             }
+          } else if (item.type === 'root_candle_open_batch') {
+            await this._processRootCandleOpenBatch(
+              item.signals,
+              item.tf
+            );
+
+            for (const signalId of item.signalIds || []) {
+              this.markSignalSent(signalId);
+            }
           } else if (item.type === 'realtime') {
             await this._processRealtimeSignal(item.signal);
             this.markSignalSent(item.signalId);
@@ -369,7 +485,11 @@ class NotificationQueue {
             this.markSignalSent(item.signalId);
           }
         } catch (err) {
-          if (item.type === 'startup_batch' || item.type === 'root_candle_batch') {
+          if (
+            item.type === 'startup_batch' ||
+            item.type === 'root_candle_batch' ||
+            item.type === 'root_candle_open_batch'
+          ) {
             for (const signalId of item.signalIds || []) {
               this.releaseSignal(signalId);
             }
@@ -444,6 +564,29 @@ class NotificationQueue {
 
     logger.info(
       'NotificationQueue: root candle batch flow completed'
+    );
+  }
+
+  async _processRootCandleOpenBatch(signals, tf = null) {
+    const telegram = require('./telegram');
+
+    logger.info(
+      {
+        tf,
+        count: signals.length
+      },
+      'NotificationQueue: starting root TF candle-open batch flow'
+    );
+
+    // This calls the existing summary format already implemented in telegram.js
+    // and passes the relevant timeframe as metadata.
+    await telegram.sendRootCandleSummary({
+      snapshot: signals,
+      tf
+    });
+
+    logger.info(
+      'NotificationQueue: root TF candle-open batch flow completed'
     );
   }
 
@@ -546,6 +689,7 @@ class NotificationQueue {
   resetSentSignals() {
     this.sentSignalIds.clear();
     this.pendingSignalIds.clear();
+    this.sentSignalTimestamps.clear();
 
     logger.info(
       'NotificationQueue: signal caches cleared'
