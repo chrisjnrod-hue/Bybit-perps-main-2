@@ -58,6 +58,26 @@ function getPersistedSymbols() {
     .filter(Boolean);
 }
 
+function validateSymbolForWs(symbol) {
+  const sym = String(symbol || '').toUpperCase();
+
+  if (!sym) {
+    return false;
+  }
+
+  // Reject dated variants (USDTQ, USDTH, USDTZ, USDT0-9)
+  if (/USDT[QHUZ0-9]/.test(sym.slice(-6))) {
+    return false;
+  }
+
+  // Accept only USDT or USDT.P perpetuals
+  if (!/USDT(\.P)?$/.test(sym)) {
+    return false;
+  }
+
+  return true;
+}
+
 async function runStartup() {
   if (startupStarted) {
     logger.warn(
@@ -141,18 +161,44 @@ async function runStartup() {
 
   if (wsStarted) {
     try {
-      const symbols =
+      const allSymbols =
         getPersistedSymbols();
+
+      // Filter out invalid symbols before subscribing
+      const validSymbols = allSymbols.filter(
+        (symbol) => {
+          return validateSymbolForWs(symbol);
+        }
+      );
+
+      const invalidCount =
+        allSymbols.length -
+        validSymbols.length;
+
+      if (invalidCount > 0) {
+        logger.warn(
+          {
+            total: allSymbols.length,
+            valid: validSymbols.length,
+            invalid: invalidCount,
+            samples: allSymbols
+              .filter((s) => !validateSymbolForWs(s))
+              .slice(0, 5)
+          },
+          'Startup: filtering invalid symbols before WS subscription'
+        );
+      }
 
       const subscribed =
         wsManager.subscribeSymbols(
-          symbols,
+          validSymbols,
           config.MTF_TFS
         );
 
       logger.info(
         {
-          discoveredSymbols: symbols.length,
+          discoveredSymbols: allSymbols.length,
+          validSymbols: validSymbols.length,
           subscribedSymbols: subscribed,
           timeframes: config.MTF_TFS
         },
@@ -201,9 +247,13 @@ async function runStartup() {
       )
       .all(startupSeedCount);
 
-    const seedList = rows.map((row) => ({
-      symbol: row.symbol
-    }));
+    const seedList = rows
+      .map((row) => ({
+        symbol: row.symbol
+      }))
+      .filter((item) =>
+        validateSymbolForWs(item.symbol)
+      );
 
     if (
       seedList.length > 0 &&
@@ -220,7 +270,7 @@ async function runStartup() {
       await poller.backgroundSeedKlines(seedList);
     } else {
       logger.info(
-        'Startup: no symbols available for targeted seeding'
+        'Startup: no valid symbols available for targeted seeding'
       );
     }
   } catch (err) {
