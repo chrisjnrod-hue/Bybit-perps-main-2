@@ -8,9 +8,15 @@ function envBool(name, defaultValue = false) {
     return defaultValue;
   }
 
-  const value = String(process.env[name]).trim().toLowerCase();
+  const value = String(process.env[name])
+    .trim()
+    .toLowerCase();
 
-  return value === '1' || value === 'true' || value === 'yes';
+  return (
+    value === '1' ||
+    value === 'true' ||
+    value === 'yes'
+  );
 }
 
 function configBool(value, defaultValue = false) {
@@ -22,7 +28,9 @@ function configBool(value, defaultValue = false) {
     return value;
   }
 
-  const normalized = String(value).trim().toLowerCase();
+  const normalized = String(value)
+    .trim()
+    .toLowerCase();
 
   if (['1', 'true', 'yes', 'on'].includes(normalized)) {
     return true;
@@ -56,7 +64,9 @@ function normalizeTimeframe(timeframe) {
     return null;
   }
 
-  const value = String(timeframe).trim().toUpperCase();
+  const value = String(timeframe)
+    .trim()
+    .toUpperCase();
 
   if (value === '1H' || value === 'H') {
     return '60';
@@ -110,7 +120,9 @@ function validateSymbol(symbol) {
 function toNumber(value) {
   const number = Number(value);
 
-  return Number.isFinite(number) ? number : null;
+  return Number.isFinite(number)
+    ? number
+    : null;
 }
 
 function normalizeOpenTime(value) {
@@ -120,7 +132,9 @@ function normalizeOpenTime(value) {
     return null;
   }
 
-  return number < 100000000000 ? number * 1000 : number;
+  return number < 100000000000
+    ? number * 1000
+    : number;
 }
 
 function normalizeKlinePayload(payload, timeframe, symbol) {
@@ -245,7 +259,10 @@ class WSManager extends EventEmitter {
 
   start() {
     if (!this.isEnabled()) {
-      logger.info('bybitWs: disabled by USE_WS configuration');
+      logger.info(
+        'bybitWs: disabled by USE_WS configuration'
+      );
+
       return false;
     }
 
@@ -551,7 +568,9 @@ class WSManager extends EventEmitter {
       return;
     }
 
-    const payloads = Array.isArray(data.data) ? data.data : [data.data];
+    const payloads = Array.isArray(data.data)
+      ? data.data
+      : [data.data];
 
     for (const payload of payloads) {
       const kline = normalizeKlinePayload(payload, timeframe, symbol);
@@ -616,23 +635,47 @@ class WSManager extends EventEmitter {
       );
 
       for (const topic of validTopics) {
-        connection.pendingTopics.add(topic);
+        if (
+          !connection.pendingTopics.has(topic) &&
+          !connection.topics.has(topic)
+        ) {
+          connection.pendingTopics.add(topic);
+        }
       }
+
+      return;
+    }
+
+    const dedupedTopics = validTopics.filter(
+      (topic) =>
+        !connection.topics.has(topic) &&
+        !connection.pendingTopics.has(topic)
+    );
+
+    if (dedupedTopics.length === 0) {
+      logger.debug(
+        {
+          connId: connection.id,
+          operation,
+          requested: validTopics.length
+        },
+        'bybitWs: duplicate topic batch skipped'
+      );
 
       return;
     }
 
     const payload = {
       op: operation,
-      args: validTopics
+      args: dedupedTopics
     };
 
     logger.info(
       {
         connId: connection.id,
         operation,
-        args: validTopics.slice(0, 5),
-        total: validTopics.length
+        args: dedupedTopics.slice(0, 5),
+        total: dedupedTopics.length
       },
       'bybitWs: sending raw ws payload'
     );
@@ -649,14 +692,14 @@ class WSManager extends EventEmitter {
             'bybitWs: ws callback error'
           );
 
-          for (const topic of validTopics) {
+          for (const topic of dedupedTopics) {
             connection.pendingTopics.add(topic);
           }
 
           return;
         }
 
-        for (const topic of validTopics) {
+        for (const topic of dedupedTopics) {
           connection.pendingTopics.delete(topic);
 
           if (operation === 'subscribe') {
@@ -670,7 +713,7 @@ class WSManager extends EventEmitter {
           {
             connId: connection.id,
             operation,
-            count: validTopics.length
+            count: dedupedTopics.length
           },
           'bybitWs: topic batch sent'
         );
@@ -685,7 +728,7 @@ class WSManager extends EventEmitter {
         'bybitWs: ws send threw'
       );
 
-      for (const topic of validTopics) {
+      for (const topic of dedupedTopics) {
         connection.pendingTopics.add(topic);
       }
     }
@@ -737,19 +780,17 @@ class WSManager extends EventEmitter {
       return null;
     }
 
-    if (this.symbolToConn.has(symbol)) {
-      const existing = this.symbolToConn.get(symbol);
+    const existing = this.symbolToConn.get(symbol);
 
-      if (
-        existing &&
-        existing.ws &&
-        existing.ws.readyState === WebSocket.OPEN
-      ) {
-        return existing;
-      }
-
-      this.symbolToConn.delete(symbol);
+    if (
+      existing &&
+      existing.ws &&
+      existing.ws.readyState === WebSocket.OPEN
+    ) {
+      return existing;
     }
+
+    this.symbolToConn.delete(symbol);
 
     const connection = this.getTargetConnection();
 
@@ -778,6 +819,13 @@ class WSManager extends EventEmitter {
     this.symbolToConn.set(symbol, connection);
 
     for (const topic of topics) {
+      if (
+        connection.topics.has(topic) ||
+        connection.pendingTopics.has(topic)
+      ) {
+        continue;
+      }
+
       connection.pendingTopics.add(topic);
     }
 
