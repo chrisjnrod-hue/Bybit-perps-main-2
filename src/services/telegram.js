@@ -8,6 +8,7 @@ let bot = null;
 const SUMMARY_TITLE_MAP = {
   startup: '📊 Startup Summary',
   new_root_candle: '🕔 New Root Candle Open',
+  root_tf_candle_open: '🕔 Root TF Candle Open',
   mtf_alignment: '⏱️ MTF Alignment Alert',
   midcandle_update: '⏳ Mid-Candle Update'
 };
@@ -306,15 +307,26 @@ module.exports = {
   async sendSummaryBlock({
     snapshot = [],
     title = '📊 Startup Summary',
-    signalType = null
+    signalType = null,
+    timeframeFilter = null
   } = {}) {
     if (!bot) return;
 
     try {
-      const signals = Array.isArray(snapshot) ? snapshot : [];
+      let signals = Array.isArray(snapshot) ? snapshot : [];
+
+      if (timeframeFilter) {
+        const targetTf = String(timeframeFilter);
+        signals = signals.filter((s) =>
+          String(s.root_tf || '') === targetTf
+        );
+      }
 
       if (signals.length === 0) {
-        logger.warn('Telegram: no signals provided to summary block');
+        logger.warn(
+          { timeframeFilter },
+          'Telegram: no signals provided to summary block'
+        );
         return;
       }
 
@@ -335,6 +347,112 @@ module.exports = {
       const orderedRootTfs = Array.isArray(config.ROOT_TFS) && config.ROOT_TFS.length
         ? config.ROOT_TFS.map(String)
         : Object.keys(tfCounts);
+
+      if (timeframeFilter) {
+        const targetTf = String(timeframeFilter);
+        const filteredTfs = [targetTf];
+        const summaryParts = filteredTfs.map((tf) => `${tf}: ${tfCounts[tf] || 0}`);
+
+        const allSymbols = Array.from(symbolSet).sort((a, b) =>
+          a.localeCompare(b, undefined, { sensitivity: 'base' })
+        );
+
+        const symbolLines = allSymbols.length ? allSymbols.join('\n') : 'n/a';
+        const header = `${title}${timeframeFilter ? ` (${timeframeFilter})` : ''} (${signals.length} signals):\n${summaryParts.join(' • ')}\n\n${symbolLines}`;
+
+        await this._sendMessage(header);
+        logger.info('Telegram: summary header sent');
+        await this._sleep(delayMs);
+
+        const sortedSignals = [...signals].sort((a, b) => {
+          const s = (a.symbol || '').localeCompare(b.symbol || '', undefined, { sensitivity: 'base' });
+          if (s !== 0) return s;
+          return String(a.root_tf || '').localeCompare(String(b.root_tf || ''), undefined, { numeric: true });
+        });
+
+        for (let i = 0; i < sortedSignals.length; i++) {
+          try {
+            await this.sendNewSignalSingleBlock(sortedSignals[i], signalType);
+            logger.debug(
+              {
+                symbol: sortedSignals[i].symbol,
+                index: i + 1,
+                total: sortedSignals.length
+              },
+              'Telegram: signal block sent'
+            );
+          } catch (e) {
+            logger.warn(
+              { err: e, symbol: sortedSignals[i].symbol },
+              'Telegram: failed to send signal block'
+            );
+          }
+
+          await this._sleep(delayMs);
+        }
+
+        let openCount = 0;
+        try {
+          const row = dbModule.get().prepare("SELECT COUNT(*) as cnt FROM trades WHERE status = 'open'").get();
+          openCount = row ? Number(row.cnt || 0) : 0;
+        } catch (e) {
+          logger.debug({ e }, 'Telegram: failed to read open trades count');
+          openCount = 0;
+        }
+
+        const maxOpenTrades = Number(config.MAX_OPEN_TRADES) || 0;
+        const maxSlots = Math.max(0, maxOpenTrades - openCount);
+        const recHeader = `📈 Recommended to Open (${maxSlots} slots available):`;
+
+        await this._sendMessage(recHeader);
+        await this._sleep(delayMs);
+
+        const candidates = signals
+          .map((s) => ({
+            symbol: s.symbol,
+            root_tf: s.root_tf,
+            tvScore: Number(s.meta?.tvScore || 0),
+            mtfScore: Number(s.meta?.mtfScore || 0),
+            acceptDecision: s.meta?.decision || 'monitor',
+            reason: s.meta?.acceptReason || 'n/a'
+          }))
+          .filter((c) => c.acceptDecision === 'accept')
+          .sort((a, b) => {
+            if (b.tvScore !== a.tvScore) return b.tvScore - a.tvScore;
+            return b.mtfScore - a.mtfScore;
+          });
+
+        const recommended = candidates.slice(0, Math.max(0, maxSlots));
+
+        if (recommended.length === 0) {
+          await this._sendMessage('No recommended signals (all rejections or filtered)');
+        } else {
+          for (let i = 0; i < recommended.length; i++) {
+            const r = recommended[i];
+            const label = this.getLabel(i, { lowercase: true });
+            const tvPercent = Math.round((r.tvScore || 0) * 100);
+            const mtfPercent = Math.round((r.mtfScore || 0) * 100);
+            const simNote = config.OPENTRADE ? '' : ' [SIMULATED]';
+            const line = `${label}) ${r.symbol} ${r.root_tf} - TV:${tvPercent}% MTF:${mtfPercent}% - ${r.reason}${simNote}`;
+
+            await this._sendMessage(line);
+
+            logger.debug(
+              {
+                symbol: r.symbol,
+                index: i + 1,
+                total: recommended.length
+              },
+              'Telegram: recommended block sent'
+            );
+
+            await this._sleep(delayMs);
+          }
+        }
+
+        logger.info('Telegram: summary flow completed');
+        return;
+      }
 
       for (const tf of Object.keys(tfCounts)) {
         if (!orderedRootTfs.includes(tf)) orderedRootTfs.push(tf);
@@ -454,13 +572,30 @@ module.exports = {
     });
   },
 
-  async sendRootCandleSummary({ snapshot = [] } = {}) {
+  async sendRootCandleSummary({ snapshot = [], tf = null } = {}) {
     if (!bot) return;
 
+    const filtered = Array.isArray(snapshot)
+      ? (tf
+          ? snapshot.filter((s) =>
+              String(s.root_tf || '') === String(tf)
+            )
+          : snapshot)
+      : [];
+
+    const title = tf
+      ? `🕔 New Root Candle Open (${tf})`
+      : '🕔 New Root Candle Open';
+
     await this.sendSummaryBlock({
-      snapshot,
-      title: '🕔 New Root Candle Open',
-      signalType: 'new_root_candle'
+      snapshot: filtered,
+      title,
+      signalType: 'new_root_candle',
+      timeframeFilter: tf || null
     });
+  },
+
+  async sendRootCandleOpenSummary({ snapshot = [], tf = null } = {}) {
+    return this.sendRootCandleSummary({ snapshot, tf });
   }
 };
