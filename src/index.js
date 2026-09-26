@@ -40,18 +40,52 @@ const PORT = process.env.PORT || config.PORT || 3000;
 
 let server;
 let heartbeatInterval;
+let startupStarted = false;
+
+function getPersistedSymbols() {
+  const dbInstance = db.get();
+
+  return dbInstance
+    .prepare(
+      `
+        SELECT symbol
+        FROM symbols
+        ORDER BY symbol COLLATE NOCASE ASC
+      `
+    )
+    .all()
+    .map((row) => row.symbol)
+    .filter(Boolean);
+}
 
 async function runStartup() {
-  logger.info('Startup: initializing database');
+  if (startupStarted) {
+    logger.warn(
+      'Startup already started; ignoring duplicate startup call'
+    );
+
+    return;
+  }
+
+  startupStarted = true;
+
+  logger.info(
+    'Startup: initializing database'
+  );
+
   db.init();
 
   // Initialize Telegram before any notification can be queued.
-  logger.info('Startup: initializing Telegram');
+  logger.info(
+    'Startup: initializing Telegram'
+  );
+
   telegram.init();
 
   // This probe is intentionally non-blocking.
   try {
-    const bybitRest = require('./services/bybitRest');
+    const bybitRest =
+      require('./services/bybitRest');
 
     bybitRest
       .probeHosts(3000)
@@ -100,6 +134,49 @@ async function runStartup() {
   }
 
   /*
+   * Start the WebSocket manager before signal processing.
+   * Symbols are subscribed centrally here, exactly once.
+   */
+  const wsStarted = wsManager.start();
+
+  if (wsStarted) {
+    try {
+      const symbols =
+        getPersistedSymbols();
+
+      const subscribed =
+        wsManager.subscribeSymbols(
+          symbols,
+          config.MTF_TFS
+        );
+
+      logger.info(
+        {
+          discoveredSymbols: symbols.length,
+          subscribedSymbols: subscribed,
+          timeframes: config.MTF_TFS
+        },
+        'Startup: central WS subscriptions queued'
+      );
+    } catch (err) {
+      logger.warn(
+        { err },
+        'Startup: central WS subscription setup failed'
+      );
+    }
+  } else {
+    logger.warn(
+      'Startup: WS disabled; REST polling fallback remains active'
+    );
+  }
+
+  /*
+   * Register listeners once before live klines arrive.
+   */
+  tradeManager.registerWs(wsManager);
+  signalManager.start();
+
+  /*
    * Seed the configured startup subset synchronously. This prevents
    * scanAllForStartup() from racing with the background seed started by
    * initialScan().
@@ -130,7 +207,8 @@ async function runStartup() {
 
     if (
       seedList.length > 0 &&
-      typeof poller.backgroundSeedKlines === 'function'
+      typeof poller.backgroundSeedKlines ===
+      'function'
     ) {
       logger.info(
         {
@@ -177,12 +255,9 @@ async function runStartup() {
   }
 
   /*
-   * Start recurring services only after the startup scan has completed.
+   * Start the recurring five-minute boundary loop last.
    */
   poller.start();
-  wsManager.start();
-  signalManager.start();
-  tradeManager.registerWs(wsManager);
 
   app.get('/', (req, res) => {
     res.json({
@@ -236,8 +311,13 @@ async function gracefulShutdown(signal) {
       heartbeatInterval = null;
     }
 
-    if (server && typeof server.close === 'function') {
-      logger.info('Closing HTTP server');
+    if (
+      server &&
+      typeof server.close === 'function'
+    ) {
+      logger.info(
+        'Closing HTTP server'
+      );
 
       await new Promise((resolve) => {
         server.close(resolve);
@@ -247,7 +327,8 @@ async function gracefulShutdown(signal) {
     try {
       if (
         wsManager &&
-        typeof wsManager.closeAll === 'function'
+        typeof wsManager.closeAll ===
+        'function'
       ) {
         await wsManager.closeAll();
 
@@ -258,15 +339,17 @@ async function gracefulShutdown(signal) {
         wsManager &&
         Array.isArray(wsManager.connections)
       ) {
-        wsManager.connections.forEach((connection) => {
-          try {
-            if (connection.ws) {
-              connection.ws.close();
+        wsManager.connections.forEach(
+          (connection) => {
+            try {
+              if (connection.ws) {
+                connection.ws.close();
+              }
+            } catch (_) {
+              // Ignore individual connection close failures.
             }
-          } catch (_) {
-            // Ignore individual connection close failures.
           }
-        });
+        );
       }
     } catch (err) {
       logger.warn(
@@ -276,7 +359,10 @@ async function gracefulShutdown(signal) {
     }
 
     try {
-      if (db && typeof db.close === 'function') {
+      if (
+        db &&
+        typeof db.close === 'function'
+      ) {
         db.close();
         logger.info('Database closed');
       } else {
@@ -284,10 +370,13 @@ async function gracefulShutdown(signal) {
 
         if (
           dbInstance &&
-          typeof dbInstance.close === 'function'
+          typeof dbInstance.close ===
+          'function'
         ) {
           dbInstance.close();
-          logger.info('Database closed through db.get()');
+          logger.info(
+            'Database closed through db.get()'
+          );
         }
       }
     } catch (err) {
