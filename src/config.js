@@ -54,7 +54,7 @@ module.exports = {
 
   SYMBOL_SEED_ALL: envBool(
     'SYMBOL_SEED_ALL',
-    false
+    true
   ),
 
   USE_WS: envBool('USE_WS', false),
