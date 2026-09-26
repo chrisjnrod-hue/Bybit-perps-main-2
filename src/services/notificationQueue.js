@@ -42,6 +42,9 @@ function getSignalId(signal) {
     return null;
   }
 
+  // FIXED: Fetch the type to prevent midcandle updates from sharing an ID with the candle-open event.
+  const type = getNotificationType(signal) || 'signal';
+
   const candleValue =
     signal.candle_open_time !== undefined && signal.candle_open_time !== null
       ? Number(signal.candle_open_time)
@@ -51,7 +54,8 @@ function getSignalId(signal) {
     return [
       signal.symbol,
       signal.root_tf,
-      candleValue
+      candleValue,
+      type
     ].join('_');
   }
 
@@ -60,7 +64,8 @@ function getSignalId(signal) {
     signal.root_tf,
     signal.detected_at !== undefined && signal.detected_at !== null
       ? Number(signal.detected_at)
-      : Date.now()
+      : Date.now(),
+    type
   ].join('_');
 }
 
@@ -166,7 +171,7 @@ class NotificationQueue {
 
     const normalized = this.normalizeSignal(
       signal,
-      type === 'realtime' ? signal.notificationType || null : null
+      type === 'realtime' ? signal.notificationType || null : type
     );
 
     const signalId = getSignalId(normalized);
