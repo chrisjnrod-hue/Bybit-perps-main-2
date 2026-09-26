@@ -515,19 +515,12 @@ class WSManager extends EventEmitter {
     );
 
     if (data && data.op === 'ping') {
-      try {
-        connection.ws.send(
-          JSON.stringify({
-            op: 'pong'
-          })
-        );
-      } catch (err) {
-        logger.debug(
-          { err },
-          'bybitWs: failed to send pong'
-        );
-      }
-
+      // Bybit responds to client ping with {"success": true, "ret_msg": "pong", "op": "ping"}.
+      // Do not respond with {"op": "pong"} as Bybit will reject it with "error:invalid op".
+      logger.debug(
+        { connId: connection.id },
+        'bybitWs: ping acknowledged by server'
+      );
       return;
     }
 
