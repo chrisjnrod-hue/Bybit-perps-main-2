@@ -120,7 +120,6 @@ function normalizeOpenTime(value) {
     return null;
   }
 
-  // Convert seconds to milliseconds when necessary.
   return number < 100000000000 ? number * 1000 : number;
 }
 
@@ -246,10 +245,7 @@ class WSManager extends EventEmitter {
 
   start() {
     if (!this.isEnabled()) {
-      logger.info(
-        'bybitWs: disabled by USE_WS configuration'
-      );
-
+      logger.info('bybitWs: disabled by USE_WS configuration');
       return false;
     }
 
@@ -417,7 +413,6 @@ class WSManager extends EventEmitter {
 
       const symbolsToRecover = Array.from(connection.symbols);
 
-      // Prevent stale subscriptions from being retried on a dead socket.
       connection.pendingTopics.clear();
       connection.topics.clear();
 
@@ -477,6 +472,14 @@ class WSManager extends EventEmitter {
 
       return;
     }
+
+    logger.debug(
+      {
+        connId: connection.id,
+        data
+      },
+      'bybitWs: incoming frame'
+    );
 
     if (data && data.op === 'ping') {
       try {
@@ -602,6 +605,16 @@ class WSManager extends EventEmitter {
     }
 
     if (connection.ws.readyState !== WebSocket.OPEN) {
+      logger.warn(
+        {
+          connId: connection.id,
+          operation,
+          pendingCount: validTopics.length,
+          readyState: connection.ws ? connection.ws.readyState : 'no-socket'
+        },
+        'bybitWs: socket not open; delaying topic send'
+      );
+
       for (const topic of validTopics) {
         connection.pendingTopics.add(topic);
       }
@@ -614,21 +627,31 @@ class WSManager extends EventEmitter {
       args: validTopics
     };
 
+    logger.info(
+      {
+        connId: connection.id,
+        operation,
+        args: validTopics.slice(0, 5),
+        total: validTopics.length
+      },
+      'bybitWs: sending raw ws payload'
+    );
+
     try {
       connection.ws.send(JSON.stringify(payload), (err) => {
         if (err) {
-          for (const topic of validTopics) {
-            connection.pendingTopics.add(topic);
-          }
-
-          logger.warn(
+          logger.error(
             {
               connId: connection.id,
               operation,
               err: err && err.message ? err.message : String(err)
             },
-            'bybitWs: topic batch send failed'
+            'bybitWs: ws callback error'
           );
+
+          for (const topic of validTopics) {
+            connection.pendingTopics.add(topic);
+          }
 
           return;
         }
@@ -653,12 +676,13 @@ class WSManager extends EventEmitter {
         );
       });
     } catch (err) {
-      logger.warn(
+      logger.error(
         {
           connId: connection.id,
+          operation,
           err: err && err.message ? err.message : String(err)
         },
-        'bybitWs: topic batch send threw'
+        'bybitWs: ws send threw'
       );
 
       for (const topic of validTopics) {
@@ -724,7 +748,6 @@ class WSManager extends EventEmitter {
         return existing;
       }
 
-      // Existing connection is stale/dead; remove it.
       this.symbolToConn.delete(symbol);
     }
 
