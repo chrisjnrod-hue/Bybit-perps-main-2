@@ -1186,9 +1186,11 @@ module.exports = {
      */
     for (const signal of newSignals) {
       try {
+        // FIXED: Enqueue as a midcandle update so the queue doesn't reject it 
+        // as a duplicate of the root candle open signal.
         notificationQueue.enqueueSignal(
           signal,
-          'realtime'
+          'midcandle_update'
         );
 
         logger.info(
@@ -1196,7 +1198,7 @@ module.exports = {
             symbol: signal.symbol,
             root_tf: signal.root_tf
           },
-          'poller.loop2: realtime root signal enqueued'
+          'poller.loop2: midcandle update enqueued'
         );
       } catch (err) {
         logger.warn(
@@ -1204,7 +1206,7 @@ module.exports = {
             err,
             signal
           },
-          'poller.loop2: failed to enqueue root signal'
+          'poller.loop2: failed to enqueue midcandle update'
         );
       }
     }
@@ -1300,7 +1302,9 @@ module.exports = {
       const openingTfs = [];
 
       for (const [tf, boundaryMs] of Object.entries(nextSchedules)) {
-        if (Math.abs(nowMs - boundaryMs) < 1000) {
+        // FIXED: Expanded the check window to catch slight timer inaccuracies. 
+        // Tolerates waking up up to 5 seconds early or up to 60 seconds late.
+        if (nowMs >= boundaryMs - 5000 && nowMs - boundaryMs < 60000) {
           openingTfs.push(tf);
         }
       }
