@@ -313,33 +313,6 @@ class WSManager extends EventEmitter {
     return normalizeTimeframe(timeframe);
   }
 
-  safeSend(connection, payload) {
-    if (
-      !connection ||
-      !connection.ws ||
-      connection.ws.readyState !== WebSocket.OPEN
-    ) {
-      return false;
-    }
-
-    try {
-      connection.ws.send(JSON.stringify(payload));
-      return true;
-    } catch (err) {
-      logger.debug(
-        {
-          connId: connection.id,
-          err: err && err.message
-            ? err.message
-            : String(err)
-        },
-        'bybitWs: send failed'
-      );
-
-      return false;
-    }
-  }
-
   createConnection() {
     if (this.connections.length >= this.maxSockets) {
       logger.warn(
@@ -362,13 +335,13 @@ class WSManager extends EventEmitter {
 
       symbols: new Set(),
 
-      // Topics waiting to be sent.
+      // Topics waiting to be sent
       pendingTopics: new Set(),
 
-      // Topics currently being sent or waiting for the server response.
+      // Topics currently being sent or waiting for server response
       inFlightTopics: new Set(),
 
-      // Topics confirmed locally as subscribed.
+      // Topics confirmed as subscribed
       topics: new Set(),
 
       ready: false,
@@ -393,7 +366,28 @@ class WSManager extends EventEmitter {
       );
 
       connection.pingTimer = setInterval(() => {
-        this.safeSend(connection, { op: 'ping' });
+        if (
+          connection.ws &&
+          connection.ws.readyState === WebSocket.OPEN
+        ) {
+          try {
+            connection.ws.send(
+              JSON.stringify({
+                op: 'ping'
+              })
+            );
+          } catch (err) {
+            logger.debug(
+              {
+                connId: connection.id,
+                err: err && err.message
+                  ? err.message
+                  : String(err)
+              },
+              'bybitWs: ping failed'
+            );
+          }
+        }
       }, this.pingIntervalMs);
 
       this.flushPending(connection);
@@ -442,7 +436,7 @@ class WSManager extends EventEmitter {
         'bybitWs: connection closed'
       );
 
-      // The old socket must never retain subscription state.
+      // Clear all topic state on close
       connection.pendingTopics.clear();
       connection.inFlightTopics.clear();
       connection.topics.clear();
@@ -521,7 +515,19 @@ class WSManager extends EventEmitter {
     );
 
     if (data && data.op === 'ping') {
-      this.safeSend(connection, { op: 'pong' });
+      try {
+        connection.ws.send(
+          JSON.stringify({
+            op: 'pong'
+          })
+        );
+      } catch (err) {
+        logger.debug(
+          { err },
+          'bybitWs: failed to send pong'
+        );
+      }
+
       return;
     }
 
@@ -558,11 +564,7 @@ class WSManager extends EventEmitter {
           'bybitWs: subscription/API error'
         );
 
-        /*
-         * A subscription failure must not be marked as subscribed.
-         * Remove failed topics from local state so a future reconnect
-         * can retry them.
-         */
+        // If subscription failed, move topics back to pending
         if (
           data.op === 'subscribe' &&
           Array.isArray(data.args)
@@ -640,7 +642,6 @@ class WSManager extends EventEmitter {
         .get(symbol)
         .set(timeframe, kline);
 
-      // Emit the kline fields directly.
       this.emit('kline', {
         ...kline,
         raw: data
@@ -720,11 +721,7 @@ class WSManager extends EventEmitter {
       return;
     }
 
-    /*
-     * Reserve topics before calling ws.send().
-     * This prevents a second flushPending() call in the same event-loop
-     * turn from sending the same topics again.
-     */
+    // Mark topics as in-flight before sending
     for (const topic of sendableTopics) {
       connection.inFlightTopics.add(topic);
       connection.pendingTopics.delete(topic);
@@ -772,11 +769,7 @@ class WSManager extends EventEmitter {
             return;
           }
 
-          /*
-           * ws.send's callback confirms that the frame was written,
-           * not necessarily that Bybit accepted it. The Bybit response
-           * is handled above.
-           */
+          // ws.send callback confirms frame was written, not server ack
           if (operation === 'subscribe') {
             for (const topic of sendableTopics) {
               connection.topics.add(topic);
@@ -786,6 +779,15 @@ class WSManager extends EventEmitter {
               connection.topics.delete(topic);
             }
           }
+
+          logger.debug(
+            {
+              connId: connection.id,
+              operation,
+              count: sendableTopics.length
+            },
+            'bybitWs: topic batch sent'
+          );
         }
       );
     } catch (err) {
@@ -879,10 +881,6 @@ class WSManager extends EventEmitter {
       existing.ws.readyState !== WebSocket.CLOSED &&
       !existing.manuallyClosed
     ) {
-      /*
-       * The symbol is already assigned to this connection.
-       * Do not queue the same symbol again.
-       */
       return existing;
     }
 
