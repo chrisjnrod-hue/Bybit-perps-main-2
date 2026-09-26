@@ -115,6 +115,34 @@ function getLatestOpenTime(db, symbol, timeframe) {
     : null;
 }
 
+function getRootTfMs(tf) {
+  const normalized = normalizeRootTf(tf);
+
+  if (normalized === 'D') {
+    return 24 * 60 * 60 * 1000;
+  }
+
+  const minutes = Number(normalized);
+
+  if (Number.isFinite(minutes) && minutes > 0) {
+    return minutes * 60 * 1000;
+  }
+
+  return FIVE_MINUTES_MS;
+}
+
+function getNextTimeframeBoundaryMs(tf, nowMs = Date.now()) {
+  const tfMs = getRootTfMs(tf);
+
+  // Align to a UTC-driven interval boundary based on Unix epoch
+  const epochStart = Date.UTC(1970, 0, 1);
+  const alignedFloor = Math.floor(
+    (nowMs - epochStart) / tfMs
+  ) * tfMs;
+
+  return alignedFloor + tfMs + epochStart;
+}
+
 module.exports = {
   /*
    * Start only the recurring polling loop.
@@ -149,19 +177,16 @@ module.exports = {
     }
 
     this.startBoundaryScanLoop();
-
     logger.info(
       'poller.start: boundary scan loop started'
     );
+
+    this.startRootTfCandleOpenLoop();
+    logger.info(
+      'poller.start: root TF candle open loop started'
+    );
   },
 
-  /*
-   * Discover and persist symbols.
-   *
-   * By default, this method preserves the previous background-seeding
-   * behavior. Startup and Loop 2 call it with { seed: false } so that
-   * they can control seeding explicitly.
-   */
   async initialScan(options = {}) {
     const {
       seed = true
@@ -603,12 +628,6 @@ module.exports = {
     }
   },
 
-  /*
-   * Perform the one and only startup signal scan.
-   *
-   * index.js calls this after controlled startup seeding. This method
-   * enqueues one startup batch and initializes Loop 2's candle state.
-   */
   async scanAllForStartup() {
     if (startupComplete) {
       logger.debug(
@@ -881,14 +900,6 @@ module.exports = {
     return results;
   },
 
-  /*
-   * Return the next exact UTC five-minute boundary.
-   *
-   * Examples:
-   *   12:00:01 -> 12:05:00
-   *   12:04:59 -> 12:05:00
-   *   12:05:00 -> 12:10:00
-   */
   getNextFiveMinuteBoundaryMs(
     nowMs = Date.now()
   ) {
@@ -904,10 +915,9 @@ module.exports = {
 
   /*
    * Start Loop 2.
-   *
-   * There is intentionally no Loop 3. Having two loops call
-   * handleRootSignal() for the same root candle caused duplicate and
-   * delayed startup-style notifications.
+   * This loop handles mid-candle flip detection and MTF alignment
+   * alerting. New root timeframe candle opens are handled by a
+   * separate scheduled loop.
    */
   startBoundaryScanLoop() {
     setImmediate(() => {
@@ -981,13 +991,9 @@ module.exports = {
       {
         boundary: boundary.toISOString()
       },
-      'poller.loop2: starting exact five-minute boundary scan'
+      'poller.loop2: starting five-minute boundary scan (mid-candle detection)'
     );
 
-    /*
-     * Refresh the symbol list, but do not launch another background
-     * seed. This boundary scan controls its own data refresh.
-     */
     await this.initialScan({
       seed: false
     });
@@ -1017,9 +1023,6 @@ module.exports = {
 
       for (const tf of rootTfs) {
         try {
-          /*
-           * Refresh the current symbol/timeframe before evaluating it.
-           */
           await this.seedKlinesForSymbol(
             symbol,
             tf
@@ -1048,54 +1051,52 @@ module.exports = {
           );
 
           /*
-           * Root MACD flip detection occurs only once for each newly
-           * observed candle.
+           * This loop is intentionally not responsible for root-candle-open
+           * processing. Root TF open detection is handled by a dedicated
+           * root-candle-open scan. Here we only react to mid-candle flips,
+           * and only after the candle has already been recorded.
            */
           if (latestOpen > processedOpen) {
-            const flip =
-              await macdUtil.isMacdFlip(
-                symbol,
-                tf
-              );
-
-            if (flip) {
-              const signal =
-                await signalManager.handleRootSignal({
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  notifyImmediately: false
-                });
-
-              if (signal) {
-                newSignals.push(signal);
-              }
-            }
-
-            /*
-             * Mark the candle after the refresh and MACD evaluation.
-             * If an exception occurred above, this state is not updated
-             * and the candle can be retried on the next boundary.
-             */
-            dbModule.setState(
-              processedStateKey,
-              latestOpen
-            );
-
             logger.debug(
               {
                 symbol,
                 tf,
-                latestOpen
+                latestOpen,
+                processedOpen
               },
-              'poller.loop2: processed newly opened root candle'
+              'poller.loop2: new root candle detected; handled separately by root-TF candle-open scanner'
             );
+
+            continue;
           }
 
           /*
-           * Alignment checks are independent of root-candle
-           * de-duplication, but only run for active signals.
+           * Mid-candle flip detection.
+           */
+          const flip =
+            await macdUtil.isMacdFlip(
+              symbol,
+              tf
+            );
+
+          if (flip) {
+            const signal =
+              await signalManager.handleRootSignal({
+                symbol,
+                root_tf: tf,
+                detected_at: Date.now(),
+                candle_open_time: latestOpen,
+                notifyImmediately: false
+              });
+
+            if (signal) {
+              newSignals.push(signal);
+            }
+          }
+
+          /*
+           * Alignment checks are independent of flip detection and are
+           * used for monitored/active signals only.
            */
           const latestSignals =
             dbModule.getLatestSignalsSnapshot();
@@ -1180,9 +1181,8 @@ module.exports = {
     }
 
     /*
-     * Loop 2 sends realtime blocks only. It does not enqueue a startup
-     * batch and therefore does not generate summary/recommendation
-     * messages.
+     * Loop 2 sends one block per new mid-candle signal and one block
+     * per alignment alert. It does not send a summary batch.
      */
     for (const signal of newSignals) {
       try {
@@ -1213,7 +1213,7 @@ module.exports = {
       try {
         notificationQueue.enqueueSignal(
           alert,
-          'realtime'
+          'mtf_alignment'
         );
 
         logger.info(
@@ -1241,6 +1241,228 @@ module.exports = {
       },
       'poller.loop2: exact five-minute boundary scan completed'
     );
+  },
+
+  /*
+   * Dedicated root TF candle-open scan.
+   * This is triggered when a root timeframe boundary opens, and sends
+   * the summary + per-signal + recommended block format.
+   */
+  startRootTfCandleOpenLoop() {
+    setImmediate(() => {
+      this.runRootTfCandleOpenLoop()
+        .catch((err) => {
+          logger.error(
+            {
+              err
+            },
+            'poller: root TF candle open loop crashed'
+          );
+        });
+    });
+  },
+
+  async runRootTfCandleOpenLoop() {
+    while (isRunning) {
+      const rootTfs = buildRootTfs();
+      const nextSchedules = {};
+
+      for (const tf of rootTfs) {
+        nextSchedules[tf] = getNextTimeframeBoundaryMs(tf);
+      }
+
+      const nextBoundaryMs = Math.min(
+        ...Object.values(nextSchedules)
+      );
+
+      const delay = Math.max(
+        0,
+        nextBoundaryMs - Date.now()
+      );
+
+      logger.debug(
+        {
+          nextBoundaryMs,
+          nextBoundary: new Date(nextBoundaryMs).toISOString(),
+          delayMs: delay,
+          timeframes: rootTfs
+        },
+        'poller: waiting for next root TF candle-open boundary'
+      );
+
+      await sleep(delay);
+
+      if (!isRunning) {
+        break;
+      }
+
+      const nowMs = Date.now();
+      const openingTfs = [];
+
+      for (const [tf, boundaryMs] of Object.entries(nextSchedules)) {
+        if (Math.abs(nowMs - boundaryMs) < 1000) {
+          openingTfs.push(tf);
+        }
+      }
+
+      if (openingTfs.length > 0) {
+        try {
+          await this.runRootTfCandleOpenOnce(openingTfs);
+        } catch (err) {
+          logger.error(
+            {
+              err
+            },
+            'poller: root TF candle open scan failed'
+          );
+        }
+      }
+    }
+  },
+
+  async runRootTfCandleOpenOnce(openingTfs = []) {
+    if (!Array.isArray(openingTfs) || openingTfs.length === 0) {
+      return;
+    }
+
+    logger.info(
+      {
+        timeframes: openingTfs
+      },
+      'poller: root TF candle-open scan started'
+    );
+
+    const db = dbModule.get();
+
+    const rows = db
+      .prepare(
+        `
+          SELECT symbol
+          FROM symbols
+          ORDER BY symbol COLLATE NOCASE ASC
+        `
+      )
+      .all();
+
+    const validRows = rows.filter((row) =>
+      isUsdtSymbol(row.symbol)
+    );
+
+    const tfSignalMap = {};
+    for (const tf of openingTfs) {
+      tfSignalMap[tf] = [];
+    }
+
+    for (const row of validRows) {
+      const symbol = row.symbol;
+
+      for (const tf of openingTfs) {
+        try {
+          await this.seedKlinesForSymbol(
+            symbol,
+            tf
+          );
+
+          const latestOpen = getLatestOpenTime(
+            db,
+            symbol,
+            tf
+          );
+
+          if (latestOpen === null) {
+            continue;
+          }
+
+          const processedStateKey =
+            this.getLoop2ProcessedCandleKey(
+              symbol,
+              tf
+            );
+
+          const processedOpen = Number(
+            dbModule.getState(
+              processedStateKey
+            ) || 0
+          );
+
+          // This is a true root TF candle open
+          if (latestOpen > processedOpen) {
+            const flip =
+              await macdUtil.isMacdFlip(
+                symbol,
+                tf
+              );
+
+            if (flip) {
+              const signal =
+                await signalManager.handleRootSignal({
+                  symbol,
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  notifyImmediately: false
+                });
+
+              if (signal) {
+                tfSignalMap[tf].push(signal);
+              }
+            }
+
+            dbModule.setState(
+              processedStateKey,
+              latestOpen
+            );
+          }
+        } catch (err) {
+          logger.debug(
+            {
+              err,
+              symbol,
+              tf
+            },
+            'poller: root TF candle-open scan failed for symbol/timeframe'
+          );
+        }
+      }
+    }
+
+    for (const tf of openingTfs) {
+      const signals = tfSignalMap[tf] || [];
+
+      if (signals.length === 0) {
+        logger.info(
+          {
+            tf
+          },
+          'poller: no root TF signals detected at candle open'
+        );
+
+        continue;
+      }
+
+      try {
+        notificationQueue.enqueueRootCandleOpenBatch(
+          signals,
+          tf
+        );
+
+        logger.info(
+          {
+            tf,
+            count: signals.length
+          },
+          'poller: root TF candle-open batch enqueued'
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            tf
+          },
+          'poller: failed to enqueue root TF candle-open batch'
+        );
+      }
+    }
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
