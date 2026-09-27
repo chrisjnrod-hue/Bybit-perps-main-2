@@ -98,19 +98,6 @@ module.exports = {
 
   setOpenTradesAllowed,
 
-  /**
-   * Process a root, root-open, or mid-candle signal.
-   *
-   * notifyImmediately:
-   *   true  - enqueue immediately
-   *   false - return the signal to the caller so the caller can batch it
-   *
-   * signalType:
-   *   new_root_candle
-   *   midcandle_update
-   *   mtf_alignment
-   *   or another queue-supported type
-   */
   async handleRootSignal({
     symbol,
     root_tf,
@@ -166,10 +153,6 @@ module.exports = {
         'Root signal received'
       );
 
-      /*
-       * Fetch fresh market data. Failure is non-fatal because the
-       * signal should still be available for notification and review.
-       */
       let mdata = null;
 
       try {
@@ -193,9 +176,6 @@ module.exports = {
         mdata = buildFallbackMarketData();
       }
 
-      /*
-       * Fetch the cached or fresh TradingView rating.
-       */
       let tv = {
         score: 0,
         source: 'error'
@@ -247,17 +227,34 @@ module.exports = {
         );
       }
 
-      /*
-       * Evaluate MTF alignment using the current MACD histogram data.
-       */
       const alignment =
         await this.evaluateMtfAlignment(symbol);
 
       const mtfScore =
         calculateMtfScore(alignment);
 
-      const decision =
-        await this.applyDecision(alignment);
+      let decision;
+
+      if (
+        normalizedSignalType ===
+        'midcandle_update'
+      ) {
+        decision =
+          mtfScore > 0.5
+            ? {
+                decision: 'accept',
+                reason:
+                  'midcandle_positive_alignment'
+              }
+            : {
+                decision: 'monitor',
+                reason:
+                  'midcandle_requires_alignment'
+              };
+      } else {
+        decision =
+          await this.applyDecision(alignment);
+      }
 
       const meta = {
         tvScore: tv.score || 0,
@@ -275,12 +272,6 @@ module.exports = {
         marketData: mdata || {}
       };
 
-      /*
-       * Keep this insert compatible with the existing database API.
-       * Event metadata remains on signalObj and is available to the
-       * notification queue even if the current schema has no eventId
-       * or candle_open_time columns.
-       */
       dbModule.insertSignal({
         symbol,
         root_tf,
@@ -302,11 +293,6 @@ module.exports = {
         meta
       };
 
-      /*
-       * Immediate notifications are used by callers that do not need
-       * a summary batch. Boundary and root-open scans pass false and
-       * enqueue the returned object themselves.
-       */
       if (notifyImmediately) {
         const queueType =
           normalizedSignalType || 'realtime';
@@ -317,7 +303,8 @@ module.exports = {
             root_tf,
             eventId,
             queueType,
-            notificationType: signalObj.notificationType
+            notificationType:
+              signalObj.notificationType
           },
           'handleRootSignal: enqueuing immediate notification'
         );
@@ -332,17 +319,15 @@ module.exports = {
             symbol,
             root_tf,
             eventId,
-            signalType: normalizedSignalType
+            signalType: normalizedSignalType,
+            tvScore: meta.tvScore,
+            mtfScore: meta.mtfScore,
+            decision: meta.decision
           },
-          'handleRootSignal: notifyImmediately=false, returning signal'
+          'handleRootSignal: notifyImmediately=false, returning signal with full scoring'
         );
       }
 
-      /*
-       * Trade opening is still performed only for accepted signals.
-       * Existing tradeManager safeguards should determine whether an
-       * already-open trade is allowed.
-       */
       if (
         decision &&
         decision.decision === 'accept'
@@ -506,17 +491,10 @@ module.exports = {
 
       return null;
     } finally {
-      /*
-       * Delete only this event's lock. A later root-open or mid-candle
-       * event for the same symbol/timeframe remains independent.
-       */
       inProgress.delete(key);
     }
   },
 
-  /**
-   * Return detailed MTF alignment for the configured MTF timeframes.
-   */
   async evaluateMtfAlignment(symbol) {
     const result = {};
     const mtfTfs = Array.isArray(config.MTF_TFS)
@@ -591,15 +569,6 @@ module.exports = {
     return result;
   },
 
-  /**
-   * Determine signal acceptance from MTF alignment.
-   *
-   * Rules:
-   * - all configured timeframes positive: accept
-   * - only daily timeframe negative and rising: accept
-   * - one or more negative timeframes: monitor
-   * - no usable data: reject
-   */
   async applyDecision(alignment = {}) {
     const tfList = Object.keys(alignment || {});
 
