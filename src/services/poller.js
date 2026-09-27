@@ -134,13 +134,86 @@ function getRootTfMs(tf) {
 function getNextTimeframeBoundaryMs(tf, nowMs = Date.now()) {
   const tfMs = getRootTfMs(tf);
 
-  // Align to a UTC-driven interval boundary based on Unix epoch
+  // Align to a UTC-based interval boundary
   const epochStart = Date.UTC(1970, 0, 1);
   const alignedFloor = Math.floor(
     (nowMs - epochStart) / tfMs
   ) * tfMs;
 
   return alignedFloor + tfMs + epochStart;
+}
+
+function calculateHistogramFlip(histogramRows = []) {
+  if (!Array.isArray(histogramRows) || histogramRows.length < 2) {
+    return false;
+  }
+
+  const current = histogramRows[histogramRows.length - 1];
+  const previous = histogramRows[histogramRows.length - 2];
+
+  const currentHistogram = Number(current?.histogram);
+  const previousHistogram = Number(previous?.histogram);
+
+  if (
+    !Number.isFinite(currentHistogram) ||
+    !Number.isFinite(previousHistogram)
+  ) {
+    return false;
+  }
+
+  return (
+    (previousHistogram <= 0 && currentHistogram > 0) ||
+    (previousHistogram >= 0 && currentHistogram < 0)
+  );
+}
+
+async function detectMidCandleFlip(symbol, timeframe) {
+  try {
+    if (
+      macdUtil &&
+      typeof macdUtil.computeMacdHistogram === 'function'
+    ) {
+      const histogram = await macdUtil.computeMacdHistogram(
+        symbol,
+        timeframe
+      );
+
+      return calculateHistogramFlip(histogram);
+    }
+  } catch (err) {
+    logger.debug(
+      { err, symbol, timeframe },
+      'poller: computeMacdHistogram mid-candle detection failed'
+    );
+  }
+
+  try {
+    if (
+      macdUtil &&
+      typeof macdUtil.isMacdFlip === 'function'
+    ) {
+      return await macdUtil.isMacdFlip(
+        symbol,
+        timeframe
+      );
+    }
+  } catch (err) {
+    logger.debug(
+      { err, symbol, timeframe },
+      'poller: isMacdFlip fallback failed'
+    );
+  }
+
+  return false;
+}
+
+function buildEventId(type, symbol, timeframe, candleOpenTime) {
+  return [
+    type,
+    String(symbol || ''),
+    String(timeframe || ''),
+    Number(candleOpenTime) || 0
+  ].join(':');
 }
 
 module.exports = {
@@ -913,12 +986,6 @@ module.exports = {
     );
   },
 
-  /*
-   * Start Loop 2.
-   * This loop handles mid-candle flip detection and MTF alignment
-   * alerting. New root timeframe candle opens are handled by a
-   * separate scheduled loop.
-   */
   startBoundaryScanLoop() {
     setImmediate(() => {
       this.runBoundaryScanLoop()
@@ -1051,10 +1118,10 @@ module.exports = {
           );
 
           /*
-           * This loop is intentionally not responsible for root-candle-open
-           * processing. Root TF open detection is handled by a dedicated
-           * root-candle-open scan. Here we only react to mid-candle flips,
-           * and only after the candle has already been recorded.
+           * Root candle-open detection is handled by the dedicated
+           * root-TF candle-open loop. This loop should ignore all
+           * newly opened candles that are already being processed
+           * by the root-open loop.
            */
           if (latestOpen > processedOpen) {
             logger.debug(
@@ -1070,34 +1137,63 @@ module.exports = {
             continue;
           }
 
-          /*
-           * Mid-candle flip detection.
-           */
-          const flip =
-            await macdUtil.isMacdFlip(
-              symbol,
-              tf
-            );
+          const midCandleStateKey =
+            `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
-          if (flip) {
-            const signal =
-              await signalManager.handleRootSignal({
+          const midCandleAlreadyReported =
+            dbModule.getState(midCandleStateKey);
+
+          if (!midCandleAlreadyReported) {
+            const midCandleFlip =
+              await detectMidCandleFlip(
                 symbol,
-                root_tf: tf,
-                detected_at: Date.now(),
-                candle_open_time: latestOpen,
-                notifyImmediately: false
-              });
+                tf
+              );
 
-            if (signal) {
-              newSignals.push(signal);
+            if (midCandleFlip) {
+              const eventId = buildEventId(
+                'midcandle',
+                symbol,
+                tf,
+                latestOpen
+              );
+
+              const signal =
+                await signalManager.handleRootSignal({
+                  symbol,
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  eventId,
+                  signalType: 'midcandle_update',
+                  notifyImmediately: false
+                });
+
+              if (signal) {
+                dbModule.setState(
+                  midCandleStateKey,
+                  Date.now()
+                );
+
+                newSignals.push({
+                  ...signal,
+                  eventId,
+                  notificationType: 'midcandle_update'
+                });
+
+                logger.info(
+                  {
+                    symbol,
+                    tf,
+                    latestOpen,
+                    eventId
+                  },
+                  'poller.loop2: mid-candle histogram flip detected'
+                );
+              }
             }
           }
 
-          /*
-           * Alignment checks are independent of flip detection and are
-           * used for monitored/active signals only.
-           */
           const latestSignals =
             dbModule.getLatestSignalsSnapshot();
 
@@ -1181,13 +1277,11 @@ module.exports = {
     }
 
     /*
-     * Loop 2 sends one block per new mid-candle signal and one block
-     * per alignment alert. It does not send a summary batch.
+     * Loop 2 sends one detail block per new mid-candle signal and one
+     * block per alignment alert. It does not send a summary batch.
      */
     for (const signal of newSignals) {
       try {
-        // FIXED: Enqueue as a midcandle update so the queue doesn't reject it 
-        // as a duplicate of the root candle open signal.
         notificationQueue.enqueueSignal(
           signal,
           'midcandle_update'
@@ -1245,11 +1339,6 @@ module.exports = {
     );
   },
 
-  /*
-   * Dedicated root TF candle-open scan.
-   * This is triggered when a root timeframe boundary opens, and sends
-   * the summary + per-signal + recommended block format.
-   */
   startRootTfCandleOpenLoop() {
     setImmediate(() => {
       this.runRootTfCandleOpenLoop()
@@ -1302,9 +1391,14 @@ module.exports = {
       const openingTfs = [];
 
       for (const [tf, boundaryMs] of Object.entries(nextSchedules)) {
-        // FIXED: Expanded the check window to catch slight timer inaccuracies. 
-        // Tolerates waking up up to 5 seconds early or up to 60 seconds late.
-        if (nowMs >= boundaryMs - 5000 && nowMs - boundaryMs < 60000) {
+        /*
+         * Catch slight scheduling drift. Wake up slightly early or
+         * a bit late and still treat the boundary as "open".
+         */
+        if (
+          nowMs >= boundaryMs - 5000 &&
+          nowMs - boundaryMs < 60000
+        ) {
           openingTfs.push(tf);
         }
       }
@@ -1389,7 +1483,6 @@ module.exports = {
             ) || 0
           );
 
-          // This is a true root TF candle open
           if (latestOpen > processedOpen) {
             const flip =
               await macdUtil.isMacdFlip(
@@ -1398,17 +1491,30 @@ module.exports = {
               );
 
             if (flip) {
+              const eventId = buildEventId(
+                'root_open',
+                symbol,
+                tf,
+                latestOpen
+              );
+
               const signal =
                 await signalManager.handleRootSignal({
                   symbol,
                   root_tf: tf,
                   detected_at: Date.now(),
                   candle_open_time: latestOpen,
+                  eventId,
+                  signalType: 'new_root_candle',
                   notifyImmediately: false
                 });
 
               if (signal) {
-                tfSignalMap[tf].push(signal);
+                tfSignalMap[tf].push({
+                  ...signal,
+                  eventId,
+                  notificationType: 'new_root_candle'
+                });
               }
             }
 
