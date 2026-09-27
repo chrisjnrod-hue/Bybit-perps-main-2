@@ -504,9 +504,9 @@ module.exports = {
       );
 
       const jobs = batch.map((item) => {
-        return limiter.schedule(() =>
-          this.seedKlinesForSymbol(item.symbol)
-        );
+        return limiter.schedule(() => {
+          return this.seedKlinesForSymbol(item.symbol);
+        });
       });
 
       try {
@@ -1282,18 +1282,32 @@ module.exports = {
      */
     for (const signal of newSignals) {
       try {
-        notificationQueue.enqueueSignal(
-          signal,
-          'midcandle_update'
-        );
+        const enqueued =
+          notificationQueue.enqueueSignal(
+            signal,
+            'midcandle_update'
+          );
 
-        logger.info(
-          {
-            symbol: signal.symbol,
-            root_tf: signal.root_tf
-          },
-          'poller.loop2: midcandle update enqueued'
-        );
+        if (!enqueued) {
+          logger.warn(
+            {
+              symbol: signal.symbol,
+              root_tf: signal.root_tf,
+              eventId: signal.eventId || null,
+              notificationType:
+                signal.notificationType || 'midcandle_update'
+            },
+            'poller.loop2: midcandle update was rejected by queue'
+          );
+        } else {
+          logger.info(
+            {
+              symbol: signal.symbol,
+              root_tf: signal.root_tf
+            },
+            'poller.loop2: midcandle update enqueued'
+          );
+        }
       } catch (err) {
         logger.warn(
           {
@@ -1307,18 +1321,31 @@ module.exports = {
 
     for (const alert of alignmentAlerts) {
       try {
-        notificationQueue.enqueueSignal(
-          alert,
-          'mtf_alignment'
-        );
+        const enqueued =
+          notificationQueue.enqueueSignal(
+            alert,
+            'mtf_alignment'
+          );
 
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf
-          },
-          'poller.loop2: realtime alignment alert enqueued'
-        );
+        if (!enqueued) {
+          logger.warn(
+            {
+              symbol: alert.symbol,
+              root_tf: alert.root_tf,
+              notificationType:
+                alert.notificationType || 'mtf_alignment'
+            },
+            'poller.loop2: alignment alert rejected by queue'
+          );
+        } else {
+          logger.info(
+            {
+              symbol: alert.symbol,
+              root_tf: alert.root_tf
+            },
+            'poller.loop2: realtime alignment alert enqueued'
+          );
+        }
       } catch (err) {
         logger.warn(
           {
@@ -1551,18 +1578,29 @@ module.exports = {
       }
 
       try {
-        notificationQueue.enqueueRootCandleOpenBatch(
-          signals,
-          tf
-        );
+        const enqueued =
+          notificationQueue.enqueueRootCandleOpenBatch(
+            signals,
+            tf
+          );
 
-        logger.info(
-          {
-            tf,
-            count: signals.length
-          },
-          'poller: root TF candle-open batch enqueued'
-        );
+        if (!enqueued) {
+          logger.warn(
+            {
+              tf,
+              count: signals.length
+            },
+            'poller: root TF candle-open batch rejected by queue'
+          );
+        } else {
+          logger.info(
+            {
+              tf,
+              count: signals.length
+            },
+            'poller: root TF candle-open batch enqueued'
+          );
+        }
       } catch (err) {
         logger.warn(
           {
