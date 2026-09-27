@@ -103,20 +103,11 @@ class NotificationQueue {
     this.sentSignalTimestamps = new Map();
   }
 
-  clearExpiredSignalCache(
-    ttlMs = SIGNAL_CACHE_TTL_MS
-  ) {
+  clearExpiredSignalCache(ttlMs = SIGNAL_CACHE_TTL_MS) {
     const now = Date.now();
 
-    for (
-      const [
-        signalId,
-        sentAt
-      ] of this.sentSignalTimestamps.entries()
-    ) {
-      if (
-        now - sentAt > ttlMs
-      ) {
+    for (const [signalId, sentAt] of this.sentSignalTimestamps.entries()) {
+      if (now - sentAt > ttlMs) {
         this.sentSignalIds.delete(signalId);
         this.sentSignalTimestamps.delete(signalId);
       }
@@ -130,10 +121,6 @@ class NotificationQueue {
       getSignalId(signal);
 
     if (!signalId) {
-      /*
-       * Signals without a stable identity are not safe to
-       * enqueue because they cannot be deduplicated reliably.
-       */
       return true;
     }
 
@@ -175,10 +162,7 @@ class NotificationQueue {
     this.pendingSignalIds.delete(signalId);
   }
 
-  normalizeSignal(
-    signal,
-    fallbackType = null
-  ) {
+  normalizeSignal(signal, fallbackType = null) {
     if (
       !signal ||
       !signal.symbol ||
@@ -232,10 +216,7 @@ class NotificationQueue {
     return nextSignal;
   }
 
-  enqueueSignal(
-    signal,
-    type = 'realtime'
-  ) {
+  enqueueSignal(signal, type = 'realtime') {
     if (
       !signal ||
       !signal.symbol ||
@@ -334,15 +315,7 @@ class NotificationQueue {
       return false;
     }
 
-    /*
-     * Startup summary is serialized by queue processing, so do not
-     * silently drop a valid batch just because another summary is
-     * flagged as in progress. Queueing sequentially is safe and
-     * preserves backpressure without losing work.
-     */
-    if (
-      this.startupSummaryInProgress
-    ) {
+    if (this.startupSummaryInProgress) {
       logger.info(
         'NotificationQueue: startup summary already in progress; queueing sequentially'
       );
@@ -369,14 +342,7 @@ class NotificationQueue {
       return false;
     }
 
-    /*
-     * Never silently drop a valid root-candle batch because the queue
-     * is already handling a prior summary. It will be processed in
-     * order and deduplicated by signal ID.
-     */
-    if (
-      this.rootCandleSummaryInProgress
-    ) {
+    if (this.rootCandleSummaryInProgress) {
       logger.info(
         'NotificationQueue: root candle summary already in progress; queueing sequentially'
       );
@@ -394,10 +360,7 @@ class NotificationQueue {
     });
   }
 
-  enqueueRootCandleOpenBatch(
-    signals,
-    tf = null
-  ) {
+  enqueueRootCandleOpenBatch(signals, tf = null) {
     if (!Array.isArray(signals)) {
       logger.warn(
         'NotificationQueue: invalid root candle open batch'
@@ -406,15 +369,7 @@ class NotificationQueue {
       return false;
     }
 
-    /*
-     * Do not reject valid root-open batches just because the summary
-     * flag is true. The queue is single-threaded, so every queued batch
-     * will execute in order. We only need deduplication, not early
-     * rejection.
-     */
-    if (
-      this.rootCandleSummaryInProgress
-    ) {
+    if (this.rootCandleSummaryInProgress) {
       logger.info(
         {
           tf
@@ -632,8 +587,7 @@ class NotificationQueue {
 
     try {
       while (this.queue.length > 0) {
-        const item =
-          this.queue.shift();
+        const item = this.queue.shift();
 
         logger.debug(
           {
@@ -808,10 +762,7 @@ class NotificationQueue {
     );
   }
 
-  async _processRootCandleOpenBatch(
-    signals,
-    tf = null
-  ) {
+  async _processRootCandleOpenBatch(signals, tf = null) {
     const telegram = require('./telegram');
 
     logger.info(
@@ -822,10 +773,6 @@ class NotificationQueue {
       'NotificationQueue: starting root TF candle-open batch flow'
     );
 
-    /*
-     * Prefer the dedicated method when available. The fallback keeps
-     * compatibility with the Telegram implementation supplied earlier.
-     */
     if (
       typeof telegram.sendRootCandleOpenSummary ===
       'function'
