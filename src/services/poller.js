@@ -1081,13 +1081,18 @@ module.exports = {
     for (const row of validRows) {
       const symbol = row.symbol;
 
+      try {
+        // Fetch all timeframes for the symbol ONCE before the loop
+        await this.seedKlinesForSymbol(symbol);
+      } catch (err) {
+        logger.debug(
+          { err, symbol },
+          'poller.loop2: failed to seed klines for symbol'
+        );
+      }
+
       for (const tf of rootTfs) {
         try {
-          await this.seedKlinesForSymbol(
-            symbol,
-            tf
-          );
-
           const latestOpen = getLatestOpenTime(
             db,
             symbol,
@@ -1480,13 +1485,18 @@ module.exports = {
     for (const row of validRows) {
       const symbol = row.symbol;
 
+      try {
+        // Fetch all timeframes for the symbol ONCE before the loop
+        await this.seedKlinesForSymbol(symbol);
+      } catch (err) {
+        logger.debug(
+          { err, symbol },
+          'poller: failed to seed klines for symbol on candle open'
+        );
+      }
+
       for (const tf of openingTfs) {
         try {
-          await this.seedKlinesForSymbol(
-            symbol,
-            tf
-          );
-
           const latestOpen = getLatestOpenTime(
             db,
             symbol,
