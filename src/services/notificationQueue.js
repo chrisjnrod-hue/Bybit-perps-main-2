@@ -334,14 +334,18 @@ class NotificationQueue {
       return false;
     }
 
+    /*
+     * Startup summary is serialized by queue processing, so do not
+     * silently drop a valid batch just because another summary is
+     * flagged as in progress. Queueing sequentially is safe and
+     * preserves backpressure without losing work.
+     */
     if (
       this.startupSummaryInProgress
     ) {
       logger.info(
-        'NotificationQueue: startup summary already in progress, skipping duplicate batch'
+        'NotificationQueue: startup summary already in progress; queueing sequentially'
       );
-
-      return false;
     }
 
     return this.enqueueSummaryBatch({
@@ -365,14 +369,17 @@ class NotificationQueue {
       return false;
     }
 
+    /*
+     * Never silently drop a valid root-candle batch because the queue
+     * is already handling a prior summary. It will be processed in
+     * order and deduplicated by signal ID.
+     */
     if (
       this.rootCandleSummaryInProgress
     ) {
       logger.info(
-        'NotificationQueue: root candle summary already in progress, skipping duplicate batch'
+        'NotificationQueue: root candle summary already in progress; queueing sequentially'
       );
-
-      return false;
     }
 
     return this.enqueueSummaryBatch({
@@ -399,6 +406,12 @@ class NotificationQueue {
       return false;
     }
 
+    /*
+     * Do not reject valid root-open batches just because the summary
+     * flag is true. The queue is single-threaded, so every queued batch
+     * will execute in order. We only need deduplication, not early
+     * rejection.
+     */
     if (
       this.rootCandleSummaryInProgress
     ) {
@@ -406,10 +419,8 @@ class NotificationQueue {
         {
           tf
         },
-        'NotificationQueue: root candle summary already in progress, skipping duplicate root-open batch'
+        'NotificationQueue: root candle summary already in progress; queueing root-open batch sequentially'
       );
-
-      return false;
     }
 
     const uniqueSignals = [];
