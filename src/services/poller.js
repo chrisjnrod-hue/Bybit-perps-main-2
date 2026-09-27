@@ -6,8 +6,6 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
-const marketData = require('./marketData');
-const tradingview = require('./tradingview');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -168,6 +166,23 @@ async function detectMidCandleFlip(symbol, timeframe) {
   try {
     if (
       macdUtil &&
+      typeof macdUtil.isMacdFlip === 'function'
+    ) {
+      return await macdUtil.isMacdFlip(
+        symbol,
+        timeframe
+      );
+    }
+  } catch (err) {
+    logger.debug(
+      { err, symbol, timeframe },
+      'poller: isMacdFlip mid-candle detection failed'
+    );
+  }
+
+  try {
+    if (
+      macdUtil &&
       typeof macdUtil.computeMacdHistogram === 'function'
     ) {
       const histogram = await macdUtil.computeMacdHistogram(
@@ -181,23 +196,6 @@ async function detectMidCandleFlip(symbol, timeframe) {
     logger.debug(
       { err, symbol, timeframe },
       'poller: computeMacdHistogram mid-candle detection failed'
-    );
-  }
-
-  try {
-    if (
-      macdUtil &&
-      typeof macdUtil.isMacdFlip === 'function'
-    ) {
-      return await macdUtil.isMacdFlip(
-        symbol,
-        timeframe
-      );
-    }
-  } catch (err) {
-    logger.debug(
-      { err, symbol, timeframe },
-      'poller: isMacdFlip fallback failed'
     );
   }
 
@@ -219,7 +217,6 @@ module.exports = {
       logger.debug(
         'poller.start: poller is already running'
       );
-
       return;
     }
 
@@ -228,7 +225,6 @@ module.exports = {
 
     try {
       signalManager.setOpenTradesAllowed(true);
-
       logger.info(
         'poller.start: open trades enabled'
       );
@@ -251,9 +247,7 @@ module.exports = {
   },
 
   async initialScan(options = {}) {
-    const {
-      seed = true
-    } = options;
+    const { seed = true } = options;
 
     logger.info(
       { seed },
@@ -289,7 +283,6 @@ module.exports = {
           logger.warn(
             'poller: WS initial scan returned no symbols; falling back to REST'
           );
-
           allSymbols = [];
         } else {
           logger.info(
@@ -302,7 +295,6 @@ module.exports = {
           { err },
           'poller: WS initial scan failed or timed out; falling back to REST'
         );
-
         allSymbols = [];
       }
     }
@@ -314,7 +306,6 @@ module.exports = {
       logger.info(
         'poller: fetching symbols via REST'
       );
-
       allSymbols = await bybit.fetchAllSymbols();
     }
 
@@ -325,7 +316,6 @@ module.exports = {
       logger.warn(
         'poller.initialScan: no symbols discovered'
       );
-
       return [];
     }
 
@@ -471,7 +461,6 @@ module.exports = {
       logger.info(
         'backgroundSeedKlines: nothing to seed'
       );
-
       return;
     }
 
@@ -494,9 +483,9 @@ module.exports = {
       );
 
       const jobs = batch.map((item) => {
-        return limiter.schedule(() => {
-          return this.seedKlinesForSymbol(item.symbol);
-        });
+        return limiter.schedule(() =>
+          this.seedKlinesForSymbol(item.symbol)
+        );
       });
 
       try {
@@ -527,7 +516,6 @@ module.exports = {
           { symbol },
           'seedKlinesForSymbol: invalid USDT symbol; skipping'
         );
-
         return;
       }
 
@@ -540,7 +528,6 @@ module.exports = {
           { symbol },
           'seedKlinesForSymbol: dated variant; skipping'
         );
-
         return;
       }
 
@@ -586,7 +573,6 @@ module.exports = {
               { symbol, tf },
               'seedKlinesForSymbol: no klines returned'
             );
-
             continue;
           }
 
@@ -691,7 +677,6 @@ module.exports = {
       logger.debug(
         'scanAllForStartup: startup scan already completed'
       );
-
       return [];
     }
 
@@ -716,8 +701,7 @@ module.exports = {
         isUsdtSymbol(row.symbol)
       );
 
-      const invalidCount =
-        rows.length - validRows.length;
+      const invalidCount = rows.length - validRows.length;
 
       if (invalidCount > 0) {
         logger.warn(
@@ -1010,7 +994,6 @@ module.exports = {
         logger.warn(
           'poller.loop2: previous boundary scan is still running; skipping boundary'
         );
-
         continue;
       }
 
@@ -1065,6 +1048,12 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
+    const MTF_ALIGNMENT_THRESHOLD = Number(
+      config.MTF_ALIGNMENT_RATING ||
+      config.MTF_ALIGNMENT_THRESHOLD ||
+      0.6
+    );
+
     for (const row of validRows) {
       const symbol = row.symbol;
 
@@ -1107,7 +1096,6 @@ module.exports = {
               },
               'poller.loop2: new root candle detected; handled separately by root-TF candle-open scanner'
             );
-
             continue;
           }
 
@@ -1188,27 +1176,26 @@ module.exports = {
               symbol
             );
 
-          const alignmentStateKey =
-            `poller.loop2.alignment.${symbol}.${tf}`;
+          const alignmentDecision =
+            await signalManager.applyDecision(
+              alignment
+            );
 
-          const previousAlignment =
+          const isAligned =
+            alignmentDecision &&
+            alignmentDecision.decision === 'accept';
+
+          const alignmentStateKey =
+            `poller.loop2.alignment.${symbol}`;
+
+          const previousAlignedState =
             dbModule.getState(
               alignmentStateKey
             );
 
-          const nextAlignmentJson =
-            JSON.stringify(alignment || {});
-
-          if (
-            previousAlignment === nextAlignmentJson
-          ) {
-            continue;
-          }
-
-          dbModule.setState(
-            alignmentStateKey,
-            alignment || {}
-          );
+          const previousAligned =
+            previousAlignedState === 'true' ||
+            previousAlignedState === true;
 
           const alignmentValues =
             Object.values(alignment || {});
@@ -1221,98 +1208,67 @@ module.exports = {
           const alignmentCount =
             alignmentValues.length;
 
-          const mtfAlignmentScore =
+          const mtfScore =
             alignmentCount > 0
               ? positiveCount / alignmentCount
               : 0;
 
-          let tvForAlert = {
-            score: 0,
-            source: 'error'
-          };
+          const shouldAlert =
+            isAligned &&
+            mtfScore >= MTF_ALIGNMENT_THRESHOLD &&
+            !previousAligned;
 
-          try {
-            const tvRes =
-              await tradingview.getOrFetchTvRatingCached(
-                symbol
-              );
-
-            if (
-              tvRes &&
-              typeof tvRes.score === 'number'
-            ) {
-              tvForAlert = {
-                score: tvRes.score,
-                source: tvRes.source || 'unknown'
-              };
-            }
-          } catch (err) {
-            logger.debug(
-              {
-                err,
-                symbol
-              },
-              'poller.loop2: TV rating fetch for alignment alert failed'
+          if (
+            !shouldAlert &&
+            previousAlignedState !== undefined
+          ) {
+            dbModule.setState(
+              alignmentStateKey,
+              String(isAligned)
             );
           }
 
-          let marketDataForAlert = null;
-
-          try {
-            marketDataForAlert =
-              await marketData.updateSymbolMarketData(
-                symbol
-              );
-          } catch (err) {
-            logger.debug(
-              {
-                err,
-                symbol
-              },
-              'poller.loop2: market data fetch for alignment alert failed'
+          if (shouldAlert) {
+            dbModule.setState(
+              alignmentStateKey,
+              String(true)
             );
-          }
 
-          const eventId = buildEventId(
-            'alignment',
-            symbol,
-            tf,
-            latestOpen
-          );
-
-          alignmentAlerts.push({
-            symbol,
-            root_tf: tf,
-            eventId,
-            detected_at: Date.now(),
-            candle_open_time: latestOpen,
-            notificationType: 'mtf_alignment',
-            state: 'monitor',
-            meta: {
-              alignment: alignment || {},
-              decision: 'monitor',
-              acceptReason: 'mtf_alignment_alert',
-              tvScore: tvForAlert.score || 0,
-              tvSource: tvForAlert.source || 'error',
-              mtfScore: mtfAlignmentScore,
-              marketData: marketDataForAlert || {
-                price: 0,
-                volume_24h_usdt: 0,
-                volume_change_pct: null,
-                market_cap: null
-              }
-            }
-          });
-
-          logger.info(
-            {
+            alignmentAlerts.push({
               symbol,
               root_tf: tf,
-              tvScore: tvForAlert.score || 0,
-              mtfScore: mtfAlignmentScore
-            },
-            'poller.loop2: MTF alignment alert created with full scoring'
-          );
+              detected_at: Date.now(),
+              state: 'monitor',
+              meta: {
+                alignment: alignment || {},
+                decision: 'monitor',
+                acceptReason: 'mtf_alignment_alert',
+                tvScore: 0,
+                tvSource: 'loop2',
+                mtfScore
+              }
+            });
+
+            logger.info(
+              {
+                symbol,
+                tf,
+                mtfScore: (mtfScore * 100).toFixed(0) + '%',
+                positiveCount,
+                alignmentCount
+              },
+              'poller.loop2: MTF alignment alert created'
+            );
+          } else if (
+            !shouldAlert &&
+            previousAlignedState === undefined
+          ) {
+            dbModule.setState(
+              alignmentStateKey,
+              String(false)
+            );
+          }
+
         } catch (err) {
           logger.debug(
             {
@@ -1328,85 +1284,55 @@ module.exports = {
 
     for (const signal of newSignals) {
       try {
-        const enqueued =
+        const queued =
           notificationQueue.enqueueSignal(
             signal,
             'midcandle_update'
           );
 
-        if (!enqueued) {
-          logger.warn(
-            {
-              symbol: signal.symbol,
-              root_tf: signal.root_tf,
-              eventId: signal.eventId || null,
-              tvScore: signal.meta?.tvScore || 0,
-              mtfScore: signal.meta?.mtfScore || 0,
-              notificationType: signal.notificationType || 'midcandle_update'
-            },
-            'poller.loop2: midcandle signal rejected by queue (duplicate or invalid)'
-          );
-        } else {
-          logger.info(
-            {
-              symbol: signal.symbol,
-              root_tf: signal.root_tf,
-              eventId: signal.eventId || null,
-              tvScore: signal.meta?.tvScore || 0,
-              mtfScore: signal.meta?.mtfScore || 0,
-              decision: signal.meta?.decision || 'monitor'
-            },
-            'poller.loop2: midcandle signal with full scoring enqueued to Telegram'
-          );
-        }
-      } catch (err) {
-        logger.error(
+        logger.info(
           {
-            err,
             symbol: signal.symbol,
             root_tf: signal.root_tf,
-            eventId: signal.eventId || null
+            queued
           },
-          'poller.loop2: failed to enqueue midcandle signal'
+          'poller.loop2: midcandle update enqueued'
+        );
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            signal
+          },
+          'poller.loop2: failed to enqueue midcandle update'
         );
       }
     }
 
     for (const alert of alignmentAlerts) {
       try {
-        const enqueued =
+        const queued =
           notificationQueue.enqueueSignal(
             alert,
             'mtf_alignment'
           );
 
-        if (!enqueued) {
-          logger.warn(
-            {
-              symbol: alert.symbol,
-              root_tf: alert.root_tf,
-              mtfScore: alert.meta?.mtfScore || 0,
-              notificationType: alert.notificationType || 'mtf_alignment'
-            },
-            'poller.loop2: alignment alert rejected by queue (duplicate or invalid)'
-          );
-        } else {
-          logger.info(
-            {
-              symbol: alert.symbol,
-              root_tf: alert.root_tf,
-              mtfScore: alert.meta?.mtfScore || 0,
-              decision: alert.meta?.decision || 'monitor'
-            },
-            'poller.loop2: MTF alignment alert with full scoring enqueued to Telegram'
-          );
-        }
+        logger.info(
+          {
+            symbol: alert.symbol,
+            root_tf: alert.root_tf,
+            queued,
+            mtfScore: (
+              alert.meta.mtfScore * 100
+            ).toFixed(0) + '%'
+          },
+          'poller.loop2: realtime alignment alert enqueued'
+        );
       } catch (err) {
-        logger.error(
+        logger.warn(
           {
             err,
-            symbol: alert.symbol,
-            root_tf: alert.root_tf
+            alert
           },
           'poller.loop2: failed to enqueue alignment alert'
         );
@@ -1415,8 +1341,8 @@ module.exports = {
 
     logger.info(
       {
-        midcandleSignalsQueued: newSignals.length,
-        alignmentAlertsQueued: alignmentAlerts.length
+        newSignals: newSignals.length,
+        alignmentAlerts: alignmentAlerts.length
       },
       'poller.loop2: exact five-minute boundary scan completed'
     );
@@ -1625,34 +1551,22 @@ module.exports = {
           },
           'poller: no root TF signals detected at candle open'
         );
-
         continue;
       }
 
       try {
-        const enqueued =
-          notificationQueue.enqueueRootCandleOpenBatch(
-            signals,
-            tf
-          );
+        notificationQueue.enqueueRootCandleOpenBatch(
+          signals,
+          tf
+        );
 
-        if (!enqueued) {
-          logger.warn(
-            {
-              tf,
-              count: signals.length
-            },
-            'poller: root TF candle-open batch rejected by queue'
-          );
-        } else {
-          logger.info(
-            {
-              tf,
-              count: signals.length
-            },
-            'poller: root TF candle-open batch enqueued'
-          );
-        }
+        logger.info(
+          {
+            tf,
+            count: signals.length
+          },
+          'poller: root TF candle-open batch enqueued'
+        );
       } catch (err) {
         logger.warn(
           {
