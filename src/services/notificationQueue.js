@@ -33,10 +33,6 @@ function getSignalId(signal) {
     return null;
   }
 
-  /*
-   * eventId is the strongest identity because poller/signalManager
-   * can distinguish root-open and mid-candle events explicitly.
-   */
   if (
     signal.eventId !== undefined &&
     signal.eventId !== null &&
@@ -81,14 +77,6 @@ function getSignalId(signal) {
   ].join('_');
 }
 
-function isSummaryItemType(type) {
-  return (
-    type === 'startup_batch' ||
-    type === 'root_candle_batch' ||
-    type === 'root_candle_open_batch'
-  );
-}
-
 class NotificationQueue {
   constructor() {
     this.queue = [];
@@ -103,11 +91,20 @@ class NotificationQueue {
     this.sentSignalTimestamps = new Map();
   }
 
-  clearExpiredSignalCache(ttlMs = SIGNAL_CACHE_TTL_MS) {
+  clearExpiredSignalCache(
+    ttlMs = SIGNAL_CACHE_TTL_MS
+  ) {
     const now = Date.now();
 
-    for (const [signalId, sentAt] of this.sentSignalTimestamps.entries()) {
-      if (now - sentAt > ttlMs) {
+    for (
+      const [
+        signalId,
+        sentAt
+      ] of this.sentSignalTimestamps.entries()
+    ) {
+      if (
+        now - sentAt > ttlMs
+      ) {
         this.sentSignalIds.delete(signalId);
         this.sentSignalTimestamps.delete(signalId);
       }
@@ -162,7 +159,10 @@ class NotificationQueue {
     this.pendingSignalIds.delete(signalId);
   }
 
-  normalizeSignal(signal, fallbackType = null) {
+  normalizeSignal(
+    signal,
+    fallbackType = null
+  ) {
     if (
       !signal ||
       !signal.symbol ||
@@ -216,7 +216,10 @@ class NotificationQueue {
     return nextSignal;
   }
 
-  enqueueSignal(signal, type = 'realtime') {
+  enqueueSignal(
+    signal,
+    type = 'realtime'
+  ) {
     if (
       !signal ||
       !signal.symbol ||
@@ -226,7 +229,6 @@ class NotificationQueue {
         { signal },
         'NotificationQueue: invalid signal, skipping'
       );
-
       return false;
     }
 
@@ -243,7 +245,6 @@ class NotificationQueue {
         { signal, type },
         'NotificationQueue: signal normalization failed'
       );
-
       return false;
     }
 
@@ -259,7 +260,6 @@ class NotificationQueue {
         },
         'NotificationQueue: signal has no stable ID, skipping'
       );
-
       return false;
     }
 
@@ -277,7 +277,6 @@ class NotificationQueue {
         },
         'NotificationQueue: duplicate signal, skipping'
       );
-
       return false;
     }
 
@@ -311,14 +310,16 @@ class NotificationQueue {
       logger.warn(
         'NotificationQueue: invalid startup batch'
       );
-
       return false;
     }
 
-    if (this.startupSummaryInProgress) {
+    if (
+      this.startupSummaryInProgress
+    ) {
       logger.info(
-        'NotificationQueue: startup summary already in progress; queueing sequentially'
+        'NotificationQueue: startup summary already in progress, skipping duplicate batch'
       );
+      return false;
     }
 
     return this.enqueueSummaryBatch({
@@ -338,14 +339,16 @@ class NotificationQueue {
       logger.warn(
         'NotificationQueue: invalid root candle batch'
       );
-
       return false;
     }
 
-    if (this.rootCandleSummaryInProgress) {
+    if (
+      this.rootCandleSummaryInProgress
+    ) {
       logger.info(
-        'NotificationQueue: root candle summary already in progress; queueing sequentially'
+        'NotificationQueue: root candle summary already in progress, skipping duplicate batch'
       );
+      return false;
     }
 
     return this.enqueueSummaryBatch({
@@ -360,22 +363,27 @@ class NotificationQueue {
     });
   }
 
-  enqueueRootCandleOpenBatch(signals, tf = null) {
+  enqueueRootCandleOpenBatch(
+    signals,
+    tf = null
+  ) {
     if (!Array.isArray(signals)) {
       logger.warn(
         'NotificationQueue: invalid root candle open batch'
       );
-
       return false;
     }
 
-    if (this.rootCandleSummaryInProgress) {
+    if (
+      this.rootCandleSummaryInProgress
+    ) {
       logger.info(
         {
           tf
         },
-        'NotificationQueue: root candle summary already in progress; queueing root-open batch sequentially'
+        'NotificationQueue: root candle summary already in progress, skipping duplicate root-open batch'
       );
+      return false;
     }
 
     const uniqueSignals = [];
@@ -418,7 +426,6 @@ class NotificationQueue {
           },
           'NotificationQueue: filtering duplicate root TF candle-open signal'
         );
-
         continue;
       }
 
@@ -436,7 +443,6 @@ class NotificationQueue {
         },
         'NotificationQueue: root TF candle-open batch contained no new signals'
       );
-
       return false;
     }
 
@@ -487,7 +493,6 @@ class NotificationQueue {
         },
         'NotificationQueue: invalid summary signals'
       );
-
       return false;
     }
 
@@ -521,7 +526,6 @@ class NotificationQueue {
           },
           `NotificationQueue: filtering duplicate ${logLabel} signal`
         );
-
         continue;
       }
 
@@ -539,7 +543,6 @@ class NotificationQueue {
         },
         `NotificationQueue: ${logLabel} batch contained no new signals`
       );
-
       return false;
     }
 
@@ -587,7 +590,8 @@ class NotificationQueue {
 
     try {
       while (this.queue.length > 0) {
-        const item = this.queue.shift();
+        const item =
+          this.queue.shift();
 
         logger.debug(
           {
@@ -605,7 +609,6 @@ class NotificationQueue {
             await this._processStartupBatch(
               item.signals
             );
-
             this.markBatchSent(item);
           } else if (
             item.type === 'root_candle_batch'
@@ -613,7 +616,6 @@ class NotificationQueue {
             await this._processRootCandleBatch(
               item.signals
             );
-
             this.markBatchSent(item);
           } else if (
             item.type === 'root_candle_open_batch'
@@ -622,7 +624,6 @@ class NotificationQueue {
               item.signals,
               item.tf
             );
-
             this.markBatchSent(item);
           } else if (
             item.type === 'realtime'
@@ -630,7 +631,6 @@ class NotificationQueue {
             await this._processRealtimeSignal(
               item.signal
             );
-
             this.markSignalSent(
               item.signalId
             );
@@ -640,7 +640,6 @@ class NotificationQueue {
             await this._processMtfAlignment(
               item.signal
             );
-
             this.markSignalSent(
               item.signalId
             );
@@ -650,7 +649,6 @@ class NotificationQueue {
             await this._processMidCandleUpdate(
               item.signal
             );
-
             this.markSignalSent(
               item.signalId
             );
@@ -660,7 +658,6 @@ class NotificationQueue {
             await this._processCandleUpdate(
               item.signal
             );
-
             this.markSignalSent(
               item.signalId
             );
@@ -727,6 +724,8 @@ class NotificationQueue {
   async _processStartupBatch(signals) {
     const telegram = require('./telegram');
 
+    telegram.init();
+
     logger.info(
       {
         count: signals.length
@@ -746,6 +745,8 @@ class NotificationQueue {
   async _processRootCandleBatch(signals) {
     const telegram = require('./telegram');
 
+    telegram.init();
+
     logger.info(
       {
         count: signals.length
@@ -762,8 +763,13 @@ class NotificationQueue {
     );
   }
 
-  async _processRootCandleOpenBatch(signals, tf = null) {
+  async _processRootCandleOpenBatch(
+    signals,
+    tf = null
+  ) {
     const telegram = require('./telegram');
+
+    telegram.init();
 
     logger.info(
       {
@@ -796,6 +802,8 @@ class NotificationQueue {
   async _processRealtimeSignal(signal) {
     const telegram = require('./telegram');
 
+    telegram.init();
+
     logger.debug(
       {
         symbol: signal.symbol,
@@ -823,6 +831,8 @@ class NotificationQueue {
 
   async _processMtfAlignment(signal) {
     const telegram = require('./telegram');
+
+    telegram.init();
 
     logger.debug(
       {
@@ -853,6 +863,8 @@ class NotificationQueue {
 
   async _processMidCandleUpdate(signal) {
     const telegram = require('./telegram');
+
+    telegram.init();
 
     logger.debug(
       {
