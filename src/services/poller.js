@@ -156,10 +156,8 @@ function calculateHistogramFlip(histogramRows = []) {
     return false;
   }
 
-  return (
-    (previousHistogram <= 0 && currentHistogram > 0) ||
-    (previousHistogram >= 0 && currentHistogram < 0)
-  );
+  // FIX #1: Only return POSITIVE flips (zero-cross into positive territory)
+  return (previousHistogram <= 0 && currentHistogram > 0);
 }
 
 async function detectMidCandleFlip(symbol, timeframe) {
@@ -209,6 +207,38 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
     String(timeframe || ''),
     Number(candleOpenTime) || 0
   ].join(':');
+}
+
+// FIX #2: Helper to validate MTF alignment consensus
+async function validateMtfAlignmentConsensus(symbol) {
+  const alignment = await signalManager.evaluateMtfAlignment(symbol);
+  
+  const alignmentValues = Object.values(alignment || {});
+  
+  if (alignmentValues.length === 0) {
+    return { isAligned: false, mtfScore: 0, reason: 'no_data' };
+  }
+
+  const positiveCount = alignmentValues.filter((value) => {
+    return value && value.positive === true;
+  }).length;
+
+  const mtfScore = positiveCount / alignmentValues.length;
+  
+  const threshold = Number(
+    config.MTF_ALIGNMENT_RATING || 0.6
+  );
+
+  const isAligned = mtfScore >= threshold;
+
+  return {
+    isAligned,
+    mtfScore,
+    positiveCount,
+    totalCount: alignmentValues.length,
+    alignment,
+    reason: isAligned ? 'threshold_met' : `only_${positiveCount}_of_${alignmentValues.length}`
+  };
 }
 
 module.exports = {
@@ -1048,12 +1078,6 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
-    const MTF_ALIGNMENT_THRESHOLD = Number(
-      config.MTF_ALIGNMENT_RATING ||
-      config.MTF_ALIGNMENT_THRESHOLD ||
-      0.6
-    );
-
     for (const row of validRows) {
       const symbol = row.symbol;
 
@@ -1112,7 +1136,30 @@ module.exports = {
                 tf
               );
 
+            // FIX #3: Only process flip if MTF is actually aligned
             if (midCandleFlip) {
+              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+
+              if (!mtfValidation.isAligned) {
+                logger.debug(
+                  {
+                    symbol,
+                    tf,
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                    reason: mtfValidation.reason
+                  },
+                  'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
+                );
+
+                // Mark as processed so we don't re-check this flip repeatedly
+                dbModule.setState(
+                  midCandleStateKey,
+                  Date.now()
+                );
+
+                continue;
+              }
+
               const eventId = buildEventId(
                 'midcandle',
                 symbol,
@@ -1148,9 +1195,10 @@ module.exports = {
                     symbol,
                     tf,
                     latestOpen,
-                    eventId
+                    eventId,
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                   },
-                  'poller.loop2: mid-candle histogram flip detected'
+                  'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
                 );
               }
             }
@@ -1171,19 +1219,8 @@ module.exports = {
             continue;
           }
 
-          const alignment =
-            await signalManager.evaluateMtfAlignment(
-              symbol
-            );
-
-          const alignmentDecision =
-            await signalManager.applyDecision(
-              alignment
-            );
-
-          const isAligned =
-            alignmentDecision &&
-            alignmentDecision.decision === 'accept';
+          // FIX #4: Validate MTF alignment before sending alert
+          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
           const alignmentStateKey =
             `poller.loop2.alignment.${symbol}`;
@@ -1197,36 +1234,9 @@ module.exports = {
             previousAlignedState === 'true' ||
             previousAlignedState === true;
 
-          const alignmentValues =
-            Object.values(alignment || {});
-
-          const positiveCount =
-            alignmentValues.filter((value) => {
-              return value && value.positive;
-            }).length;
-
-          const alignmentCount =
-            alignmentValues.length;
-
-          const mtfScore =
-            alignmentCount > 0
-              ? positiveCount / alignmentCount
-              : 0;
-
           const shouldAlert =
-            isAligned &&
-            mtfScore >= MTF_ALIGNMENT_THRESHOLD &&
+            mtfValidation.isAligned &&
             !previousAligned;
-
-          if (
-            !shouldAlert &&
-            previousAlignedState !== undefined
-          ) {
-            dbModule.setState(
-              alignmentStateKey,
-              String(isAligned)
-            );
-          }
 
           if (shouldAlert) {
             dbModule.setState(
@@ -1240,12 +1250,12 @@ module.exports = {
               detected_at: Date.now(),
               state: 'monitor',
               meta: {
-                alignment: alignment || {},
+                alignment: mtfValidation.alignment || {},
                 decision: 'monitor',
                 acceptReason: 'mtf_alignment_alert',
                 tvScore: 0,
                 tvSource: 'loop2',
-                mtfScore
+                mtfScore: mtfValidation.mtfScore
               }
             });
 
@@ -1253,19 +1263,30 @@ module.exports = {
               {
                 symbol,
                 tf,
-                mtfScore: (mtfScore * 100).toFixed(0) + '%',
-                positiveCount,
-                alignmentCount
+                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                positiveCount: mtfValidation.positiveCount,
+                totalCount: mtfValidation.totalCount
               },
-              'poller.loop2: MTF alignment alert created'
+              'poller.loop2: MTF alignment alert created (consensus met)'
             );
-          } else if (
-            !shouldAlert &&
-            previousAlignedState === undefined
-          ) {
+          } else if (!shouldAlert && previousAlignedState === undefined) {
             dbModule.setState(
               alignmentStateKey,
               String(false)
+            );
+          } else if (!mtfValidation.isAligned && previousAligned) {
+            // MTF dropped below threshold, reset state
+            dbModule.setState(
+              alignmentStateKey,
+              String(false)
+            );
+
+            logger.info(
+              {
+                symbol,
+                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+              },
+              'poller.loop2: MTF alignment dropped below threshold'
             );
           }
 
@@ -1299,12 +1320,12 @@ module.exports = {
           'poller.loop2: midcandle update enqueued'
         );
       } catch (err) {
-        logger.warn(
+        logger.error(
           {
             err,
             signal
           },
-          'poller.loop2: failed to enqueue midcandle update'
+          'poller.loop2: FAILED to enqueue midcandle update'
         );
       }
     }
@@ -1329,12 +1350,12 @@ module.exports = {
           'poller.loop2: realtime alignment alert enqueued'
         );
       } catch (err) {
-        logger.warn(
+        logger.error(
           {
             err,
             alert
           },
-          'poller.loop2: failed to enqueue alignment alert'
+          'poller.loop2: FAILED to enqueue alignment alert'
         );
       }
     }
