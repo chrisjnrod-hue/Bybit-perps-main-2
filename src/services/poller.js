@@ -6,6 +6,8 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
+const marketData = require('./marketData');
+const tradingview = require('./tradingview');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -79,10 +81,6 @@ function isUsdtSymbol(symbol) {
     return false;
   }
 
-  /*
-   * Exclude dated contracts and other symbols where characters follow
-   * the USDT suffix.
-   */
   if (/USDT[QHUZ0-9]/.test(value.slice(-6))) {
     return false;
   }
@@ -134,7 +132,6 @@ function getRootTfMs(tf) {
 function getNextTimeframeBoundaryMs(tf, nowMs = Date.now()) {
   const tfMs = getRootTfMs(tf);
 
-  // Align to a UTC-based interval boundary
   const epochStart = Date.UTC(1970, 0, 1);
   const alignedFloor = Math.floor(
     (nowMs - epochStart) / tfMs
@@ -217,13 +214,6 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
 }
 
 module.exports = {
-  /*
-   * Start only the recurring polling loop.
-   *
-   * Startup discovery, startup seeding, and the startup flip scan are
-   * deliberately owned by index.js. Do not run initialScan() or
-   * scanAllForStartup() here.
-   */
   start() {
     if (isRunning) {
       logger.debug(
@@ -645,11 +635,6 @@ module.exports = {
             'seedKlinesForSymbol: klines persisted'
           );
 
-          /*
-           * This repository currently exposes computeMacdHistogram()
-           * rather than computeAndStoreMacd(). Warm the calculation when
-           * available, but do not fail seeding if MACD warm-up fails.
-           */
           try {
             if (
               typeof macdUtil.computeAndStoreMacd ===
@@ -796,11 +781,6 @@ module.exports = {
         );
       }
 
-      /*
-       * The startup pass has already examined the latest available
-       * candle. Loop 2 must not treat that existing candle as new at
-       * the first five-minute boundary after deployment.
-       */
       this.initializeBoundaryCandleState(
         validRows,
         db
@@ -1117,12 +1097,6 @@ module.exports = {
             ) || 0
           );
 
-          /*
-           * Root candle-open detection is handled by the dedicated
-           * root-TF candle-open loop. This loop should ignore all
-           * newly opened candles that are already being processed
-           * by the root-open loop.
-           */
           if (latestOpen > processedOpen) {
             logger.debug(
               {
@@ -1247,22 +1221,98 @@ module.exports = {
           const alignmentCount =
             alignmentValues.length;
 
+          const mtfAlignmentScore =
+            alignmentCount > 0
+              ? positiveCount / alignmentCount
+              : 0;
+
+          let tvForAlert = {
+            score: 0,
+            source: 'error'
+          };
+
+          try {
+            const tvRes =
+              await tradingview.getOrFetchTvRatingCached(
+                symbol
+              );
+
+            if (
+              tvRes &&
+              typeof tvRes.score === 'number'
+            ) {
+              tvForAlert = {
+                score: tvRes.score,
+                source: tvRes.source || 'unknown'
+              };
+            }
+          } catch (err) {
+            logger.debug(
+              {
+                err,
+                symbol
+              },
+              'poller.loop2: TV rating fetch for alignment alert failed'
+            );
+          }
+
+          let marketDataForAlert = null;
+
+          try {
+            marketDataForAlert =
+              await marketData.updateSymbolMarketData(
+                symbol
+              );
+          } catch (err) {
+            logger.debug(
+              {
+                err,
+                symbol
+              },
+              'poller.loop2: market data fetch for alignment alert failed'
+            );
+          }
+
+          const eventId = buildEventId(
+            'alignment',
+            symbol,
+            tf,
+            latestOpen
+          );
+
           alignmentAlerts.push({
             symbol,
             root_tf: tf,
+            eventId,
             detected_at: Date.now(),
+            candle_open_time: latestOpen,
+            notificationType: 'mtf_alignment',
             state: 'monitor',
             meta: {
               alignment: alignment || {},
               decision: 'monitor',
               acceptReason: 'mtf_alignment_alert',
-              tvScore: 0,
-              tvSource: 'loop2',
-              mtfScore: alignmentCount > 0
-                ? positiveCount / alignmentCount
-                : 0
+              tvScore: tvForAlert.score || 0,
+              tvSource: tvForAlert.source || 'error',
+              mtfScore: mtfAlignmentScore,
+              marketData: marketDataForAlert || {
+                price: 0,
+                volume_24h_usdt: 0,
+                volume_change_pct: null,
+                market_cap: null
+              }
             }
           });
+
+          logger.info(
+            {
+              symbol,
+              root_tf: tf,
+              tvScore: tvForAlert.score || 0,
+              mtfScore: mtfAlignmentScore
+            },
+            'poller.loop2: MTF alignment alert created with full scoring'
+          );
         } catch (err) {
           logger.debug(
             {
@@ -1276,10 +1326,6 @@ module.exports = {
       }
     }
 
-    /*
-     * Loop 2 sends one detail block per new mid-candle signal and one
-     * block per alignment alert. It does not send a summary batch.
-     */
     for (const signal of newSignals) {
       try {
         const enqueued =
@@ -1294,27 +1340,34 @@ module.exports = {
               symbol: signal.symbol,
               root_tf: signal.root_tf,
               eventId: signal.eventId || null,
-              notificationType:
-                signal.notificationType || 'midcandle_update'
+              tvScore: signal.meta?.tvScore || 0,
+              mtfScore: signal.meta?.mtfScore || 0,
+              notificationType: signal.notificationType || 'midcandle_update'
             },
-            'poller.loop2: midcandle update was rejected by queue'
+            'poller.loop2: midcandle signal rejected by queue (duplicate or invalid)'
           );
         } else {
           logger.info(
             {
               symbol: signal.symbol,
-              root_tf: signal.root_tf
+              root_tf: signal.root_tf,
+              eventId: signal.eventId || null,
+              tvScore: signal.meta?.tvScore || 0,
+              mtfScore: signal.meta?.mtfScore || 0,
+              decision: signal.meta?.decision || 'monitor'
             },
-            'poller.loop2: midcandle update enqueued'
+            'poller.loop2: midcandle signal with full scoring enqueued to Telegram'
           );
         }
       } catch (err) {
-        logger.warn(
+        logger.error(
           {
             err,
-            signal
+            symbol: signal.symbol,
+            root_tf: signal.root_tf,
+            eventId: signal.eventId || null
           },
-          'poller.loop2: failed to enqueue midcandle update'
+          'poller.loop2: failed to enqueue midcandle signal'
         );
       }
     }
@@ -1332,25 +1385,28 @@ module.exports = {
             {
               symbol: alert.symbol,
               root_tf: alert.root_tf,
-              notificationType:
-                alert.notificationType || 'mtf_alignment'
+              mtfScore: alert.meta?.mtfScore || 0,
+              notificationType: alert.notificationType || 'mtf_alignment'
             },
-            'poller.loop2: alignment alert rejected by queue'
+            'poller.loop2: alignment alert rejected by queue (duplicate or invalid)'
           );
         } else {
           logger.info(
             {
               symbol: alert.symbol,
-              root_tf: alert.root_tf
+              root_tf: alert.root_tf,
+              mtfScore: alert.meta?.mtfScore || 0,
+              decision: alert.meta?.decision || 'monitor'
             },
-            'poller.loop2: realtime alignment alert enqueued'
+            'poller.loop2: MTF alignment alert with full scoring enqueued to Telegram'
           );
         }
       } catch (err) {
-        logger.warn(
+        logger.error(
           {
             err,
-            alert
+            symbol: alert.symbol,
+            root_tf: alert.root_tf
           },
           'poller.loop2: failed to enqueue alignment alert'
         );
@@ -1359,8 +1415,8 @@ module.exports = {
 
     logger.info(
       {
-        newSignals: newSignals.length,
-        alignmentAlerts: alignmentAlerts.length
+        midcandleSignalsQueued: newSignals.length,
+        alignmentAlertsQueued: alignmentAlerts.length
       },
       'poller.loop2: exact five-minute boundary scan completed'
     );
@@ -1418,10 +1474,6 @@ module.exports = {
       const openingTfs = [];
 
       for (const [tf, boundaryMs] of Object.entries(nextSchedules)) {
-        /*
-         * Catch slight scheduling drift. Wake up slightly early or
-         * a bit late and still treat the boundary as "open".
-         */
         if (
           nowMs >= boundaryMs - 5000 &&
           nowMs - boundaryMs < 60000
