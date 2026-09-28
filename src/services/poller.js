@@ -1076,18 +1076,21 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
+    // Batch seed klines concurrently for faster scanning
+    const pageSize = Number(config.PAGE_SIZE || 25);
+    for (let i = 0; i < validRows.length; i += pageSize) {
+      const page = validRows.slice(i, i + pageSize);
+      await Promise.all(
+        page.map((row) =>
+          this.seedKlinesForSymbol(row.symbol).catch((err) => {
+            logger.debug({ err, symbol: row.symbol }, 'poller.loop2: failed to seed klines');
+          })
+        )
+      );
+    }
+
     for (const row of validRows) {
       const symbol = row.symbol;
-
-      try {
-        // Fetch all timeframes for the symbol ONCE before the loop
-        await this.seedKlinesForSymbol(symbol);
-      } catch (err) {
-        logger.debug(
-          { err, symbol },
-          'poller.loop2: failed to seed klines for symbol'
-        );
-      }
 
       for (const tf of rootTfs) {
         try {
@@ -1133,80 +1136,84 @@ module.exports = {
             dbModule.getState(midCandleStateKey);
 
           if (!midCandleAlreadyReported) {
-            const midCandleFlip =
-              await detectMidCandleFlip(
-                symbol,
-                tf
-              );
+            // Check if signal already exists in root summary snapshot to prevent duplicate pushes
+            const latestSignalsSnapshot = dbModule.getLatestSignalsSnapshot() || [];
+            const isAlreadyInRootSummary = latestSignalsSnapshot.some(
+              (s) => s.symbol === symbol && s.root_tf === tf
+            );
 
-            if (midCandleFlip) {
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-              if (!mtfValidation.isAligned) {
-                logger.debug(
-                  {
-                    symbol,
-                    tf,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    reason: mtfValidation.reason
-                  },
-                  'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
-                );
-
-                dbModule.setState(
-                  midCandleStateKey,
-                  Date.now()
-                );
-
-                continue;
-              }
-
-              const eventId = buildEventId(
-                'midcandle',
-                symbol,
-                tf,
-                latestOpen
-              );
-
-              const signal =
-                await signalManager.handleRootSignal({
+            if (isAlreadyInRootSummary) {
+              dbModule.setState(midCandleStateKey, Date.now());
+            } else {
+              const midCandleFlip =
+                await detectMidCandleFlip(
                   symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  eventId,
-                  signalType: 'midcandle_update',
-                  notifyImmediately: true
-                });
-
-              if (signal) {
-                dbModule.setState(
-                  midCandleStateKey,
-                  Date.now()
+                  tf
                 );
 
-                newSignals.push({
-                  ...signal,
-                  eventId,
-                  notificationType: 'midcandle_update'
-                });
+              if (midCandleFlip) {
+                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                logger.info(
-                  {
+                if (!mtfValidation.isAligned) {
+                  logger.debug(
+                    {
+                      symbol,
+                      tf,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      reason: mtfValidation.reason
+                    },
+                    'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
+                  );
+                } else {
+                  const eventId = buildEventId(
+                    'midcandle',
                     symbol,
                     tf,
-                    latestOpen,
-                    eventId,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                  },
-                  'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
-                );
+                    latestOpen
+                  );
+
+                  const signal =
+                    await signalManager.handleRootSignal({
+                      symbol,
+                      root_tf: tf,
+                      detected_at: Date.now(),
+                      candle_open_time: latestOpen,
+                      eventId,
+                      signalType: 'midcandle_update',
+                      notifyImmediately: true
+                    });
+
+                  if (signal) {
+                    newSignals.push({
+                      ...signal,
+                      eventId,
+                      notificationType: 'midcandle_update'
+                    });
+
+                    logger.info(
+                      {
+                        symbol,
+                        tf,
+                        latestOpen,
+                        eventId,
+                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                      },
+                      'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
+                    );
+                  }
+                }
               }
+
+              // Always record midcandle state so it won't repeatedly re-evaluate on every 5m boundary
+              dbModule.setState(
+                midCandleStateKey,
+                Date.now()
+              );
             }
           }
 
           const latestSignals =
-            dbModule.getLatestSignalsSnapshot();
+            dbModule.getLatestSignalsSnapshot() || [];
 
           const activeSignals =
             latestSignals.filter((signal) => {
@@ -1220,6 +1227,7 @@ module.exports = {
             continue;
           }
 
+          const activeSignal = activeSignals[0];
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
           const alignmentStateKey =
@@ -1246,7 +1254,9 @@ module.exports = {
 
             const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
 
+            // Spread activeSignal so direction, close, open, and macd properties are present
             alignmentAlerts.push({
+              ...activeSignal,
               symbol,
               root_tf: tf,
               detected_at: Date.now(),
@@ -1255,6 +1265,7 @@ module.exports = {
               notificationType: 'mtf_alignment',  
               state: 'monitor',
               meta: {
+                ...(activeSignal.meta || {}),
                 alignment: mtfValidation.alignment || {},
                 decision: 'monitor',
                 acceptReason: 'mtf_alignment_alert',
@@ -1413,6 +1424,14 @@ module.exports = {
           nowMs + 60 * 60 * 1000;
       }
 
+      const dueTfs = [];
+      for (const tf of rootTfs) {
+        const next = getNextTimeframeBoundaryMs(tf, nowMs);
+        if (next === nextBoundaryMs) {
+          dueTfs.push(tf);
+        }
+      }
+
       const delay = Math.max(
         0,
         nextBoundaryMs - Date.now()
@@ -1423,7 +1442,8 @@ module.exports = {
           nextBoundaryMs: new Date(
             nextBoundaryMs
           ).toISOString(),
-          delayMs: delay
+          delayMs: delay,
+          dueTfs
         },
         'poller: waiting for next root TF candle-open boundary'
       );
@@ -1439,6 +1459,7 @@ module.exports = {
 
       try {
         await this.runRootTfCandleOpenOnce(
+          dueTfs.length > 0 ? dueTfs : buildRootTfs(),
           Date.now()
         );
       } catch (err) {
@@ -1452,22 +1473,24 @@ module.exports = {
     }
   },
 
-  async runRootTfCandleOpenOnce(nowMs) {
-    const rootTfs = buildRootTfs();
-    const tfsToProcess = [];
+  async runRootTfCandleOpenOnce(tfsInput, nowMs = Date.now()) {
+    let tfsToProcess = Array.isArray(tfsInput) ? tfsInput : [];
 
-    const epochStart = Date.UTC(1970, 0, 1);
+    if (tfsToProcess.length === 0) {
+      const rootTfs = buildRootTfs();
+      const epochStart = Date.UTC(1970, 0, 1);
 
-    for (const tf of rootTfs) {
-      const tfMs = getRootTfMs(tf);
+      for (const tf of rootTfs) {
+        const tfMs = getRootTfMs(tf);
 
-      const isBoundary =
-        Math.abs(
-          (nowMs - epochStart) % tfMs
-        ) < 5 * 60 * 1000;
+        const isBoundary =
+          Math.abs(
+            (nowMs - epochStart) % tfMs
+          ) < 5 * 60 * 1000;
 
-      if (isBoundary) {
-        tfsToProcess.push(tf);
+        if (isBoundary) {
+          tfsToProcess.push(tf);
+        }
       }
     }
 
@@ -1503,18 +1526,24 @@ module.exports = {
       tfSignalMap[tf] = [];
     }
 
+    // Concurrent batch seeding to speed up candle open scan
+    const pageSize = Number(config.PAGE_SIZE || 25);
+    for (let i = 0; i < validRows.length; i += pageSize) {
+      const page = validRows.slice(i, i + pageSize);
+      await Promise.all(
+        page.map((row) =>
+          this.seedKlinesForSymbol(row.symbol).catch((err) => {
+            logger.debug(
+              { err, symbol: row.symbol },
+              'poller: failed to seed klines for symbol at candle open'
+            );
+          })
+        )
+      );
+    }
+
     for (const row of validRows) {
       const symbol = row.symbol;
-      
-      try {
-        // Fetch all timeframes for the symbol ONCE before the loop
-        await this.seedKlinesForSymbol(symbol);
-      } catch (err) {
-        logger.debug(
-          { err, symbol },
-          'poller: failed to seed klines for symbol at candle open'
-        );
-      }
 
       for (const tf of tfsToProcess) {
         try {
@@ -1606,22 +1635,20 @@ module.exports = {
     }
 
     for (const tf of tfsToProcess) {
-      const signals = tfSignalMap[tf];
+      const signals = tfSignalMap[tf] || [];
 
-      if (signals && signals.length > 0) {
-        logger.info(
-          {
-            tf,
-            count: signals.length
-          },
-          'poller: enqueueing root TF candle open notification batch'
-        );
+      logger.info(
+        {
+          tf,
+          count: signals.length
+        },
+        'poller: enqueueing root TF candle open notification batch'
+      );
 
-        notificationQueue.enqueueRootCandleOpenBatch(
-          signals,
-          tf
-        );
-      }
+      notificationQueue.enqueueRootCandleOpenBatch(
+        signals,
+        tf
+      );
     }
   },
 
