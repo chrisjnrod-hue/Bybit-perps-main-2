@@ -156,7 +156,6 @@ function calculateHistogramFlip(histogramRows = []) {
     return false;
   }
 
-  // FIX #1: Only return POSITIVE flips (zero-cross into positive territory)
   return (previousHistogram <= 0 && currentHistogram > 0);
 }
 
@@ -209,7 +208,6 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
   ].join(':');
 }
 
-// FIX #2: Helper to validate MTF alignment consensus
 async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
   
@@ -1141,7 +1139,6 @@ module.exports = {
                 tf
               );
 
-            // FIX #3: Only process flip if MTF is actually aligned
             if (midCandleFlip) {
               const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1156,7 +1153,6 @@ module.exports = {
                   'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
                 );
 
-                // Mark as processed so we don't re-check this flip repeatedly
                 dbModule.setState(
                   midCandleStateKey,
                   Date.now()
@@ -1180,7 +1176,7 @@ module.exports = {
                   candle_open_time: latestOpen,
                   eventId,
                   signalType: 'midcandle_update',
-                  notifyImmediately: true
+                  notifyImmediately: false
                 });
 
               if (signal) {
@@ -1224,7 +1220,6 @@ module.exports = {
             continue;
           }
 
-          // FIX #4: Validate MTF alignment before sending alert
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
           const alignmentStateKey =
@@ -1249,10 +1244,15 @@ module.exports = {
               String(true)
             );
 
+            const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
+
             alignmentAlerts.push({
               symbol,
               root_tf: tf,
               detected_at: Date.now(),
+              eventId: alertEventId,              
+              signalType: 'mtf_alignment',        
+              notificationType: 'mtf_alignment',  
               state: 'monitor',
               meta: {
                 alignment: mtfValidation.alignment || {},
@@ -1280,7 +1280,6 @@ module.exports = {
               String(false)
             );
           } else if (!mtfValidation.isAligned && previousAligned) {
-            // MTF dropped below threshold, reset state
             dbModule.setState(
               alignmentStateKey,
               String(false)
@@ -1391,15 +1390,28 @@ module.exports = {
   async runRootTfCandleOpenLoop() {
     while (isRunning) {
       const rootTfs = buildRootTfs();
-      const nextSchedules = {};
+      const nowMs = Date.now();
+
+      let nextBoundaryMs = Infinity;
 
       for (const tf of rootTfs) {
-        nextSchedules[tf] = getNextTimeframeBoundaryMs(tf);
+        const next = getNextTimeframeBoundaryMs(
+          tf,
+          nowMs
+        );
+
+        if (next < nextBoundaryMs) {
+          nextBoundaryMs = next;
+        }
       }
 
-      const nextBoundaryMs = Math.min(
-        ...Object.values(nextSchedules)
-      );
+      if (!isFinite(nextBoundaryMs)) {
+        logger.warn(
+          'poller: next root TF boundary calculation failed; falling back to 1 hour'
+        );
+        nextBoundaryMs =
+          nowMs + 60 * 60 * 1000;
+      }
 
       const delay = Math.max(
         0,
@@ -1408,10 +1420,10 @@ module.exports = {
 
       logger.debug(
         {
-          nextBoundaryMs,
-          nextBoundary: new Date(nextBoundaryMs).toISOString(),
-          delayMs: delay,
-          timeframes: rootTfs
+          nextBoundaryMs: new Date(
+            nextBoundaryMs
+          ).toISOString(),
+          delayMs: delay
         },
         'poller: waiting for next root TF candle-open boundary'
       );
@@ -1422,43 +1434,52 @@ module.exports = {
         break;
       }
 
-      const nowMs = Date.now();
-      const openingTfs = [];
+      logger.debug('poller: waiting 15s for exchange kline generation...');
+      await sleep(15000);
 
-      for (const [tf, boundaryMs] of Object.entries(nextSchedules)) {
-        if (
-          nowMs >= boundaryMs - 5000 &&
-          nowMs - boundaryMs < 60000
-        ) {
-          openingTfs.push(tf);
-        }
-      }
-
-      if (openingTfs.length > 0) {
-        try {
-          await this.runRootTfCandleOpenOnce(openingTfs);
-        } catch (err) {
-          logger.error(
-            {
-              err
-            },
-            'poller: root TF candle open scan failed'
-          );
-        }
+      try {
+        await this.runRootTfCandleOpenOnce(
+          Date.now()
+        );
+      } catch (err) {
+        logger.error(
+          {
+            err
+          },
+          'poller: root TF candle open scan failed'
+        );
       }
     }
   },
 
-  async runRootTfCandleOpenOnce(openingTfs = []) {
-    if (!Array.isArray(openingTfs) || openingTfs.length === 0) {
+  async runRootTfCandleOpenOnce(nowMs) {
+    const rootTfs = buildRootTfs();
+    const tfsToProcess = [];
+
+    const epochStart = Date.UTC(1970, 0, 1);
+
+    for (const tf of rootTfs) {
+      const tfMs = getRootTfMs(tf);
+
+      const isBoundary =
+        Math.abs(
+          (nowMs - epochStart) % tfMs
+        ) < 5 * 60 * 1000;
+
+      if (isBoundary) {
+        tfsToProcess.push(tf);
+      }
+    }
+
+    if (tfsToProcess.length === 0) {
       return;
     }
 
     logger.info(
       {
-        timeframes: openingTfs
+        timeframes: tfsToProcess
       },
-      'poller: root TF candle-open scan started'
+      'poller: root TF candle open boundary reached'
     );
 
     const db = dbModule.get();
@@ -1478,24 +1499,24 @@ module.exports = {
     );
 
     const tfSignalMap = {};
-    for (const tf of openingTfs) {
+    for (const tf of tfsToProcess) {
       tfSignalMap[tf] = [];
     }
 
     for (const row of validRows) {
       const symbol = row.symbol;
-
+      
       try {
         // Fetch all timeframes for the symbol ONCE before the loop
         await this.seedKlinesForSymbol(symbol);
       } catch (err) {
         logger.debug(
           { err, symbol },
-          'poller: failed to seed klines for symbol on candle open'
+          'poller: failed to seed klines for symbol at candle open'
         );
       }
 
-      for (const tf of openingTfs) {
+      for (const tf of tfsToProcess) {
         try {
           const latestOpen = getLatestOpenTime(
             db,
@@ -1528,7 +1549,7 @@ module.exports = {
 
             if (flip) {
               const eventId = buildEventId(
-                'root_open',
+                'rootcandle',
                 symbol,
                 tf,
                 latestOpen
@@ -1541,7 +1562,7 @@ module.exports = {
                   detected_at: Date.now(),
                   candle_open_time: latestOpen,
                   eventId,
-                  signalType: 'new_root_candle',
+                  signalType: 'rootcandle_update',
                   notifyImmediately: false
                 });
 
@@ -1551,12 +1572,24 @@ module.exports = {
                   eventId,
                   notificationType: 'new_root_candle'
                 });
+                
+                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                dbModule.setState(midCandleStateKey, Date.now());
               }
             }
 
             dbModule.setState(
               processedStateKey,
               latestOpen
+            );
+
+            logger.debug(
+              {
+                symbol,
+                tf,
+                latestOpen
+              },
+              'poller: recorded processed root TF candle boundary'
             );
           }
         } catch (err) {
@@ -1566,51 +1599,38 @@ module.exports = {
               symbol,
               tf
             },
-            'poller: root TF candle-open scan failed for symbol/timeframe'
+            'poller: error processing new root TF candle'
           );
         }
       }
     }
 
-    for (const tf of openingTfs) {
-      const signals = tfSignalMap[tf] || [];
+    for (const tf of tfsToProcess) {
+      const signals = tfSignalMap[tf];
 
-      if (signals.length === 0) {
-        logger.info(
-          {
-            tf
-          },
-          'poller: no root TF signals detected at candle open'
-        );
-        continue;
-      }
-
-      try {
-        notificationQueue.enqueueRootCandleOpenBatch(
-          signals,
-          tf
-        );
-
+      if (signals && signals.length > 0) {
         logger.info(
           {
             tf,
             count: signals.length
           },
-          'poller: root TF candle-open batch enqueued'
+          'poller: enqueueing root TF candle open notification batch'
         );
-      } catch (err) {
-        logger.warn(
-          {
-            err,
-            tf
-          },
-          'poller: failed to enqueue root TF candle-open batch'
+
+        notificationQueue.enqueueRootCandleOpenBatch(
+          signals,
+          tf
         );
       }
     }
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
-    return `poller.loop2.lastRootOpen.${symbol}.${tf}`;
+    return `poller.loop2.processedCandle.${symbol}.${tf}`;
+  },
+
+  stop() {
+    isRunning = false;
+    logger.info('poller: stopping loops');
   }
 };
