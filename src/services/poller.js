@@ -1176,7 +1176,7 @@ module.exports = {
                   candle_open_time: latestOpen,
                   eventId,
                   signalType: 'midcandle_update',
-                  notifyImmediately: false
+                  notifyImmediately: true
                 });
 
               if (signal) {
