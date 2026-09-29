@@ -1201,14 +1201,14 @@ module.exports = {
                       'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
                     );
                   }
+
+                  // Only lock state after successfully processing an aligned flip
+                  dbModule.setState(
+                    midCandleStateKey,
+                    Date.now()
+                  );
                 }
               }
-
-              // Always record midcandle state so it won't repeatedly re-evaluate on every 5m boundary
-              dbModule.setState(
-                midCandleStateKey,
-                Date.now()
-              );
             }
           }
 
@@ -1230,8 +1230,9 @@ module.exports = {
           const activeSignal = activeSignals[0];
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
+          // Scoped with timeframe to prevent cross-TF alignment state overwrites
           const alignmentStateKey =
-            `poller.loop2.alignment.${symbol}`;
+            `poller.loop2.alignment.${symbol}.${tf}`;
 
           const previousAlignedState =
             dbModule.getState(
@@ -1254,7 +1255,6 @@ module.exports = {
 
             const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
 
-            // Spread activeSignal so direction, close, open, and macd properties are present
             alignmentAlerts.push({
               ...activeSignal,
               symbol,
@@ -1458,10 +1458,19 @@ module.exports = {
       await sleep(15000);
 
       try {
-        await this.runRootTfCandleOpenOnce(
-          dueTfs.length > 0 ? dueTfs : buildRootTfs(),
-          Date.now()
-        );
+        const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
+        
+        let scannedSuccess = false;
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          logger.info({ attempt, tfsToRun }, 'poller: executing root TF candle open scan pass');
+          
+          scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
+          
+          if (scannedSuccess || attempt === 3) break;
+          
+          logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 10 seconds...');
+          await sleep(10000);
+        }
       } catch (err) {
         logger.error(
           {
@@ -1495,7 +1504,7 @@ module.exports = {
     }
 
     if (tfsToProcess.length === 0) {
-      return;
+      return false;
     }
 
     logger.info(
@@ -1521,11 +1530,6 @@ module.exports = {
       isUsdtSymbol(row.symbol)
     );
 
-    const tfSignalMap = {};
-    for (const tf of tfsToProcess) {
-      tfSignalMap[tf] = [];
-    }
-
     // Concurrent batch seeding to speed up candle open scan
     const pageSize = Number(config.PAGE_SIZE || 25);
     for (let i = 0; i < validRows.length; i += pageSize) {
@@ -1541,6 +1545,9 @@ module.exports = {
         )
       );
     }
+
+    const allBoundarySignals = [];
+    let detectedNewCandles = false;
 
     for (const row of validRows) {
       const symbol = row.symbol;
@@ -1570,6 +1577,7 @@ module.exports = {
           );
 
           if (latestOpen > processedOpen) {
+            detectedNewCandles = true;
             const flip =
               await macdUtil.isMacdFlip(
                 symbol,
@@ -1577,33 +1585,42 @@ module.exports = {
               );
 
             if (flip) {
-              const eventId = buildEventId(
-                'rootcandle',
-                symbol,
-                tf,
-                latestOpen
-              );
+              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-              const signal =
-                await signalManager.handleRootSignal({
+              if (mtfValidation.isAligned) {
+                const eventId = buildEventId(
+                  'rootcandle',
                   symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  eventId,
-                  signalType: 'rootcandle_update',
-                  notifyImmediately: false
-                });
+                  tf,
+                  latestOpen
+                );
 
-              if (signal) {
-                tfSignalMap[tf].push({
-                  ...signal,
-                  eventId,
-                  notificationType: 'new_root_candle'
-                });
-                
-                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-                dbModule.setState(midCandleStateKey, Date.now());
+                const signal =
+                  await signalManager.handleRootSignal({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    candle_open_time: latestOpen,
+                    eventId,
+                    signalType: 'rootcandle_update',
+                    notifyImmediately: false
+                  });
+
+                if (signal) {
+                  allBoundarySignals.push({
+                    ...signal,
+                    eventId,
+                    notificationType: 'new_root_candle'
+                  });
+
+                  const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                  dbModule.setState(midCandleStateKey, Date.now());
+                }
+              } else {
+                logger.debug(
+                  { symbol, tf, reason: mtfValidation.reason },
+                  'poller: root flip detected but MTF consensus failed; skipping'
+                );
               }
             }
 
@@ -1634,22 +1651,19 @@ module.exports = {
       }
     }
 
-    for (const tf of tfsToProcess) {
-      const signals = tfSignalMap[tf] || [];
-
+    if (allBoundarySignals.length > 0) {
       logger.info(
         {
-          tf,
-          count: signals.length
+          count: allBoundarySignals.length,
+          timeframes: tfsToProcess
         },
-        'poller: enqueueing root TF candle open notification batch'
+        'poller: enqueueing root TF candle open notifications via startup batch format'
       );
 
-      notificationQueue.enqueueRootCandleOpenBatch(
-        signals,
-        tf
-      );
+      notificationQueue.enqueueStartupBatch(allBoundarySignals);
     }
+
+    return detectedNewCandles;
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
