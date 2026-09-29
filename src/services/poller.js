@@ -214,14 +214,15 @@ async function validateMtfAlignmentConsensus(symbol) {
   const alignmentValues = Object.values(alignment || {});
   
   if (alignmentValues.length === 0) {
-    return { isAligned: false, mtfScore: 0, reason: 'no_data' };
+    return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
   }
 
   const positiveCount = alignmentValues.filter((value) => {
     return value && value.positive === true;
   }).length;
 
-  const mtfScore = positiveCount / alignmentValues.length;
+  const totalCount = alignmentValues.length;
+  const mtfScore = positiveCount / totalCount;
   
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
@@ -233,9 +234,9 @@ async function validateMtfAlignmentConsensus(symbol) {
     isAligned,
     mtfScore,
     positiveCount,
-    totalCount: alignmentValues.length,
+    totalCount,
     alignment,
-    reason: isAligned ? 'threshold_met' : `only_${positiveCount}_of_${alignmentValues.length}`
+    reason: isAligned ? 'threshold_met' : `only_${positiveCount}_of_${totalCount}`
   };
 }
 
@@ -1049,12 +1050,8 @@ module.exports = {
       {
         boundary: boundary.toISOString()
       },
-      'poller.loop2: starting five-minute boundary scan (mid-candle detection)'
+      'poller.loop2: starting five-minute boundary scan (mid-candle detection via WS)'
     );
-
-    await this.initialScan({
-      seed: false
-    });
 
     const db = dbModule.get();
 
@@ -1076,18 +1073,8 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
-    // Batch seed klines concurrently for faster scanning
-    const pageSize = Number(config.PAGE_SIZE || 25);
-    for (let i = 0; i < validRows.length; i += pageSize) {
-      const page = validRows.slice(i, i + pageSize);
-      await Promise.all(
-        page.map((row) =>
-          this.seedKlinesForSymbol(row.symbol).catch((err) => {
-            logger.debug({ err, symbol: row.symbol }, 'poller.loop2: failed to seed klines');
-          })
-        )
-      );
-    }
+    // NOTE: REST seeding loop removed here. Data relies on real-time WebSocket feeds 
+    // updating the klines DB continuously to ensure instantaneous scan performance.
 
     for (const row of validRows) {
       const symbol = row.symbol;
@@ -1136,7 +1123,7 @@ module.exports = {
             dbModule.getState(midCandleStateKey);
 
           if (!midCandleAlreadyReported) {
-            // Check if signal already exists in root summary snapshot to prevent duplicate pushes
+            // Explicitly scan for new root signals NOT in summary snapshot list
             const latestSignalsSnapshot = dbModule.getLatestSignalsSnapshot() || [];
             const isAlreadyInRootSummary = latestSignalsSnapshot.some(
               (s) => s.symbol === symbol && s.root_tf === tf
@@ -1202,7 +1189,6 @@ module.exports = {
                     );
                   }
 
-                  // Only lock state after successfully processing an aligned flip
                   dbModule.setState(
                     midCandleStateKey,
                     Date.now()
@@ -1230,7 +1216,6 @@ module.exports = {
           const activeSignal = activeSignals[0];
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-          // Scoped with timeframe to prevent cross-TF alignment state overwrites
           const alignmentStateKey =
             `poller.loop2.alignment.${symbol}.${tf}`;
 
@@ -1243,8 +1228,13 @@ module.exports = {
             previousAlignedState === 'true' ||
             previousAlignedState === true;
 
+          // STRICT REQUIREMENT: MTF alignment alert triggers ONLY when ALL MTF timeframes are positive (100% positive)
+          const isAllPositive =
+            mtfValidation.totalCount > 0 &&
+            mtfValidation.positiveCount === mtfValidation.totalCount;
+
           const shouldAlert =
-            mtfValidation.isAligned &&
+            isAllPositive &&
             !previousAligned;
 
           if (shouldAlert) {
@@ -1283,14 +1273,9 @@ module.exports = {
                 positiveCount: mtfValidation.positiveCount,
                 totalCount: mtfValidation.totalCount
               },
-              'poller.loop2: MTF alignment alert created (consensus met)'
+              'poller.loop2: MTF alignment alert created (100% consensus met)'
             );
-          } else if (!shouldAlert && previousAlignedState === undefined) {
-            dbModule.setState(
-              alignmentStateKey,
-              String(false)
-            );
-          } else if (!mtfValidation.isAligned && previousAligned) {
+          } else if (!isAllPositive && previousAligned) {
             dbModule.setState(
               alignmentStateKey,
               String(false)
@@ -1299,9 +1284,15 @@ module.exports = {
             logger.info(
               {
                 symbol,
+                tf,
                 mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
               },
-              'poller.loop2: MTF alignment dropped below threshold'
+              'poller.loop2: MTF alignment dropped below 100%'
+            );
+          } else if (previousAlignedState === undefined) {
+            dbModule.setState(
+              alignmentStateKey,
+              String(false)
             );
           }
 
@@ -1448,14 +1439,15 @@ module.exports = {
         'poller: waiting for next root TF candle-open boundary'
       );
 
+      // Precision sleep until exact boundary
       await sleep(delay);
 
       if (!isRunning) {
         break;
       }
 
-      logger.debug('poller: waiting 15s for exchange kline generation...');
-      await sleep(15000);
+      // Minimal 1.5s grace period for WS kline stream sync instead of heavy 15s REST sleep
+      await sleep(1500);
 
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
@@ -1468,8 +1460,9 @@ module.exports = {
           
           if (scannedSuccess || attempt === 3) break;
           
-          logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 10 seconds...');
-          await sleep(10000);
+          // Fast 2-second retry loop to catch fast updates
+          logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 2 seconds...');
+          await sleep(2000);
         }
       } catch (err) {
         logger.error(
@@ -1529,22 +1522,6 @@ module.exports = {
     const validRows = rows.filter((row) =>
       isUsdtSymbol(row.symbol)
     );
-
-    // Concurrent batch seeding to speed up candle open scan
-    const pageSize = Number(config.PAGE_SIZE || 25);
-    for (let i = 0; i < validRows.length; i += pageSize) {
-      const page = validRows.slice(i, i + pageSize);
-      await Promise.all(
-        page.map((row) =>
-          this.seedKlinesForSymbol(row.symbol).catch((err) => {
-            logger.debug(
-              { err, symbol: row.symbol },
-              'poller: failed to seed klines for symbol at candle open'
-            );
-          })
-        )
-      );
-    }
 
     const allBoundarySignals = [];
     let detectedNewCandles = false;
