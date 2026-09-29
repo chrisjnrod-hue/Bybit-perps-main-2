@@ -1,6 +1,7 @@
 const WebSocket = require('ws');
 const EventEmitter = require('events');
 const config = require('../config');
+const dbModule = require('../db');
 const logger = require('pino')();
 
 function envBool(name, defaultValue = false) {
@@ -334,14 +335,8 @@ class WSManager extends EventEmitter {
         .slice(2)}`,
 
       symbols: new Set(),
-
-      // Topics waiting to be sent
       pendingTopics: new Set(),
-
-      // Topics currently being sent or waiting for server response
       inFlightTopics: new Set(),
-
-      // Topics confirmed as subscribed
       topics: new Set(),
 
       ready: false,
@@ -436,7 +431,6 @@ class WSManager extends EventEmitter {
         'bybitWs: connection closed'
       );
 
-      // Clear all topic state on close
       connection.pendingTopics.clear();
       connection.inFlightTopics.clear();
       connection.topics.clear();
@@ -515,8 +509,6 @@ class WSManager extends EventEmitter {
     );
 
     if (data && data.op === 'ping') {
-      // Bybit responds to client ping with {"success": true, "ret_msg": "pong", "op": "ping"}.
-      // Do not respond with {"op": "pong"} as Bybit will reject it with "error:invalid op".
       logger.debug(
         { connId: connection.id },
         'bybitWs: ping acknowledged by server'
@@ -557,7 +549,6 @@ class WSManager extends EventEmitter {
           'bybitWs: subscription/API error'
         );
 
-        // If subscription failed, move topics back to pending
         if (
           data.op === 'subscribe' &&
           Array.isArray(data.args)
@@ -634,6 +625,48 @@ class WSManager extends EventEmitter {
       this.klineBuffer
         .get(symbol)
         .set(timeframe, kline);
+
+      // Save real-time WebSocket kline directly into SQLite database
+      try {
+        const db = dbModule.get();
+
+        if (db) {
+          db.prepare(
+            `
+              INSERT OR REPLACE INTO klines
+                (
+                  symbol,
+                  timeframe,
+                  open_time,
+                  open,
+                  high,
+                  low,
+                  close,
+                  volume
+                )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `
+          ).run(
+            kline.symbol,
+            kline.timeframe,
+            kline.open_time,
+            kline.open,
+            kline.high,
+            kline.low,
+            kline.close,
+            kline.volume
+          );
+        }
+      } catch (err) {
+        logger.debug(
+          {
+            err: err && err.message ? err.message : String(err),
+            symbol,
+            timeframe
+          },
+          'bybitWs: failed to save ws kline to db'
+        );
+      }
 
       this.emit('kline', {
         ...kline,
@@ -714,7 +747,6 @@ class WSManager extends EventEmitter {
       return;
     }
 
-    // Mark topics as in-flight before sending
     for (const topic of sendableTopics) {
       connection.inFlightTopics.add(topic);
       connection.pendingTopics.delete(topic);
@@ -762,7 +794,6 @@ class WSManager extends EventEmitter {
             return;
           }
 
-          // ws.send callback confirms frame was written, not server ack
           if (operation === 'subscribe') {
             for (const topic of sendableTopics) {
               connection.topics.add(topic);
