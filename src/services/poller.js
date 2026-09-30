@@ -1,5 +1,6 @@
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
+const bybitWs = require('./bybitWs');
 const config = require('../config');
 const logger = require('pino')();
 const Bottleneck = require('bottleneck');
@@ -42,6 +43,10 @@ function normalizeRootTf(tf) {
 
   if (value === '1H' || value === 'H') {
     return '60';
+  }
+
+  if (value === '4H') {
+    return '240';
   }
 
   return value;
@@ -264,6 +269,23 @@ module.exports = {
       );
     }
 
+    if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
+      try {
+        bybitWs.start();
+        const db = dbModule.get();
+        if (db) {
+          const rows = db.prepare('SELECT symbol FROM symbols').all();
+          if (rows && rows.length > 0) {
+            const symbols = rows.map((r) => r.symbol).filter(isUsdtSymbol);
+            const count = bybitWs.subscribeSymbols(symbols);
+            logger.info({ count }, 'poller.start: subscribed symbols to WS stream');
+          }
+        }
+      } catch (err) {
+        logger.warn({ err }, 'poller.start: failed to initialize WS stream');
+      }
+    }
+
     this.startBoundaryScanLoop();
     logger.info(
       'poller.start: boundary scan loop started'
@@ -382,22 +404,33 @@ module.exports = {
       }
     });
 
-    insertMany(
-      allSymbols.filter((symbolInfo) =>
-        symbolInfo &&
-        symbolInfo.symbol
-      )
+    const validSymbols = allSymbols.filter((symbolInfo) =>
+      symbolInfo &&
+      symbolInfo.symbol &&
+      isUsdtSymbol(symbolInfo.symbol)
     );
+
+    insertMany(validSymbols);
 
     logger.info(
       {
-        total: allSymbols.length
+        total: validSymbols.length
       },
       'poller.initialScan: symbols persisted'
     );
 
+    if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
+      try {
+        bybitWs.start();
+        const subCount = bybitWs.subscribeSymbols(validSymbols);
+        logger.info({ subCount }, 'poller.initialScan: subscribed symbols to WS stream');
+      } catch (err) {
+        logger.warn({ err }, 'poller.initialScan: WS subscription error');
+      }
+    }
+
     const seedSymbols =
-      bybit.getSeedSymbols(allSymbols);
+      bybit.getSeedSymbols(validSymbols);
 
     if (
       seedSymbols &&
@@ -454,19 +487,17 @@ module.exports = {
       );
     }
 
-    return allSymbols;
+    return validSymbols;
   },
 
   async performWsInitialScan() {
     try {
-      const wsManager = require('./bybitWs');
-
       if (
-        wsManager &&
-        typeof wsManager.performInitialScan === 'function'
+        bybitWs &&
+        typeof bybitWs.performInitialScan === 'function'
       ) {
         const result =
-          await wsManager.performInitialScan();
+          await bybitWs.performInitialScan();
 
         return Array.isArray(result)
           ? result
@@ -1073,16 +1104,24 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
+    // Retrieve active summary signals snapshot ONCE per pass
+    const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
+
     for (const row of validRows) {
       const symbol = row.symbol;
 
       for (const tf of rootTfs) {
         try {
-          const latestOpen = getLatestOpenTime(
+          let latestOpen = getLatestOpenTime(
             db,
             symbol,
             tf
           );
+
+          if (latestOpen === null) {
+            await this.seedKlinesForSymbol(symbol, tf);
+            latestOpen = getLatestOpenTime(db, symbol, tf);
+          }
 
           if (latestOpen === null) {
             continue;
@@ -1113,175 +1152,172 @@ module.exports = {
             continue;
           }
 
-          const midCandleStateKey =
-            `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+          const activeSignals = latestSignals.filter((signal) => {
+            return (
+              signal.symbol === symbol &&
+              normalizeRootTf(signal.root_tf) === tf
+            );
+          });
 
-          const midCandleAlreadyReported =
-            dbModule.getState(midCandleStateKey);
+          const isAlreadyInSummary = activeSignals.length > 0;
 
-          if (!midCandleAlreadyReported) {
-            const midCandleFlip =
-              await detectMidCandleFlip(
-                symbol,
-                tf
-              );
+          if (!isAlreadyInSummary) {
+            // SYMBOL NOT IN SUMMARY LIST: Scan for NEW mid-candle root flip
+            const midCandleStateKey =
+              `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
-            if (midCandleFlip) {
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            const midCandleAlreadyReported =
+              dbModule.getState(midCandleStateKey);
 
-              if (!mtfValidation.isAligned) {
-                logger.debug(
-                  {
-                    symbol,
-                    tf,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    reason: mtfValidation.reason
-                  },
-                  'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
-                );
-              } else {
-                const eventId = buildEventId(
-                  'midcandle',
+            if (!midCandleAlreadyReported) {
+              const midCandleFlip =
+                await detectMidCandleFlip(
                   symbol,
-                  tf,
-                  latestOpen
+                  tf
                 );
 
-                const signal =
-                  await signalManager.handleRootSignal({
-                    symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    candle_open_time: latestOpen,
-                    eventId,
-                    signalType: 'midcandle_update',
-                    notifyImmediately: true
-                  });
+              if (midCandleFlip) {
+                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                if (signal) {
-                  newSignals.push({
-                    ...signal,
-                    eventId,
-                    notificationType: 'midcandle_update'
-                  });
-
-                  logger.info(
+                if (!mtfValidation.isAligned) {
+                  logger.debug(
                     {
                       symbol,
                       tf,
-                      latestOpen,
-                      eventId,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      reason: mtfValidation.reason
                     },
-                    'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
+                    'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
+                  );
+                } else {
+                  const eventId = buildEventId(
+                    'midcandle',
+                    symbol,
+                    tf,
+                    latestOpen
+                  );
+
+                  const signal =
+                    await signalManager.handleRootSignal({
+                      symbol,
+                      root_tf: tf,
+                      detected_at: Date.now(),
+                      candle_open_time: latestOpen,
+                      eventId,
+                      signalType: 'midcandle_update',
+                      notifyImmediately: true
+                    });
+
+                  if (signal) {
+                    newSignals.push({
+                      ...signal,
+                      eventId,
+                      notificationType: 'midcandle_update'
+                    });
+
+                    logger.info(
+                      {
+                        symbol,
+                        tf,
+                        latestOpen,
+                        eventId,
+                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                      },
+                      'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned)'
+                    );
+                  }
+
+                  dbModule.setState(
+                    midCandleStateKey,
+                    Date.now()
                   );
                 }
-
-                dbModule.setState(
-                  midCandleStateKey,
-                  Date.now()
-                );
               }
             }
-          }
+          } else {
+            // SYMBOL ALREADY IN SUMMARY LIST: Only evaluate MTF alignment consensus changes
+            const activeSignal = activeSignals[0];
+            const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-          const latestSignals =
-            dbModule.getLatestSignalsSnapshot() || [];
+            const alignmentStateKey =
+              `poller.loop2.alignment.${symbol}.${tf}`;
 
-          const activeSignals =
-            latestSignals.filter((signal) => {
-              return (
-                signal.symbol === symbol &&
-                signal.root_tf === tf
+            const previousAlignedState =
+              dbModule.getState(
+                alignmentStateKey
               );
-            });
 
-          if (activeSignals.length === 0) {
-            continue;
-          }
+            const previousAligned =
+              previousAlignedState === 'true' ||
+              previousAlignedState === true;
 
-          const activeSignal = activeSignals[0];
-          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            const isAllPositive =
+              mtfValidation.totalCount > 0 &&
+              mtfValidation.positiveCount === mtfValidation.totalCount;
 
-          const alignmentStateKey =
-            `poller.loop2.alignment.${symbol}.${tf}`;
+            const shouldAlert =
+              isAllPositive &&
+              !previousAligned;
 
-          const previousAlignedState =
-            dbModule.getState(
-              alignmentStateKey
-            );
+            if (shouldAlert) {
+              dbModule.setState(
+                alignmentStateKey,
+                String(true)
+              );
 
-          const previousAligned =
-            previousAlignedState === 'true' ||
-            previousAlignedState === true;
+              const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
 
-          const isAllPositive =
-            mtfValidation.totalCount > 0 &&
-            mtfValidation.positiveCount === mtfValidation.totalCount;
-
-          const shouldAlert =
-            isAllPositive &&
-            !previousAligned;
-
-          if (shouldAlert) {
-            dbModule.setState(
-              alignmentStateKey,
-              String(true)
-            );
-
-            const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
-
-            alignmentAlerts.push({
-              ...activeSignal,
-              symbol,
-              root_tf: tf,
-              detected_at: Date.now(),
-              eventId: alertEventId,              
-              signalType: 'mtf_alignment',        
-              notificationType: 'mtf_alignment',  
-              state: 'monitor',
-              meta: {
-                ...(activeSignal.meta || {}),
-                alignment: mtfValidation.alignment || {},
-                decision: 'monitor',
-                acceptReason: 'mtf_alignment_alert',
-                tvScore: 0,
-                tvSource: 'loop2',
-                mtfScore: mtfValidation.mtfScore
-              }
-            });
-
-            logger.info(
-              {
+              alignmentAlerts.push({
+                ...activeSignal,
                 symbol,
-                tf,
-                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                positiveCount: mtfValidation.positiveCount,
-                totalCount: mtfValidation.totalCount
-              },
-              'poller.loop2: MTF alignment alert created (100% consensus met)'
-            );
-          } else if (!isAllPositive && previousAligned) {
-            dbModule.setState(
-              alignmentStateKey,
-              String(false)
-            );
+                root_tf: tf,
+                detected_at: Date.now(),
+                eventId: alertEventId,              
+                signalType: 'mtf_alignment',        
+                notificationType: 'mtf_alignment',  
+                state: 'monitor',
+                meta: {
+                  ...(activeSignal.meta || {}),
+                  alignment: mtfValidation.alignment || {},
+                  decision: 'monitor',
+                  acceptReason: 'mtf_alignment_alert',
+                  tvScore: 0,
+                  tvSource: 'loop2',
+                  mtfScore: mtfValidation.mtfScore
+                }
+              });
 
-            logger.info(
-              {
-                symbol,
-                tf,
-                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-              },
-              'poller.loop2: MTF alignment dropped below 100%'
-            );
-          } else if (previousAlignedState === undefined) {
-            dbModule.setState(
-              alignmentStateKey,
-              String(false)
-            );
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                  positiveCount: mtfValidation.positiveCount,
+                  totalCount: mtfValidation.totalCount
+                },
+                'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+              );
+            } else if (!isAllPositive && previousAligned) {
+              dbModule.setState(
+                alignmentStateKey,
+                String(false)
+              );
+
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                },
+                'poller.loop2: MTF alignment dropped below 100%'
+              );
+            } else if (previousAlignedState === undefined) {
+              dbModule.setState(
+                alignmentStateKey,
+                String(false)
+              );
+            }
           }
-
         } catch (err) {
           logger.debug(
             {
