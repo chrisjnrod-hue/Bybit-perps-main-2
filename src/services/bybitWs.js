@@ -73,6 +73,10 @@ function normalizeTimeframe(timeframe) {
     return '60';
   }
 
+  if (value === '4H') {
+    return '240';
+  }
+
   if (value === '1D') {
     return 'D';
   }
@@ -626,7 +630,6 @@ class WSManager extends EventEmitter {
         .get(symbol)
         .set(timeframe, kline);
 
-      // Save real-time WebSocket kline directly into SQLite database
       try {
         const db = dbModule.get();
 
@@ -1056,16 +1059,28 @@ class WSManager extends EventEmitter {
   }
 
   async performInitialScan() {
-    return Array.from(this.symbolToConn.keys())
-      .filter(validateSymbol)
-      .map((symbol) => ({
+    const existing = Array.from(this.symbolToConn.keys()).filter(validateSymbol);
+    if (existing.length > 0) {
+      return existing.map((symbol) => ({
         symbol,
-        base: symbol.replace(
-          /USDT(\.P)?$/i,
-          ''
-        ),
+        base: symbol.replace(/USDT(\.P)?$/i, ''),
         quote: 'USDT'
       }));
+    }
+
+    try {
+      const bybitRest = require('./bybitRest');
+      if (bybitRest && typeof bybitRest.fetchAllSymbols === 'function') {
+        const symbols = await bybitRest.fetchAllSymbols();
+        return Array.isArray(symbols)
+          ? symbols.filter((s) => s && validateSymbol(s.symbol))
+          : [];
+      }
+    } catch (err) {
+      logger.debug({ err }, 'bybitWs: performInitialScan fallback fetch failed');
+    }
+
+    return [];
   }
 
   async closeAll() {
