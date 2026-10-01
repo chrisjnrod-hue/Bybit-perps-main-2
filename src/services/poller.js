@@ -1101,6 +1101,7 @@ module.exports = {
     );
 
     const rootTfs = buildRootTfs();
+    const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
     const newSignals = [];
     const alignmentAlerts = [];
 
@@ -1177,67 +1178,67 @@ module.exports = {
                 );
 
               if (midCandleFlip) {
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+                // Issue #2 Fix: Midcandle scans are placed directly into active monitoring state
+                // regardless of MTF alignment status. MTF scoring relates only to trade execution.
+                const eventId = buildEventId(
+                  'midcandle',
+                  symbol,
+                  tf,
+                  latestOpen
+                );
 
-                if (!mtfValidation.isAligned) {
-                  logger.debug(
+                const signal =
+                  await signalManager.handleRootSignal({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    candle_open_time: latestOpen,
+                    eventId,
+                    signalType: 'midcandle_update',
+                    notifyImmediately: true
+                  });
+
+                if (signal) {
+                  newSignals.push({
+                    ...signal,
+                    eventId,
+                    notificationType: 'midcandle_update'
+                  });
+
+                  logger.info(
                     {
                       symbol,
                       tf,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      reason: mtfValidation.reason
+                      latestOpen,
+                      eventId,
+                      mtfScore: (signal.meta?.mtfScore ? (signal.meta.mtfScore * 100).toFixed(0) : '0') + '%'
                     },
-                    'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
-                  );
-                } else {
-                  const eventId = buildEventId(
-                    'midcandle',
-                    symbol,
-                    tf,
-                    latestOpen
-                  );
-
-                  const signal =
-                    await signalManager.handleRootSignal({
-                      symbol,
-                      root_tf: tf,
-                      detected_at: Date.now(),
-                      candle_open_time: latestOpen,
-                      eventId,
-                      signalType: 'midcandle_update',
-                      notifyImmediately: true
-                    });
-
-                  if (signal) {
-                    newSignals.push({
-                      ...signal,
-                      eventId,
-                      notificationType: 'midcandle_update'
-                    });
-
-                    logger.info(
-                      {
-                        symbol,
-                        tf,
-                        latestOpen,
-                        eventId,
-                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                      },
-                      'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned)'
-                    );
-                  }
-
-                  dbModule.setState(
-                    midCandleStateKey,
-                    Date.now()
+                    'poller.loop2: mid-candle histogram flip detected for new root signal (added to active monitoring list)'
                   );
                 }
+
+                dbModule.setState(
+                  midCandleStateKey,
+                  Date.now()
+                );
               }
             }
           } else {
-            // SYMBOL ALREADY IN SUMMARY LIST: Only evaluate MTF alignment consensus changes
+            // SYMBOL ALREADY IN SUMMARY LIST: Evaluate MTF consensus & deduplicate alignment alerts
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+
+            const isAllPositive =
+              mtfValidation.totalCount > 0 &&
+              mtfValidation.positiveCount === mtfValidation.totalCount;
+
+            // Issue #1 Fix: Build a distinct MTF flip/candle open time fingerprint signature across MTF timeframes
+            const mtfSigParts = [];
+            for (const mtfTf of mtfTfs) {
+              const mtfOpen = getLatestOpenTime(db, symbol, mtfTf) || 0;
+              mtfSigParts.push(`${mtfTf}:${mtfOpen}`);
+            }
+            const currentMtfSignature = mtfSigParts.join('|');
 
             const alignmentStateKey =
               `poller.loop2.alignment.${symbol}.${tf}`;
@@ -1247,22 +1248,15 @@ module.exports = {
                 alignmentStateKey
               );
 
-            const previousAligned =
-              previousAlignedState === 'true' ||
-              previousAlignedState === true;
-
-            const isAllPositive =
-              mtfValidation.totalCount > 0 &&
-              mtfValidation.positiveCount === mtfValidation.totalCount;
-
+            // Alert only if 100% consensus is met AND a new MTF candle/histogram flip signature occurs
             const shouldAlert =
               isAllPositive &&
-              !previousAligned;
+              previousAlignedState !== currentMtfSignature;
 
             if (shouldAlert) {
               dbModule.setState(
                 alignmentStateKey,
-                String(true)
+                currentMtfSignature
               );
 
               const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
@@ -1281,8 +1275,8 @@ module.exports = {
                   alignment: mtfValidation.alignment || {},
                   decision: 'monitor',
                   acceptReason: 'mtf_alignment_alert',
-                  tvScore: 0,
-                  tvSource: 'loop2',
+                  tvScore: activeSignal.meta?.tvScore || 0,
+                  tvSource: activeSignal.meta?.tvSource || 'loop2',
                   mtfScore: mtfValidation.mtfScore
                 }
               });
@@ -1293,14 +1287,15 @@ module.exports = {
                   tf,
                   mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
                   positiveCount: mtfValidation.positiveCount,
-                  totalCount: mtfValidation.totalCount
+                  totalCount: mtfValidation.totalCount,
+                  signature: currentMtfSignature
                 },
-                'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+                'poller.loop2: MTF alignment alert created for active signal (100% consensus flip verified)'
               );
-            } else if (!isAllPositive && previousAligned) {
+            } else if (!isAllPositive && previousAlignedState !== 'false') {
               dbModule.setState(
                 alignmentStateKey,
-                String(false)
+                'false'
               );
 
               logger.info(
@@ -1310,11 +1305,6 @@ module.exports = {
                   mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                 },
                 'poller.loop2: MTF alignment dropped below 100%'
-              );
-            } else if (previousAlignedState === undefined) {
-              dbModule.setState(
-                alignmentStateKey,
-                String(false)
               );
             }
           }
@@ -1583,42 +1573,35 @@ module.exports = {
               );
 
             if (flip) {
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+              // Issue #3 Fix: Do not gate root candle open flips on MTF alignment.
+              // Record all root TF signals to DB & monitoring state.
+              const eventId = buildEventId(
+                'rootcandle',
+                symbol,
+                tf,
+                latestOpen
+              );
 
-              if (mtfValidation.isAligned) {
-                const eventId = buildEventId(
-                  'rootcandle',
+              const signal =
+                await signalManager.handleRootSignal({
                   symbol,
-                  tf,
-                  latestOpen
-                );
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  eventId,
+                  signalType: 'new_root_candle',
+                  notifyImmediately: false
+                });
 
-                const signal =
-                  await signalManager.handleRootSignal({
-                    symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    candle_open_time: latestOpen,
-                    eventId,
-                    signalType: 'rootcandle_update',
-                    notifyImmediately: false
-                  });
+              if (signal) {
+                allBoundarySignals.push({
+                  ...signal,
+                  eventId,
+                  notificationType: 'new_root_candle'
+                });
 
-                if (signal) {
-                  allBoundarySignals.push({
-                    ...signal,
-                    eventId,
-                    notificationType: 'new_root_candle'
-                  });
-
-                  const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-                  dbModule.setState(midCandleStateKey, Date.now());
-                }
-              } else {
-                logger.debug(
-                  { symbol, tf, reason: mtfValidation.reason },
-                  'poller: root flip detected but MTF consensus failed; skipping'
-                );
+                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                dbModule.setState(midCandleStateKey, Date.now());
               }
             }
 
@@ -1650,15 +1633,33 @@ module.exports = {
     }
 
     if (allBoundarySignals.length > 0) {
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
-        },
-        'poller: enqueueing root TF candle open notifications via startup batch format'
-      );
+      // Issue #3 Fix: Group boundary signals by open root TF and enqueue summary + per block + recommended
+      const signalsByTf = {};
+      for (const sig of allBoundarySignals) {
+        const sigTf = String(sig.root_tf || 'unknown');
+        if (!signalsByTf[sigTf]) {
+          signalsByTf[sigTf] = [];
+        }
+        signalsByTf[sigTf].push(sig);
+      }
 
-      notificationQueue.enqueueStartupBatch(allBoundarySignals);
+      for (const [sigTf, tfSignals] of Object.entries(signalsByTf)) {
+        logger.info(
+          {
+            count: tfSignals.length,
+            timeframe: sigTf
+          },
+          'poller: enqueueing new root candle summary batch for open TF'
+        );
+
+        if (typeof notificationQueue.enqueueRootCandleBatch === 'function') {
+          notificationQueue.enqueueRootCandleBatch(tfSignals, sigTf);
+        } else if (typeof notificationQueue.enqueueRootCandleSummary === 'function') {
+          notificationQueue.enqueueRootCandleSummary(tfSignals, sigTf);
+        } else {
+          notificationQueue.enqueueStartupBatch(tfSignals);
+        }
+      }
     }
 
     return detectedNewCandles;
