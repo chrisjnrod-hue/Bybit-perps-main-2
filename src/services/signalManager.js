@@ -20,13 +20,7 @@ function setOpenTradesAllowed(value) {
 
 /*
  * This lock only prevents the same event from being processed
- * concurrently. It must not use only symbol:root_tf because a symbol
- * can legitimately produce:
- *
- *   root_open:BTCUSDT:60:candle
- *   midcandle:BTCUSDT:60:candle
- *
- * during the same root candle.
+ * concurrently.
  */
 const inProgress = new Map();
 
@@ -233,28 +227,9 @@ module.exports = {
       const mtfScore =
         calculateMtfScore(alignment);
 
-      let decision;
-
-      if (
-        normalizedSignalType ===
-        'midcandle_update'
-      ) {
-        decision =
-          mtfScore > 0.5
-            ? {
-                decision: 'accept',
-                reason:
-                  'midcandle_positive_alignment'
-              }
-            : {
-                decision: 'monitor',
-                reason:
-                  'midcandle_requires_alignment'
-              };
-      } else {
-        decision =
-          await this.applyDecision(alignment);
-      }
+      // Decision is standard for all signals (midcandle or root) based on MTF alignment
+      const decision =
+        await this.applyDecision(alignment);
 
       const meta = {
         tvScore: tv.score || 0,
@@ -328,6 +303,7 @@ module.exports = {
         );
       }
 
+      // Trade opening is restricted strictly to signals that achieve decision 'accept' (100% MTF alignment)
       if (
         decision &&
         decision.decision === 'accept'
