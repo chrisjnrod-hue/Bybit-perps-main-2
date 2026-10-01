@@ -7,6 +7,8 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
+const telegram = require('./telegram');
+const tradeManager = require('./tradeManager');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -1179,9 +1181,6 @@ module.exports = {
                 );
 
               if (midCandleFlip) {
-                // Mid-candle signals enforce strict 100% consensus alignment
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
-
                 const eventId = buildEventId(
                   'midcandle',
                   symbol,
@@ -1189,6 +1188,7 @@ module.exports = {
                   latestOpen
                 );
 
+                // Mid-candle signals are recorded regardless of MTF alignment score
                 const signal =
                   await signalManager.handleRootSignal({
                     symbol,
@@ -1197,8 +1197,7 @@ module.exports = {
                     candle_open_time: latestOpen,
                     eventId,
                     signalType: 'midcandle_update',
-                    notifyImmediately: true,
-                    mtfValidation
+                    notifyImmediately: true
                   });
 
                 if (signal) {
@@ -1208,15 +1207,17 @@ module.exports = {
                     notificationType: 'midcandle_update'
                   });
 
-                  logger.info(
-                    {
-                      symbol,
-                      tf,
-                      latestOpen,
-                      eventId,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                    },
-                    'poller.loop2: mid-candle histogram flip detected for new root signal'
+                  // Track initial alignment state for this candle
+                  const alignmentStateKey =
+                    `poller.loop2.alignment.${symbol}.${tf}.${latestOpen}`;
+
+                  const isAligned =
+                    signal.meta?.decision === 'accept' ||
+                    signal.meta?.mtfScore === 1.0;
+
+                  dbModule.setState(
+                    alignmentStateKey,
+                    String(isAligned)
                   );
                 }
 
@@ -1227,7 +1228,7 @@ module.exports = {
               }
             }
           } else {
-            // SYMBOL ALREADY IN SUMMARY LIST: Evaluate MTF alignment consensus changes per candle
+            // SYMBOL ALREADY IN SUMMARY LIST: Evaluate MTF alignment consensus changes
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
 
@@ -1240,13 +1241,14 @@ module.exports = {
               );
 
             const previousAligned =
-              previousAlignedState === 'true' ||
-              previousAlignedState === true;
+              previousAlignedState === 'true';
 
             const isAllPositive = mtfValidation.isAligned;
 
+            // Alert ONLY on transition from explicit false -> true
             const shouldAlert =
               isAllPositive &&
+              previousAlignedState !== undefined &&
               !previousAligned;
 
             if (shouldAlert) {
@@ -1257,7 +1259,7 @@ module.exports = {
 
               const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
 
-              alignmentAlerts.push({
+              const alertSignal = {
                 ...activeSignal,
                 symbol,
                 root_tf: tf,
@@ -1269,13 +1271,34 @@ module.exports = {
                 meta: {
                   ...(activeSignal.meta || {}),
                   alignment: mtfValidation.alignment || {},
-                  decision: 'monitor',
+                  decision: 'accept',
                   acceptReason: 'mtf_alignment_alert',
-                  tvScore: 0,
-                  tvSource: 'loop2',
+                  tvScore: activeSignal.meta?.tvScore || 0,
+                  tvSource: activeSignal.meta?.tvSource || 'loop2',
                   mtfScore: mtfValidation.mtfScore
                 }
-              });
+              };
+
+              alignmentAlerts.push(alertSignal);
+
+              // Execute trade opening now that 100% alignment criteria is reached
+              if (config.OPENTRADE) {
+                try {
+                  await tradeManager.openTrade({
+                    symbol,
+                    root_tf: tf,
+                    alignment: mtfValidation.alignment,
+                    meta: alertSignal.meta,
+                    eventId: alertEventId,
+                    signalType: 'mtf_alignment'
+                  });
+                } catch (err) {
+                  logger.error(
+                    { err, symbol },
+                    'poller.loop2: openTrade on MTF alert failed'
+                  );
+                }
+              }
 
               logger.info(
                 {
@@ -1301,10 +1324,13 @@ module.exports = {
                 },
                 'poller.loop2: MTF alignment dropped below 100%'
               );
-            } else if (previousAlignedState === undefined) {
+            } else if (
+              previousAlignedState === undefined ||
+              previousAlignedState === null
+            ) {
               dbModule.setState(
                 alignmentStateKey,
-                String(false)
+                String(isAllPositive)
               );
             }
           }
@@ -1451,7 +1477,6 @@ module.exports = {
       // Buffer 1.5s past boundary to allow new candles to form
       await sleep(1500);
 
-      // Re-evaluate due timeframes AT wake-up boundary time
       const currentMs = Date.now();
       const epochStart = Date.UTC(1970, 0, 1);
       const dueTfs = [];
@@ -1566,7 +1591,6 @@ module.exports = {
             ) || 0
           );
 
-          // REST Fallback: If WS hasn't streamed the new candle open_time yet, fetch via REST
           if (latestOpen === null || latestOpen <= processedOpen) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
@@ -1586,7 +1610,6 @@ module.exports = {
             const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
 
             if (isAlreadyInSummary) {
-              // Refresh root candle open summary update for active summary signals
               const activeSignal = activeSignals[0];
               const eventId = buildEventId(
                 'rootcandle',
@@ -1604,7 +1627,7 @@ module.exports = {
                   candle_open_time: latestOpen,
                   eventId,
                   signalType: 'rootcandle_update',
-                  notifyImmediately: true,
+                  notifyImmediately: false,
                   mtfValidation
                 });
 
@@ -1616,7 +1639,6 @@ module.exports = {
                 });
               }
             } else {
-              // Check for new MACD flip on new candle open
               const flip =
                 await macdUtil.isMacdFlip(
                   symbol,
@@ -1639,7 +1661,7 @@ module.exports = {
                     candle_open_time: latestOpen,
                     eventId,
                     signalType: 'rootcandle_update',
-                    notifyImmediately: true,
+                    notifyImmediately: false,
                     mtfValidation
                   });
 
@@ -1683,34 +1705,27 @@ module.exports = {
       }
     }
 
-    if (allBoundarySignals.length > 0) {
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
-        },
-        'poller: enqueueing root TF candle open notifications'
+    // Triggers Telegram summary + per-block + recommended list for each relevant open TF
+    for (const tf of tfsToProcess) {
+      const tfSignals = allBoundarySignals.filter(
+        (s) => String(s.root_tf) === String(tf)
       );
 
-      for (const signal of allBoundarySignals) {
+      if (tfSignals.length > 0) {
         try {
-          const queued = notificationQueue.enqueueSignal(
-            signal,
-            'new_root_candle'
+          logger.info(
+            { tf, count: tfSignals.length },
+            'poller: sending root candle open summary to Telegram'
           );
 
-          logger.info(
-            {
-              symbol: signal.symbol,
-              root_tf: signal.root_tf,
-              queued
-            },
-            'poller: new root candle update enqueued'
-          );
+          await telegram.sendRootCandleOpenSummary({
+            snapshot: tfSignals,
+            tf
+          });
         } catch (err) {
           logger.error(
-            { err, signal },
-            'poller: FAILED to enqueue new root candle update'
+            { err, tf },
+            'poller: failed to send root candle open summary via Telegram'
           );
         }
       }
