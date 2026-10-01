@@ -213,7 +213,7 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
   ].join(':');
 }
 
-async function validateMtfAlignmentConsensus(symbol) {
+async function validateMtfAlignmentConsensus(symbol, requireFullAlignment = true) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
   
   const alignmentValues = Object.values(alignment || {});
@@ -230,10 +230,12 @@ async function validateMtfAlignmentConsensus(symbol) {
   const mtfScore = positiveCount / totalCount;
   
   const threshold = Number(
-    config.MTF_ALIGNMENT_RATING || 0.6
+    config.MTF_ALIGNMENT_RATING || 1.0
   );
 
-  const isAligned = mtfScore >= threshold;
+  const isAligned = requireFullAlignment
+    ? (totalCount > 0 && positiveCount === totalCount)
+    : (mtfScore >= threshold);
 
   return {
     isAligned,
@@ -1177,7 +1179,8 @@ module.exports = {
                 );
 
               if (midCandleFlip) {
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+                // Mid-candle signals enforce strict 100% consensus alignment
+                const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
 
                 const eventId = buildEventId(
                   'midcandle',
@@ -1226,7 +1229,7 @@ module.exports = {
           } else {
             // SYMBOL ALREADY IN SUMMARY LIST: Evaluate MTF alignment consensus changes per candle
             const activeSignal = activeSignals[0];
-            const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
 
             const alignmentStateKey =
               `poller.loop2.alignment.${symbol}.${tf}.${latestOpen}`;
@@ -1240,9 +1243,7 @@ module.exports = {
               previousAlignedState === 'true' ||
               previousAlignedState === true;
 
-            const isAllPositive =
-              mtfValidation.totalCount > 0 &&
-              mtfValidation.positiveCount === mtfValidation.totalCount;
+            const isAllPositive = mtfValidation.isAligned;
 
             const shouldAlert =
               isAllPositive &&
@@ -1426,14 +1427,6 @@ module.exports = {
           nowMs + 60 * 60 * 1000;
       }
 
-      const dueTfs = [];
-      for (const tf of rootTfs) {
-        const next = getNextTimeframeBoundaryMs(tf, nowMs);
-        if (next === nextBoundaryMs) {
-          dueTfs.push(tf);
-        }
-      }
-
       const delay = Math.max(
         0,
         nextBoundaryMs - Date.now()
@@ -1444,8 +1437,7 @@ module.exports = {
           nextBoundaryMs: new Date(
             nextBoundaryMs
           ).toISOString(),
-          delayMs: delay,
-          dueTfs
+          delayMs: delay
         },
         'poller: waiting for next root TF candle-open boundary'
       );
@@ -1456,7 +1448,21 @@ module.exports = {
         break;
       }
 
+      // Buffer 1.5s past boundary to allow new candles to form
       await sleep(1500);
+
+      // Re-evaluate due timeframes AT wake-up boundary time
+      const currentMs = Date.now();
+      const epochStart = Date.UTC(1970, 0, 1);
+      const dueTfs = [];
+
+      for (const tf of rootTfs) {
+        const tfMs = getRootTfMs(tf);
+        const isBoundary = Math.abs((currentMs - epochStart) % tfMs) < 5 * 60 * 1000;
+        if (isBoundary) {
+          dueTfs.push(tf);
+        }
+      }
 
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
@@ -1534,6 +1540,9 @@ module.exports = {
     const allBoundarySignals = [];
     let detectedNewCandles = false;
 
+    // Retrieve active signals snapshot to refresh existing active summary blocks
+    const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
+
     for (const row of validRows) {
       const symbol = row.symbol;
 
@@ -1565,15 +1574,20 @@ module.exports = {
 
           if (latestOpen !== null && latestOpen > processedOpen) {
             detectedNewCandles = true;
-            const flip =
-              await macdUtil.isMacdFlip(
-                symbol,
-                tf
+
+            const activeSignals = latestSignals.filter((signal) => {
+              return (
+                signal.symbol === symbol &&
+                normalizeRootTf(signal.root_tf) === tf
               );
+            });
 
-            if (flip) {
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            const isAlreadyInSummary = activeSignals.length > 0;
+            const mtfValidation = await validateMtfAlignmentConsensus(symbol, true);
 
+            if (isAlreadyInSummary) {
+              // Refresh root candle open summary update for active summary signals
+              const activeSignal = activeSignals[0];
               const eventId = buildEventId(
                 'rootcandle',
                 symbol,
@@ -1583,6 +1597,7 @@ module.exports = {
 
               const signal =
                 await signalManager.handleRootSignal({
+                  ...activeSignal,
                   symbol,
                   root_tf: tf,
                   detected_at: Date.now(),
@@ -1599,9 +1614,45 @@ module.exports = {
                   eventId,
                   notificationType: 'new_root_candle'
                 });
+              }
+            } else {
+              // Check for new MACD flip on new candle open
+              const flip =
+                await macdUtil.isMacdFlip(
+                  symbol,
+                  tf
+                );
 
-                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-                dbModule.setState(midCandleStateKey, Date.now());
+              if (flip) {
+                const eventId = buildEventId(
+                  'rootcandle',
+                  symbol,
+                  tf,
+                  latestOpen
+                );
+
+                const signal =
+                  await signalManager.handleRootSignal({
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    candle_open_time: latestOpen,
+                    eventId,
+                    signalType: 'rootcandle_update',
+                    notifyImmediately: true,
+                    mtfValidation
+                  });
+
+                if (signal) {
+                  allBoundarySignals.push({
+                    ...signal,
+                    eventId,
+                    notificationType: 'new_root_candle'
+                  });
+
+                  const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                  dbModule.setState(midCandleStateKey, Date.now());
+                }
               }
             }
 
