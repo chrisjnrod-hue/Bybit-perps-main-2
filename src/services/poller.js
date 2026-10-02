@@ -7,6 +7,7 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
+const telegramNotifier = require('./telegramNotifier');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -215,9 +216,9 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
 
 async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
-  
+
   const alignmentValues = Object.values(alignment || {});
-  
+
   if (alignmentValues.length === 0) {
     return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
   }
@@ -228,7 +229,7 @@ async function validateMtfAlignmentConsensus(symbol) {
 
   const totalCount = alignmentValues.length;
   const mtfScore = positiveCount / totalCount;
-  
+
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
   );
@@ -243,6 +244,163 @@ async function validateMtfAlignmentConsensus(symbol) {
     alignment,
     reason: isAligned ? 'threshold_met' : `only_${positiveCount}_of_${totalCount}`
   };
+}
+
+async function getLatestOpenTimeFromWs(symbol, timeframe) {
+  try {
+    if (
+      bybitWs &&
+      typeof bybitWs.getLatestKline === 'function'
+    ) {
+      const kline = await bybitWs.getLatestKline(symbol, timeframe);
+
+      if (kline && kline.open_time) {
+        const openTime = Number(kline.open_time);
+
+        if (Number.isFinite(openTime)) {
+          return openTime;
+        }
+      }
+    }
+  } catch (err) {
+    logger.debug(
+      { err, symbol, timeframe },
+      'getLatestOpenTimeFromWs: WS fetch failed; falling back to DB'
+    );
+  }
+
+  return null;
+}
+
+async function formatMidCandleTelegramAlert(signal, mtfValidation) {
+  try {
+    const block = {
+      symbol: signal.symbol,
+      timeframe: signal.root_tf,
+      type: 'midcandle_flip',
+      detected_at: new Date(signal.detected_at).toISOString(),
+      mtf_score: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+      mtf_alignment: mtfValidation.alignment || {},
+      candle_open_time: new Date(signal.candle_open_time).toISOString()
+    };
+
+    return block;
+  } catch (err) {
+    logger.error(
+      { err, signal },
+      'formatMidCandleTelegramAlert: formatting failed'
+    );
+    return null;
+  }
+}
+
+async function formatRootCandleTelegramAlert(signal, mtfValidation) {
+  try {
+    const db = dbModule.get();
+    const rootTfs = buildRootTfs();
+
+    const recommendedBlocks = [];
+
+    for (const tf of rootTfs) {
+      if (tf === signal.root_tf) continue;
+
+      const row = db.prepare(
+        `
+          SELECT close, open
+          FROM klines
+          WHERE symbol = ?
+            AND timeframe = ?
+          ORDER BY open_time DESC
+          LIMIT 1
+        `
+      ).get(signal.symbol, tf);
+
+      if (row) {
+        recommendedBlocks.push({
+          timeframe: tf,
+          close: row.close,
+          open: row.open
+        });
+      }
+    }
+
+    const block = {
+      symbol: signal.symbol,
+      timeframe: signal.root_tf,
+      type: 'root_candle_open',
+      detected_at: new Date(signal.detected_at).toISOString(),
+      candle_open_time: new Date(signal.candle_open_time).toISOString(),
+      mtf_score: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+      mtf_alignment: mtfValidation.alignment || {},
+      summary: {
+        signal_state: signal.state || 'monitor',
+        mtf_consensus: mtfValidation.positiveCount + '/' + mtfValidation.totalCount
+      },
+      recommended_blocks: recommendedBlocks
+    };
+
+    return block;
+  } catch (err) {
+    logger.error(
+      { err, signal },
+      'formatRootCandleTelegramAlert: formatting failed'
+    );
+    return null;
+  }
+}
+
+async function sendSignalTelegramAlert(signal, alertType, mtfValidation) {
+  try {
+    if (
+      !telegramNotifier ||
+      typeof telegramNotifier.sendAlert !== 'function'
+    ) {
+      logger.debug(
+        'telegramNotifier not available; skipping Telegram alert'
+      );
+      return false;
+    }
+
+    let alertBlock = null;
+
+    if (alertType === 'midcandle_update') {
+      alertBlock = await formatMidCandleTelegramAlert(signal, mtfValidation);
+    } else if (alertType === 'new_root_candle') {
+      alertBlock = await formatRootCandleTelegramAlert(signal, mtfValidation);
+    }
+
+    if (!alertBlock) {
+      return false;
+    }
+
+    await telegramNotifier.sendAlert({
+      type: alertType,
+      block: alertBlock,
+      eventId: signal.eventId || buildEventId(
+        alertType,
+        signal.symbol,
+        signal.root_tf,
+        signal.candle_open_time
+      )
+    });
+
+    logger.info(
+      {
+        symbol: signal.symbol,
+        root_tf: signal.root_tf,
+        type: alertType
+      },
+      'poller: Telegram alert sent'
+    );
+
+    return true;
+  } catch (err) {
+    logger.error(
+      { err, signal, alertType },
+      'sendSignalTelegramAlert: failed to send'
+    );
+    return false;
+  }
 }
 
 module.exports = {
@@ -1102,9 +1260,9 @@ module.exports = {
 
     const rootTfs = buildRootTfs();
     const newSignals = [];
+    const telegramAlerts = [];
     const alignmentAlerts = [];
 
-    // Retrieve active summary signals snapshot ONCE per pass
     const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
 
     for (const row of validRows) {
@@ -1112,11 +1270,11 @@ module.exports = {
 
       for (const tf of rootTfs) {
         try {
-          let latestOpen = getLatestOpenTime(
-            db,
-            symbol,
-            tf
-          );
+          let latestOpen = await getLatestOpenTimeFromWs(symbol, tf);
+
+          if (latestOpen === null) {
+            latestOpen = getLatestOpenTime(db, symbol, tf);
+          }
 
           if (latestOpen === null) {
             await this.seedKlinesForSymbol(symbol, tf);
@@ -1162,7 +1320,6 @@ module.exports = {
           const isAlreadyInSummary = activeSignals.length > 0;
 
           if (!isAlreadyInSummary) {
-            // SYMBOL NOT IN SUMMARY LIST: Scan for NEW mid-candle root flip
             const midCandleStateKey =
               `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
@@ -1215,13 +1372,29 @@ module.exports = {
                       notificationType: 'midcandle_update'
                     });
 
+                    const telegramSent = await sendSignalTelegramAlert(
+                      signal,
+                      'midcandle_update',
+                      mtfValidation
+                    );
+
+                    if (telegramSent) {
+                      telegramAlerts.push({
+                        symbol,
+                        tf,
+                        type: 'midcandle_update',
+                        eventId
+                      });
+                    }
+
                     logger.info(
                       {
                         symbol,
                         tf,
                         latestOpen,
                         eventId,
-                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                        telegramSent
                       },
                       'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned)'
                     );
@@ -1235,7 +1408,6 @@ module.exports = {
               }
             }
           } else {
-            // SYMBOL ALREADY IN SUMMARY LIST: Only evaluate MTF alignment consensus changes
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1272,9 +1444,9 @@ module.exports = {
                 symbol,
                 root_tf: tf,
                 detected_at: Date.now(),
-                eventId: alertEventId,              
-                signalType: 'mtf_alignment',        
-                notificationType: 'mtf_alignment',  
+                eventId: alertEventId,
+                signalType: 'mtf_alignment',
+                notificationType: 'mtf_alignment',
                 state: 'monitor',
                 meta: {
                   ...(activeSignal.meta || {}),
@@ -1391,6 +1563,7 @@ module.exports = {
     logger.info(
       {
         newSignals: newSignals.length,
+        telegramAlerts: telegramAlerts.length,
         alignmentAlerts: alignmentAlerts.length
       },
       'poller.loop2: exact five-minute boundary scan completed'
@@ -1471,15 +1644,15 @@ module.exports = {
 
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
-        
+
         let scannedSuccess = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
           logger.info({ attempt, tfsToRun }, 'poller: executing root TF candle open scan pass');
-          
+
           scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
-          
+
           if (scannedSuccess || attempt === 3) break;
-          
+
           logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 2 seconds...');
           await sleep(2000);
         }
@@ -1543,6 +1716,7 @@ module.exports = {
     );
 
     const allBoundarySignals = [];
+    const telegramAlerts = [];
     let detectedNewCandles = false;
 
     for (const row of validRows) {
@@ -1550,11 +1724,11 @@ module.exports = {
 
       for (const tf of tfsToProcess) {
         try {
-          let latestOpen = getLatestOpenTime(
-            db,
-            symbol,
-            tf
-          );
+          let latestOpen = await getLatestOpenTimeFromWs(symbol, tf);
+
+          if (latestOpen === null) {
+            latestOpen = getLatestOpenTime(db, symbol, tf);
+          }
 
           const processedStateKey =
             this.getLoop2ProcessedCandleKey(
@@ -1568,7 +1742,6 @@ module.exports = {
             ) || 0
           );
 
-          // REST Fallback: If WS hasn't streamed the new candle open_time yet, fetch via REST
           if (latestOpen === null || latestOpen <= processedOpen) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
@@ -1611,8 +1784,35 @@ module.exports = {
                     notificationType: 'new_root_candle'
                   });
 
+                  const telegramSent = await sendSignalTelegramAlert(
+                    signal,
+                    'new_root_candle',
+                    mtfValidation
+                  );
+
+                  if (telegramSent) {
+                    telegramAlerts.push({
+                      symbol,
+                      tf,
+                      type: 'new_root_candle',
+                      eventId
+                    });
+                  }
+
                   const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
                   dbModule.setState(midCandleStateKey, Date.now());
+
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      latestOpen,
+                      eventId,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      telegramSent
+                    },
+                    'poller: root TF flip detected with Telegram alert'
+                  );
                 }
               } else {
                 logger.debug(
@@ -1653,6 +1853,7 @@ module.exports = {
       logger.info(
         {
           count: allBoundarySignals.length,
+          telegramCount: telegramAlerts.length,
           timeframes: tfsToProcess
         },
         'poller: enqueueing root TF candle open notifications via startup batch format'
