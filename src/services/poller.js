@@ -6,8 +6,7 @@ const logger = require('pino')();
 const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
-const notificationQueue = require('./notificationqueue');
-const telegram = require('./telegram');
+const notificationQueue = require('./notificationQueue');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -216,9 +215,9 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
 
 async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
-
+  
   const alignmentValues = Object.values(alignment || {});
-
+  
   if (alignmentValues.length === 0) {
     return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
   }
@@ -229,7 +228,7 @@ async function validateMtfAlignmentConsensus(symbol) {
 
   const totalCount = alignmentValues.length;
   const mtfScore = positiveCount / totalCount;
-
+  
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
   );
@@ -246,107 +245,6 @@ async function validateMtfAlignmentConsensus(symbol) {
   };
 }
 
-// NEW: Get latest kline from WS (instant data)
-async function getLatestOpenTimeFromWs(symbol, timeframe) {
-  try {
-    if (
-      bybitWs &&
-      typeof bybitWs.getLatestKline === 'function'
-    ) {
-      const kline = await bybitWs.getLatestKline(symbol, timeframe);
-
-      if (kline && kline.open_time) {
-        const openTime = Number(kline.open_time);
-
-        if (Number.isFinite(openTime)) {
-          logger.debug(
-            { symbol, timeframe, source: 'ws', openTime },
-            'poller: fetched latest open_time from WS'
-          );
-          return openTime;
-        }
-      }
-    }
-  } catch (err) {
-    logger.debug(
-      { err, symbol, timeframe },
-      'poller: WS fetch failed; falling back to DB'
-    );
-  }
-
-  return null;
-}
-
-// NEW: Send Telegram alert for mid-candle signal
-async function sendMidCandleTelegramAlert(signal) {
-  try {
-    if (
-      !telegram ||
-      typeof telegram.sendMidCandleUpdateBlock !== 'function'
-    ) {
-      logger.debug(
-        { symbol: signal?.symbol, tf: signal?.root_tf },
-        'telegram not available; skipping mid-candle Telegram alert'
-      );
-      return false;
-    }
-
-    await telegram.sendMidCandleUpdateBlock(signal);
-
-    logger.info(
-      {
-        symbol: signal.symbol,
-        root_tf: signal.root_tf,
-        eventId: signal.eventId
-      },
-      'poller: mid-candle Telegram alert sent'
-    );
-
-    return true;
-  } catch (err) {
-    logger.error(
-      { err, symbol: signal?.symbol, tf: signal?.root_tf },
-      'poller: failed to send mid-candle Telegram alert'
-    );
-    return false;
-  }
-}
-
-// NEW: Send Telegram alert for root candle open signal
-async function sendRootCandleTelegramAlert(signal) {
-  try {
-    if (
-      !telegram ||
-      typeof telegram.sendNewSignalSingleBlock !== 'function'
-    ) {
-      logger.debug(
-        { symbol: signal?.symbol, tf: signal?.root_tf },
-        'telegram not available; skipping root candle Telegram alert'
-      );
-      return false;
-    }
-
-    await telegram.sendNewSignalSingleBlock(signal, 'new_root_candle');
-
-    logger.info(
-      {
-        symbol: signal.symbol,
-        root_tf: signal.root_tf,
-        eventId: signal.eventId
-      },
-      'poller: root candle Telegram alert sent'
-    );
-
-    return true;
-  } catch (err) {
-    logger.error(
-      { err, symbol: signal?.symbol, tf: signal?.root_tf },
-      'poller: failed to send root candle Telegram alert'
-    );
-    return false;
-  }
-}
-
 module.exports = {
   start() {
     if (isRunning) {
@@ -358,16 +256,6 @@ module.exports = {
 
     isRunning = true;
     startupComplete = true;
-
-    try {
-      telegram.init();
-      logger.info('poller.start: telegram initialized');
-    } catch (err) {
-      logger.debug(
-        { err },
-        'poller.start: telegram init optional'
-      );
-    }
 
     try {
       signalManager.setOpenTradesAllowed(true);
@@ -1193,7 +1081,7 @@ module.exports = {
       {
         boundary: boundary.toISOString()
       },
-      'poller.loop2: starting five-minute boundary scan (mid-candle detection via WS)'
+      'poller.loop2: starting 5-minute boundary scan for new mid-candle root signals'
     );
 
     const db = dbModule.get();
@@ -1214,9 +1102,9 @@ module.exports = {
 
     const rootTfs = buildRootTfs();
     const newSignals = [];
-    const telegramAlerts = [];
     const alignmentAlerts = [];
 
+    // Retrieve active summary signals snapshot ONCE per pass
     const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
 
     for (const row of validRows) {
@@ -1224,28 +1112,18 @@ module.exports = {
 
       for (const tf of rootTfs) {
         try {
-          // ✅ WS-FIRST: Try to get data from WebSocket stream
-          let latestOpen = await getLatestOpenTimeFromWs(symbol, tf);
-          let dataSource = 'ws';
+          let latestOpen = getLatestOpenTime(
+            db,
+            symbol,
+            tf
+          );
 
-          // ✅ FALLBACK 1: If WS unavailable, check DB
-          if (latestOpen === null) {
-            latestOpen = getLatestOpenTime(db, symbol, tf);
-            dataSource = 'db';
-          }
-
-          // ✅ FALLBACK 2: If DB has no data, seed via REST
           if (latestOpen === null) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
-            dataSource = 'rest';
           }
 
           if (latestOpen === null) {
-            logger.debug(
-              { symbol, tf },
-              'poller.loop2: no data found (WS, DB, REST); skipping'
-            );
             continue;
           }
 
@@ -1267,8 +1145,7 @@ module.exports = {
                 symbol,
                 tf,
                 latestOpen,
-                processedOpen,
-                dataSource
+                processedOpen
               },
               'poller.loop2: new root candle detected; handled separately by root-TF candle-open scanner'
             );
@@ -1282,9 +1159,19 @@ module.exports = {
             );
           });
 
-          const isAlreadyInSummary = activeSignals.length > 0;
+          // Verify whether signal was previously found or persisted in DB
+          const signalExistsInDb = db.prepare(
+            `
+              SELECT 1 FROM signals 
+              WHERE symbol = ? AND root_tf = ? AND candle_open_time = ?
+              LIMIT 1
+            `
+          ).get(symbol, tf, latestOpen);
+
+          const isAlreadyInSummary = activeSignals.length > 0 || !!signalExistsInDb;
 
           if (!isAlreadyInSummary) {
+            // SYMBOL NOT IN DB OR SUMMARY LIST: Scan for NEW mid-candle root flip
             const midCandleStateKey =
               `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
@@ -1307,8 +1194,7 @@ module.exports = {
                       symbol,
                       tf,
                       mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      reason: mtfValidation.reason,
-                      dataSource
+                      reason: mtfValidation.reason
                     },
                     'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
                   );
@@ -1328,7 +1214,7 @@ module.exports = {
                       candle_open_time: latestOpen,
                       eventId,
                       signalType: 'midcandle_update',
-                      notifyImmediately: true
+                      notifyImmediately: false
                     });
 
                   if (signal) {
@@ -1338,30 +1224,15 @@ module.exports = {
                       notificationType: 'midcandle_update'
                     });
 
-                    // ✅ Send Telegram alert immediately
-                    const telegramSent = await sendMidCandleTelegramAlert(signal);
-
-                    if (telegramSent) {
-                      telegramAlerts.push({
-                        symbol,
-                        tf,
-                        type: 'midcandle_update',
-                        eventId,
-                        dataSource
-                      });
-                    }
-
                     logger.info(
                       {
                         symbol,
                         tf,
                         latestOpen,
                         eventId,
-                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                        telegramSent,
-                        dataSource
+                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                       },
-                      'poller.loop2: mid-candle histogram flip detected (MTF aligned, WS-sourced)'
+                      'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned)'
                     );
                   }
 
@@ -1373,7 +1244,10 @@ module.exports = {
               }
             }
           } else {
+            // SYMBOL ALREADY IN SUMMARY LIST / DB: Evaluate MTF alignment consensus changes
             const activeSignal = activeSignals[0];
+            if (!activeSignal) continue;
+
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
             const alignmentStateKey =
@@ -1409,9 +1283,9 @@ module.exports = {
                 symbol,
                 root_tf: tf,
                 detected_at: Date.now(),
-                eventId: alertEventId,
-                signalType: 'mtf_alignment',
-                notificationType: 'mtf_alignment',
+                eventId: alertEventId,              
+                signalType: 'mtf_alignment',        
+                notificationType: 'mtf_alignment',  
                 state: 'monitor',
                 meta: {
                   ...(activeSignal.meta || {}),
@@ -1468,13 +1342,13 @@ module.exports = {
       }
     }
 
+    // Dispatch 5m Boundary Midcandle alerts ONE BLOCK PER SIGNAL
     for (const signal of newSignals) {
       try {
-        const queued =
-          notificationQueue.enqueueSignal(
-            signal,
-            'midcandle_update'
-          );
+        const queued = notificationQueue.enqueueSignal(
+          signal,
+          'midcandle_update'
+        );
 
         logger.info(
           {
@@ -1482,7 +1356,7 @@ module.exports = {
             root_tf: signal.root_tf,
             queued
           },
-          'poller.loop2: midcandle update enqueued'
+          'poller.loop2: midcandle update enqueued (1 block per signal)'
         );
       } catch (err) {
         logger.error(
@@ -1497,11 +1371,10 @@ module.exports = {
 
     for (const alert of alignmentAlerts) {
       try {
-        const queued =
-          notificationQueue.enqueueSignal(
-            alert,
-            'mtf_alignment'
-          );
+        const queued = notificationQueue.enqueueSignal(
+          alert,
+          'mtf_alignment'
+        );
 
         logger.info(
           {
@@ -1528,11 +1401,9 @@ module.exports = {
     logger.info(
       {
         newSignals: newSignals.length,
-        telegramAlerts: telegramAlerts.length,
-        alignmentAlerts: alignmentAlerts.length,
-        boundary: boundary.toISOString()
+        alignmentAlerts: alignmentAlerts.length
       },
-      'poller.loop2: five-minute boundary scan completed'
+      'poller.loop2: exact five-minute boundary scan completed'
     );
   },
 
@@ -1610,15 +1481,15 @@ module.exports = {
 
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
-
+        
         let scannedSuccess = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
           logger.info({ attempt, tfsToRun }, 'poller: executing root TF candle open scan pass');
-
+          
           scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
-
+          
           if (scannedSuccess || attempt === 3) break;
-
+          
           logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 2 seconds...');
           await sleep(2000);
         }
@@ -1682,7 +1553,6 @@ module.exports = {
     );
 
     const allBoundarySignals = [];
-    const telegramAlerts = [];
     let detectedNewCandles = false;
 
     for (const row of validRows) {
@@ -1690,15 +1560,11 @@ module.exports = {
 
       for (const tf of tfsToProcess) {
         try {
-          // ✅ WS-FIRST: Try to get data from WebSocket stream
-          let latestOpen = await getLatestOpenTimeFromWs(symbol, tf);
-          let dataSource = 'ws';
-
-          // ✅ FALLBACK 1: If WS unavailable, check DB
-          if (latestOpen === null) {
-            latestOpen = getLatestOpenTime(db, symbol, tf);
-            dataSource = 'db';
-          }
+          let latestOpen = getLatestOpenTime(
+            db,
+            symbol,
+            tf
+          );
 
           const processedStateKey =
             this.getLoop2ProcessedCandleKey(
@@ -1712,11 +1578,10 @@ module.exports = {
             ) || 0
           );
 
-          // ✅ FALLBACK 2: If DB has no data or WS lag, seed via REST
+          // REST Fallback: If WS hasn't streamed the new candle open_time yet, fetch via REST
           if (latestOpen === null || latestOpen <= processedOpen) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
-            dataSource = 'rest';
           }
 
           if (latestOpen !== null && latestOpen > processedOpen) {
@@ -1756,38 +1621,12 @@ module.exports = {
                     notificationType: 'new_root_candle'
                   });
 
-                  // ✅ Send Telegram alert immediately with summary + recommended blocks
-                  const telegramSent = await sendRootCandleTelegramAlert(signal);
-
-                  if (telegramSent) {
-                    telegramAlerts.push({
-                      symbol,
-                      tf,
-                      type: 'new_root_candle',
-                      eventId,
-                      dataSource
-                    });
-                  }
-
                   const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
                   dbModule.setState(midCandleStateKey, Date.now());
-
-                  logger.info(
-                    {
-                      symbol,
-                      tf,
-                      latestOpen,
-                      eventId,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      telegramSent,
-                      dataSource
-                    },
-                    'poller: root TF flip detected with Telegram alert (WS-sourced)'
-                  );
                 }
               } else {
                 logger.debug(
-                  { symbol, tf, reason: mtfValidation.reason, dataSource },
+                  { symbol, tf, reason: mtfValidation.reason },
                   'poller: root flip detected but MTF consensus failed; skipping'
                 );
               }
@@ -1802,8 +1641,7 @@ module.exports = {
               {
                 symbol,
                 tf,
-                latestOpen,
-                dataSource
+                latestOpen
               },
               'poller: recorded processed root TF candle boundary'
             );
@@ -1825,13 +1663,18 @@ module.exports = {
       logger.info(
         {
           count: allBoundarySignals.length,
-          telegramCount: telegramAlerts.length,
           timeframes: tfsToProcess
         },
-        'poller: enqueueing root TF candle open notifications via startup batch format'
+        'poller: enqueueing new root TF candle open notifications (summary + signal per block + recommended blocks)'
       );
 
-      notificationQueue.enqueueStartupBatch(allBoundarySignals);
+      // Dispatch Summary Block + Signal per Block + Recommended Blocks for newly open root TF
+      if (typeof notificationQueue.enqueueRootTfCandleOpenBatch === 'function') {
+        notificationQueue.enqueueRootTfCandleOpenBatch(allBoundarySignals, tfsToProcess);
+      } else {
+        // Fallback: Send summary/batch via startup batch handler and individual signal blocks
+        notificationQueue.enqueueStartupBatch(allBoundarySignals);
+      }
     }
 
     return detectedNewCandles;
