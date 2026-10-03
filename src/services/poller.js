@@ -21,7 +21,6 @@ const FIVE_MINUTES_MS = 5 * 60 * 1000;
 let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
-let wsSignalQueue = {}; // Track WS-detected signals before periodic boundary scan
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -246,108 +245,10 @@ async function validateMtfAlignmentConsensus(symbol) {
   };
 }
 
-// ===== WS EVENT HANDLER: Listen for instant mid-candle flips from WebSocket =====
-function attachWsMidCandleListener() {
-  if (!bybitWs || typeof bybitWs.on !== 'function') {
-    logger.debug('poller: bybitWs does not support event listeners');
-    return;
-  }
-
-  bybitWs.on('midCandleFlip', async (data) => {
-    const { symbol, timeframe, candleOpenTime, macdData } = data || {};
-
-    if (!symbol || !timeframe || candleOpenTime === undefined) {
-      logger.debug('poller: WS midCandleFlip event missing required fields');
-      return;
-    }
-
-    try {
-      const eventKey = `${symbol}:${timeframe}:${candleOpenTime}`;
-
-      // Check if already reported
-      const stateKey = `poller.ws.midCandle.${eventKey}`;
-      if (dbModule.getState(stateKey)) {
-        logger.debug(
-          { symbol, timeframe, eventKey },
-          'poller: WS midCandleFlip already reported; skipping'
-        );
-        return;
-      }
-
-      // Validate MTF alignment before creating signal
-      const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-      if (!mtfValidation.isAligned) {
-        logger.debug(
-          {
-            symbol,
-            timeframe,
-            mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-            reason: mtfValidation.reason
-          },
-          'poller: WS midCandleFlip detected but MTF not aligned; skipping'
-        );
-        return;
-      }
-
-      // Mark as reported
-      dbModule.setState(stateKey, Date.now());
-
-      // Create signal via signalManager
-      const eventId = buildEventId('ws_midcandle', symbol, timeframe, candleOpenTime);
-
-      const signal = await signalManager.handleRootSignal({
-        symbol,
-        root_tf: timeframe,
-        detected_at: Date.now(),
-        candle_open_time: candleOpenTime,
-        eventId,
-        signalType: 'midcandle_update',
-        notifyImmediately: true,
-        source: 'ws_stream'
-      });
-
-      if (signal) {
-        // Send Telegram push immediately (one block per signal)
-        try {
-          const wsSignal = {
-            ...signal,
-            eventId,
-            notificationType: 'midcandle_update',
-            source: 'ws_stream'
-          };
-
-          notificationQueue.enqueueSignal(wsSignal, 'midcandle_update');
-
-          logger.info(
-            {
-              symbol,
-              timeframe,
-              eventId,
-              mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-              source: 'ws_stream'
-            },
-            'poller: WS midCandleFlip detected & Telegram alert sent (instant via WebSocket)'
-          );
-        } catch (err) {
-          logger.error(
-            { err, symbol, timeframe, eventId },
-            'poller: FAILED to send WS midcandle Telegram alert'
-          );
-        }
-      }
-    } catch (err) {
-      logger.error(
-        { err, symbol, timeframe, candleOpenTime },
-        'poller: error handling WS midCandleFlip event'
-      );
-    }
-  });
-
-  logger.info('poller: WS midCandleFlip listener attached');
-}
-
 module.exports = {
+  rootScanTimers: {},
+  boundaryScanTimer: null,
+
   start() {
     if (isRunning) {
       logger.debug(
@@ -383,23 +284,83 @@ module.exports = {
             logger.info({ count }, 'poller.start: subscribed symbols to WS stream');
           }
         }
-
-        // Attach WS listener for instant mid-candle detection
-        attachWsMidCandleListener();
       } catch (err) {
         logger.warn({ err }, 'poller.start: failed to initialize WS stream');
       }
     }
 
+    // Bind WebSockets listener for real-time boundary detection
+    this.bindWsListeners();
+
+    // Start fallback clock loops (buffered to run AFTER WS listeners)
     this.startBoundaryScanLoop();
     logger.info(
-      'poller.start: boundary scan loop started'
+      'poller.start: boundary scan loop started (fallback)'
     );
 
     this.startRootTfCandleOpenLoop();
     logger.info(
-      'poller.start: root TF candle open loop started'
+      'poller.start: root TF candle open loop started (fallback)'
     );
+  },
+
+  bindWsListeners() {
+    if (!bybitWs || typeof bybitWs.on !== 'function') {
+      logger.warn('poller: bybitWs.on is not available. Ensure bybitWs inherits EventEmitter and emits "kline" events to trigger WS boundary scans.');
+      return;
+    }
+
+    bybitWs.on('kline', (data) => {
+      // Safely extract payload (adjust if your bybitWs payload structure differs slightly)
+      const symbol = data.symbol;
+      const rawTf = data.timeframe || data.interval;
+      const openTime = Number(data.open_time || data.openTime || data.start);
+
+      if (!symbol || !rawTf || !openTime) return;
+
+      const tf = normalizeRootTf(rawTf);
+      const rootTfs = buildRootTfs();
+      const now = Date.now();
+
+      // 1. Root TF Boundary Detection via WS
+      if (rootTfs.includes(tf)) {
+        const stateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
+        const processed = Number(dbModule.getState(stateKey) || 0);
+
+        if (openTime > processed) {
+          if (!this.rootScanTimers[tf]) {
+            logger.info({ tf, symbol }, 'poller: WS detected new root candle open. Scheduling batched scan...');
+            // Debounce for 5 seconds to allow ALL symbols in the WS stream to update SQLite
+            this.rootScanTimers[tf] = setTimeout(() => {
+              this.runRootTfCandleOpenOnce([tf], Date.now());
+              this.rootScanTimers[tf] = null;
+            }, 5000); 
+          }
+        }
+      }
+
+      // 2. 5-Minute Boundary (Midcandle) Detection via WS
+      const current5mEpoch = Math.floor(now / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+      const lastScanned5m = Number(dbModule.getState('poller.lastBoundaryScan') || 0);
+
+      if (current5mEpoch > lastScanned5m) {
+        // Ensure the clock has technically passed the boundary by at least a second
+        if (now - current5mEpoch > 1000) {
+          if (!this.boundaryScanTimer) {
+            dbModule.setState('poller.lastBoundaryScan', current5mEpoch);
+            logger.info({ current5mEpoch: new Date(current5mEpoch).toISOString() }, 'poller: WS detected 5m boundary crossing. Scheduling midcandle scan...');
+            
+            // Debounce for 5 seconds to ensure DB is populated
+            this.boundaryScanTimer = setTimeout(() => {
+              this.runBoundaryScanOnce();
+              this.boundaryScanTimer = null;
+            }, 5000);
+          }
+        }
+      }
+    });
+
+    logger.info('poller: WS boundary listeners successfully bound for flip detection.');
   },
 
   async initialScan(options = {}) {
@@ -529,9 +490,6 @@ module.exports = {
         bybitWs.start();
         const subCount = bybitWs.subscribeSymbols(validSymbols);
         logger.info({ subCount }, 'poller.initialScan: subscribed symbols to WS stream');
-
-        // Attach WS listener for instant mid-candle detection
-        attachWsMidCandleListener();
       } catch (err) {
         logger.warn({ err }, 'poller.initialScan: WS subscription error');
       }
@@ -780,15 +738,6 @@ module.exports = {
 
           insertMany(klines);
 
-          logger.debug(
-            {
-              symbol,
-              tf,
-              count: klines.length
-            },
-            'seedKlinesForSymbol: klines persisted'
-          );
-
           try {
             if (
               typeof macdUtil.computeAndStoreMacd ===
@@ -809,32 +758,20 @@ module.exports = {
             }
           } catch (err) {
             logger.debug(
-              {
-                err,
-                symbol,
-                tf
-              },
+              { err, symbol, tf },
               'seedKlinesForSymbol: MACD warm-up failed'
             );
           }
         } catch (err) {
           logger.debug(
-            {
-              err,
-              symbol,
-              tf
-            },
+            { err, symbol, tf },
             'seedKlinesForSymbol: timeframe fetch failed'
           );
         }
       }
     } catch (err) {
       logger.debug(
-        {
-          err,
-          symbol,
-          timeframe
-        },
+        { err, symbol, timeframe },
         'seedKlinesForSymbol: unexpected error'
       );
     }
@@ -868,17 +805,6 @@ module.exports = {
       const validRows = rows.filter((row) =>
         isUsdtSymbol(row.symbol)
       );
-
-      const invalidCount = rows.length - validRows.length;
-
-      if (invalidCount > 0) {
-        logger.warn(
-          {
-            invalidCount
-          },
-          'scanAllForStartup: invalid symbols skipped'
-        );
-      }
 
       const newSignals = [];
       const pageSize = Number(
@@ -947,9 +873,7 @@ module.exports = {
       return newSignals;
     } catch (err) {
       logger.error(
-        {
-          err
-        },
+        { err },
         'scanAllForStartup: unexpected error'
       );
 
@@ -983,14 +907,6 @@ module.exports = {
         );
       }
     }
-
-    logger.info(
-      {
-        symbols: rows.length,
-        timeframes: rootTfs.length
-      },
-      'poller: initialized boundary candle state'
-    );
   },
 
   async scanSymbolRoots(symbol) {
@@ -998,13 +914,6 @@ module.exports = {
     const results = [];
 
     if (!isUsdtSymbol(symbol)) {
-      logger.warn(
-        {
-          symbol
-        },
-        'scanSymbolRoots: invalid USDT symbol; skipping'
-      );
-
       return results;
     }
 
@@ -1032,14 +941,6 @@ module.exports = {
           !rows ||
           rows.length < 2
         ) {
-          logger.debug(
-            {
-              symbol,
-              tf
-            },
-            'scanSymbolRoots: insufficient klines; seeding'
-          );
-
           await this.seedKlinesForSymbol(
             symbol,
             tf
@@ -1054,14 +955,6 @@ module.exports = {
             !rows ||
             rows.length < 2
           ) {
-            logger.debug(
-              {
-                symbol,
-                tf
-              },
-              'scanSymbolRoots: still insufficient klines'
-            );
-
             continue;
           }
         }
@@ -1092,11 +985,7 @@ module.exports = {
         }
       } catch (err) {
         logger.debug(
-          {
-            err,
-            symbol,
-            tf
-          },
+          { err, symbol, tf },
           'scanSymbolRoots: error checking flip'
         );
       }
@@ -1123,9 +1012,7 @@ module.exports = {
       this.runBoundaryScanLoop()
         .catch((err) => {
           logger.error(
-            {
-              err
-            },
+            { err },
             'poller: boundary scan loop crashed'
           );
         });
@@ -1137,19 +1024,11 @@ module.exports = {
       const nextBoundary =
         this.getNextFiveMinuteBoundaryMs();
 
+      // IMPORTANT ADDITION: +5000ms offset
+      // If WS doesn't trigger it, fallback runs 5s late to ensure SQLite is populated.
       const delay = Math.max(
         0,
-        nextBoundary - Date.now()
-      );
-
-      logger.debug(
-        {
-          nextBoundary: new Date(
-            nextBoundary
-          ).toISOString(),
-          delayMs: delay
-        },
-        'poller.loop2: waiting for next five-minute boundary'
+        nextBoundary - Date.now() + 5000 
       );
 
       await sleep(delay);
@@ -1159,9 +1038,6 @@ module.exports = {
       }
 
       if (boundaryScanInProgress) {
-        logger.warn(
-          'poller.loop2: previous boundary scan is still running; skipping boundary'
-        );
         continue;
       }
 
@@ -1171,9 +1047,7 @@ module.exports = {
         await this.runBoundaryScanOnce();
       } catch (err) {
         logger.error(
-          {
-            err
-          },
+          { err },
           'poller.loop2: boundary scan failed'
         );
       } finally {
@@ -1186,10 +1060,8 @@ module.exports = {
     const boundary = new Date();
 
     logger.info(
-      {
-        boundary: boundary.toISOString()
-      },
-      'poller.loop2: starting five-minute boundary scan (WS-instant mid-candle detection + MTF alignment checks)'
+      { boundary: boundary.toISOString() },
+      'poller.loop2: starting 5m boundary scan (Midcandle + MTF updates)'
     );
 
     const db = dbModule.get();
@@ -1209,7 +1081,7 @@ module.exports = {
     );
 
     const rootTfs = buildRootTfs();
-    const periodicMidCandleSignals = [];
+    const newSignals = [];
     const alignmentAlerts = [];
 
     // Retrieve active summary signals snapshot ONCE per pass
@@ -1247,16 +1119,9 @@ module.exports = {
             ) || 0
           );
 
+          // If WS populated a brand new root candle, we skip midcandle evaluation 
+          // because it will be processed by the root TF boundary scanner.
           if (latestOpen > processedOpen) {
-            logger.debug(
-              {
-                symbol,
-                tf,
-                latestOpen,
-                processedOpen
-              },
-              'poller.loop2: new root candle detected; handled separately by root-TF candle-open scanner'
-            );
             continue;
           }
 
@@ -1270,7 +1135,7 @@ module.exports = {
           const isAlreadyInSummary = activeSignals.length > 0;
 
           if (!isAlreadyInSummary) {
-            // SYMBOL NOT IN SUMMARY LIST: Scan for NEW mid-candle root flip (fallback to periodic if WS missed)
+            // DEDUPLICATION CHECK: Ensure we haven't already fired midcandle for this specific candle
             const midCandleStateKey =
               `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
@@ -1292,14 +1157,13 @@ module.exports = {
                     {
                       symbol,
                       tf,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      reason: mtfValidation.reason
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                     },
-                    'poller.loop2: mid-candle flip detected but MTF not aligned; skipping'
+                    'poller.loop2: mid-candle flip detected but MTF not aligned'
                   );
                 } else {
                   const eventId = buildEventId(
-                    'periodic_midcandle',
+                    'midcandle',
                     symbol,
                     tf,
                     latestOpen
@@ -1313,16 +1177,14 @@ module.exports = {
                       candle_open_time: latestOpen,
                       eventId,
                       signalType: 'midcandle_update',
-                      notifyImmediately: true,
-                      source: 'periodic_boundary'
+                      notifyImmediately: true
                     });
 
                   if (signal) {
-                    periodicMidCandleSignals.push({
+                    newSignals.push({
                       ...signal,
                       eventId,
-                      notificationType: 'midcandle_update',
-                      source: 'periodic_boundary'
+                      notificationType: 'midcandle_update'
                     });
 
                     logger.info(
@@ -1330,14 +1192,13 @@ module.exports = {
                         symbol,
                         tf,
                         latestOpen,
-                        eventId,
-                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                        source: 'periodic_boundary'
+                        eventId
                       },
-                      'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned) - periodic fallback'
+                      'poller.loop2: mid-candle histogram flip detected (MTF aligned)'
                     );
                   }
 
+                  // Prevents duplicate midcandle signals for this candle open time
                   dbModule.setState(
                     midCandleStateKey,
                     Date.now()
@@ -1346,7 +1207,7 @@ module.exports = {
               }
             }
           } else {
-            // SYMBOL ALREADY IN SUMMARY LIST: Only evaluate MTF alignment consensus changes
+            // ALREADY ACTIVE: Only evaluate MTF alignment consensus changes
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1397,30 +1258,10 @@ module.exports = {
                   mtfScore: mtfValidation.mtfScore
                 }
               });
-
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                  positiveCount: mtfValidation.positiveCount,
-                  totalCount: mtfValidation.totalCount
-                },
-                'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
-              );
             } else if (!isAllPositive && previousAligned) {
               dbModule.setState(
                 alignmentStateKey,
                 String(false)
-              );
-
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                },
-                'poller.loop2: MTF alignment dropped below 100%'
               );
             } else if (previousAlignedState === undefined) {
               dbModule.setState(
@@ -1431,80 +1272,36 @@ module.exports = {
           }
         } catch (err) {
           logger.debug(
-            {
-              err,
-              symbol,
-              tf
-            },
+            { err, symbol, tf },
             'poller.loop2: symbol/timeframe scan failed'
           );
         }
       }
     }
 
-    // ===== 5-MINUTE BOUNDARY: Send one Telegram block per periodic mid-candle signal (fallback from WS) =====
-    for (const signal of periodicMidCandleSignals) {
+    // REQUIREMENT 1: One signal per block for 5mboundary Midcandle
+    for (const signal of newSignals) {
       try {
-        notificationQueue.enqueueSignal(signal, 'midcandle_update');
-
-        logger.info(
-          {
-            symbol: signal.symbol,
-            root_tf: signal.root_tf,
-            eventId: signal.eventId,
-            source: signal.source
-          },
-          'poller.loop2: periodic midcandle signal block sent via Telegram (one per signal, fallback if WS missed)'
+        notificationQueue.enqueueSignal(
+          signal,
+          'midcandle_update'
         );
       } catch (err) {
-        logger.error(
-          {
-            err,
-            signal
-          },
-          'poller.loop2: FAILED to send periodic midcandle Telegram block'
-        );
+        logger.error({ err, signal }, 'poller.loop2: FAILED to enqueue midcandle update');
       }
     }
 
-    // ===== Send MTF alignment alerts =====
+    // REQUIREMENT 2: One signal per block MTF alignment alert
     for (const alert of alignmentAlerts) {
       try {
-        const queued =
-          notificationQueue.enqueueSignal(
-            alert,
-            'mtf_alignment'
-          );
-
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf,
-            queued,
-            mtfScore: (
-              alert.meta.mtfScore * 100
-            ).toFixed(0) + '%'
-          },
-          'poller.loop2: realtime alignment alert enqueued'
+        notificationQueue.enqueueSignal(
+          alert,
+          'mtf_alignment'
         );
       } catch (err) {
-        logger.error(
-          {
-            err,
-            alert
-          },
-          'poller.loop2: FAILED to enqueue alignment alert'
-        );
+        logger.error({ err, alert }, 'poller.loop2: FAILED to enqueue alignment alert');
       }
     }
-
-    logger.info(
-      {
-        periodicMidCandleSignals: periodicMidCandleSignals.length,
-        alignmentAlerts: alignmentAlerts.length
-      },
-      'poller.loop2: five-minute boundary scan completed'
-    );
   },
 
   startRootTfCandleOpenLoop() {
@@ -1512,9 +1309,7 @@ module.exports = {
       this.runRootTfCandleOpenLoop()
         .catch((err) => {
           logger.error(
-            {
-              err
-            },
+            { err },
             'poller: root TF candle open loop crashed'
           );
         });
@@ -1540,11 +1335,7 @@ module.exports = {
       }
 
       if (!isFinite(nextBoundaryMs)) {
-        logger.warn(
-          'poller: next root TF boundary calculation failed; falling back to 1 hour'
-        );
-        nextBoundaryMs =
-          nowMs + 60 * 60 * 1000;
+        nextBoundaryMs = nowMs + 60 * 60 * 1000;
       }
 
       const dueTfs = [];
@@ -1555,20 +1346,11 @@ module.exports = {
         }
       }
 
+      // IMPORTANT ADDITION: +5000ms offset
+      // Fallback delay ensuring DB is written to by WS before timer fires
       const delay = Math.max(
         0,
-        nextBoundaryMs - Date.now()
-      );
-
-      logger.debug(
-        {
-          nextBoundaryMs: new Date(
-            nextBoundaryMs
-          ).toISOString(),
-          delayMs: delay,
-          dueTfs
-        },
-        'poller: waiting for next root TF candle-open boundary'
+        nextBoundaryMs - Date.now() + 5000 
       );
 
       await sleep(delay);
@@ -1577,27 +1359,18 @@ module.exports = {
         break;
       }
 
-      await sleep(1500);
-
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
         
         let scannedSuccess = false;
         for (let attempt = 1; attempt <= 3; attempt++) {
-          logger.info({ attempt, tfsToRun }, 'poller: executing root TF candle open scan pass');
-          
           scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
-          
           if (scannedSuccess || attempt === 3) break;
-          
-          logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 2 seconds...');
           await sleep(2000);
         }
       } catch (err) {
         logger.error(
-          {
-            err
-          },
+          { err },
           'poller: root TF candle open scan failed'
         );
       }
@@ -1630,10 +1403,8 @@ module.exports = {
     }
 
     logger.info(
-      {
-        timeframes: tfsToProcess
-      },
-      'poller: root TF candle open boundary reached'
+      { timeframes: tfsToProcess },
+      'poller: root TF candle open boundary processing'
     );
 
     const db = dbModule.get();
@@ -1678,7 +1449,6 @@ module.exports = {
             ) || 0
           );
 
-          // REST Fallback: If WS hasn't streamed the new candle open_time yet, fetch via REST
           if (latestOpen === null || latestOpen <= processedOpen) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
@@ -1686,6 +1456,7 @@ module.exports = {
 
           if (latestOpen !== null && latestOpen > processedOpen) {
             detectedNewCandles = true;
+            
             const flip =
               await macdUtil.isMacdFlip(
                 symbol,
@@ -1721,64 +1492,31 @@ module.exports = {
                     notificationType: 'new_root_candle'
                   });
 
+                  // DEDUPLICATION: Prevents the 5m loop from pushing this as a midcandle alert
                   const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
                   dbModule.setState(midCandleStateKey, Date.now());
                 }
-              } else {
-                logger.debug(
-                  { symbol, tf, reason: mtfValidation.reason },
-                  'poller: root flip detected but MTF consensus failed; skipping'
-                );
               }
             }
 
+            // DEDUPLICATION: Prevents this root candle open from being processed a second time
             dbModule.setState(
               processedStateKey,
               latestOpen
             );
-
-            logger.debug(
-              {
-                symbol,
-                tf,
-                latestOpen
-              },
-              'poller: recorded processed root TF candle boundary'
-            );
           }
         } catch (err) {
           logger.debug(
-            {
-              err,
-              symbol,
-              tf
-            },
+            { err, symbol, tf },
             'poller: error processing new root TF candle'
           );
         }
       }
     }
 
+    // REQUIREMENT 3: Newroottfcandleopen summary+signal blocks+recommended blocks
     if (allBoundarySignals.length > 0) {
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
-        },
-        'poller: enqueueing root TF candle open notifications (summary + per-signal blocks + recommended blocks via Telegram)'
-      );
-
-      // Send summary block + per-signal block + recommended blocks format
-      notificationQueue.enqueueRootTfCandleOpenBatch(allBoundarySignals);
-
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess,
-          signals: allBoundarySignals.map((s) => ({ symbol: s.symbol, root_tf: s.root_tf, eventId: s.eventId }))
-        },
-        'poller: root TF candle open scan complete (Telegram sent: summary block + per-signal block + recommended blocks)'
-      );
+      notificationQueue.enqueueStartupBatch(allBoundarySignals);
     }
 
     return detectedNewCandles;
