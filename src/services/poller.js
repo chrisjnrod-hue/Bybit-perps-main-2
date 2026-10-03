@@ -1,4 +1,3 @@
-
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
 const bybitWs = require('./bybitWs');
