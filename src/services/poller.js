@@ -422,7 +422,9 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // This is the actual "WS-triggered signal detection" path for mid-candle updates.
+      // This is the actual "WS-triggered signal detection" path.
+      // It reuses the same detection logic as the scan loops but bypasses the wait for
+      // the next boundary loop, so the signal is detected immediately on realtime WS candle data.
       const midFlip = await detectMidCandleFlip(symbol, tf);
 
       if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
