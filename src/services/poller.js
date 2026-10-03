@@ -422,9 +422,7 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // This is the actual "WS-triggered signal detection" path.
-      // It reuses the same detection logic as the scan loops but bypasses the wait for
-      // the next boundary loop, so the signal is detected immediately on realtime WS candle data.
+      // This is the actual "WS-triggered signal detection" path for mid-candle updates.
       const midFlip = await detectMidCandleFlip(symbol, tf);
 
       if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
@@ -465,55 +463,6 @@ function registerBybitWsListeners() {
             );
           }
         }
-      }
-
-      // Root-candle opening detection with WS incoming kline.
-      // This is used to detect a new root candle without waiting for the scheduled boundary loop.
-      const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
-      const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
-
-      if (openTime > processedOpen) {
-        const flip = await macdUtil.isMacdFlip(symbol, tf);
-
-        if (flip && !alreadyProcessedSignal(wsSignal, 'ws_rootcandle')) {
-          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-          if (mtfValidation.isAligned) {
-            const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
-
-            const signal = await signalManager.handleRootSignal({
-              symbol,
-              root_tf: tf,
-              detected_at: Date.now(),
-              candle_open_time: openTime,
-              eventId: rootEventId,
-              signalType: 'rootcandle_update',
-              notifyImmediately: false
-            });
-
-            if (signal) {
-              const rootSignal = {
-                ...signal,
-                eventId: rootEventId,
-                notificationType: 'new_root_candle',
-                signalType: 'rootcandle_update'
-              };
-
-              notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  openTime,
-                  rootEventId
-                },
-                'poller.ws: ws-triggered root candle signal enqueued'
-              );
-            }
-          }
-        }
-
-        dbModule.setState(processedStateKey, openTime);
       }
     } catch (err) {
       logger.debug(
