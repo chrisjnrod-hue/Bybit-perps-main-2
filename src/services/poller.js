@@ -2067,6 +2067,94 @@ module.exports = {
         tfsToProcess.join(',')
       );
     }
+        // SUMMARY BLOCK
+    const summaryBlock = {
+      timestamp: new Date(nowMs).toISOString(),
+      scanType: 'root_tf_candle_open',
+      timeframes: tfsToProcess,
+      totalSymbolsScanned: validRows.length,
+      newCandlesDetected: detectedNewCandles,
+      signalsGenerated: allBoundarySignals.length,
+      acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
+      monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
+      avgMtfScore: allBoundarySignals.length > 0
+        ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
+        : 'N/A',
+      detailedBreakdown: tfsToProcess.map(tf => {
+        const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
+        return {
+          timeframe: tf,
+          signalCount: tfSignals.length,
+          acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
+          monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
+        };
+      })
+    };
+
+    logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
+
+    // SIGNAL PER BLOCK
+    for (const signal of allBoundarySignals) {
+      const signalBlock = {
+        symbol: signal.symbol,
+        timeframe: normalizeRootTf(signal.root_tf),
+        candleOpenTime: new Date(signal.candle_open_time).toISOString(),
+        eventId: signal.eventId,
+        decision: signal.meta?.decision || 'unknown',
+        mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
+        mtfAligned: signal.meta?.mtfAligned || false,
+        alignmentDetails: signal.meta?.alignment || {},
+        acceptReason: signal.meta?.acceptReason || 'none',
+        confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
+      };
+
+      logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
+    }
+
+    // RECOMMENDED BLOCKS
+    const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
+    const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
+
+    if (acceptedSignals.length > 0) {
+      const acceptedBlock = {
+        actionType: 'ACCEPT',
+        count: acceptedSignals.length,
+        reason: 'MTF alignment threshold met (≥ 60%)',
+        signals: acceptedSignals.map(s => ({
+          symbol: s.symbol,
+          timeframe: normalizeRootTf(s.root_tf),
+          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+        })),
+        recommendation: 'Process these signals for potential trade entry'
+      };
+
+      logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
+    }
+
+    if (monitorSignals.length > 0) {
+      const monitorBlock = {
+        actionType: 'MONITOR',
+        count: monitorSignals.length,
+        reason: 'MTF alignment below threshold (< 60%)',
+        signals: monitorSignals.map(s => ({
+          symbol: s.symbol,
+          timeframe: normalizeRootTf(s.root_tf),
+          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+        })),
+        recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
+      };
+
+      logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
+    }
+
+    if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
+      logger.info(
+        { timeframes: tfsToProcess },
+        'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+      );
+          }
 
     return detectedNewCandles;
   },
