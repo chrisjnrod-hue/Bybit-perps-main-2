@@ -1762,35 +1762,6 @@ module.exports = {
           );
         });
     });
-  }
-      if (allBoundarySignals.length > 0) {
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
-        },
-        'poller: enqueueing root TF candle open notifications via summary + per-block flow'
-      );
-
-      notificationQueue.enqueueRootCandleOpenBatch(
-        allBoundarySignals,
-        tfsToProcess.join(',')
-      );
-    } else if (detectedNewCandles) {
-      logger.info(
-        {
-          timeframes: tfsToProcess
-        },
-        'poller: root TF candle open boundary detected; dispatching batch summary'
-      );
-
-      notificationQueue.enqueueRootCandleOpenBatch(
-        [],
-        tfsToProcess.join(',')
-      );
-    }
-
-    return detectedNewCandles;
   },
 
   async runRootTfCandleOpenLoop() {
@@ -1985,7 +1956,7 @@ module.exports = {
               };
 
               // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
-              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+              if (isStartupBatchSignal(rootCandidate, 'rootcandle_update')) {
                 logger.debug(
                   {
                     symbol,
@@ -1995,7 +1966,7 @@ module.exports = {
                   },
                   'poller: skipping startup-batch duplicate root candle signal'
                 );
-              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle_update')) {
                 const signal =
                   await signalManager.handleRootSignal(rootCandidate);
 
@@ -2093,18 +2064,6 @@ module.exports = {
 
       notificationQueue.enqueueRootCandleOpenBatch(
         allBoundarySignals,
-        tfsToProcess.join(',')
-      );
-    } else if (detectedNewCandles) {
-      logger.info(
-        {
-          timeframes: tfsToProcess
-        },
-        'poller: root TF candle open boundary detected; dispatching batch summary'
-      );
-
-      notificationQueue.enqueueRootCandleOpenBatch(
-        [],
         tfsToProcess.join(',')
       );
     }
