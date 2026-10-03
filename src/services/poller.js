@@ -1956,7 +1956,7 @@ module.exports = {
               };
 
               // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
-              if (isStartupBatchSignal(rootCandidate, 'rootcandle_update')) {
+              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
                 logger.debug(
                   {
                     symbol,
@@ -1966,7 +1966,7 @@ module.exports = {
                   },
                   'poller: skipping startup-batch duplicate root candle signal'
                 );
-              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle_update')) {
+              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
                 const signal =
                   await signalManager.handleRootSignal(rootCandidate);
 
