@@ -221,6 +221,27 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
   ].join(':');
 }
 
+function startupBatchKeyFromSignal(signal) {
+  if (!signal || !signal.symbol || !signal.root_tf) {
+    return null;
+  }
+
+  const symbol = String(signal.symbol).toUpperCase();
+  const rootTf = normalizeRootTf(signal.root_tf);
+  const candleOpenTime = Number(
+    signal.candle_open_time ??
+    signal.candleOpenTime ??
+    signal.detected_at ??
+    0
+  );
+
+  const effectiveCandle = Number.isFinite(candleOpenTime)
+    ? candleOpenTime
+    : 0;
+
+  return `${symbol}|${rootTf}|${effectiveCandle}`;
+}
+
 function dedupKeyFromSignal(signal, family = 'generic') {
   if (!signal || !signal.symbol || !signal.root_tf) {
     return null;
@@ -239,12 +260,14 @@ function dedupKeyFromSignal(signal, family = 'generic') {
     ? candleOpenTime
     : 0;
 
-  const familyName = String(family || 'generic').toLowerCase();
-
-  return `${symbol}|${rootTf}|${effectiveCandle}|${familyName}`;
+  return `${symbol}|${rootTf}|${effectiveCandle}|${String(family).toLowerCase()}`;
 }
 
 function alreadyProcessedSignal(signal, family = 'generic') {
+  if (isStartupBatchSignal(signal, family)) {
+    return true;
+  }
+
   const key = dedupKeyFromSignal(signal, family);
   if (!key) {
     return true;
@@ -268,22 +291,58 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   }
 }
 
-// IMPORTANT: family must match the actual signal.signalType that was used
-// when the startup batch was registered, otherwise the duplicate check fails.
 function registerStartupBatchSignal(signal, family = 'generic') {
-  const key = dedupKeyFromSignal(signal, family);
-  if (!key) {
-    return;
+  const baseKey = startupBatchKeyFromSignal(signal);
+  if (baseKey) {
+    startupBatchSignalKeys.add(baseKey);
   }
-  startupBatchSignalKeys.add(key);
+
+  const key = dedupKeyFromSignal(signal, family);
+  if (key) {
+    startupBatchSignalKeys.add(key);
+    processedEventKeys.set(key, Date.now());
+  }
+
+  const symbol = String(signal?.symbol || '').toUpperCase();
+  const rootTf = normalizeRootTf(signal?.root_tf);
+  const candleOpenTime = Number(
+    signal?.candle_open_time ??
+    signal?.candleOpenTime ??
+    signal?.detected_at ??
+    0
+  );
+  const effectiveCandle = Number.isFinite(candleOpenTime) ? candleOpenTime : 0;
+
+  if (symbol && rootTf) {
+    const families = [
+      'generic',
+      'midcandle',
+      'rootcandle',
+      'alignment',
+      'ws_midcandle',
+      'ws_rootcandle',
+      'rootcandle_update',
+      'midcandle_update',
+      'mtf_alignment'
+    ];
+    for (const fam of families) {
+      processedEventKeys.set(`${symbol}|${rootTf}|${effectiveCandle}|${fam}`, Date.now());
+    }
+  }
 }
 
 function isStartupBatchSignal(signal, family = 'generic') {
-  const key = dedupKeyFromSignal(signal, family);
-  if (!key) {
-    return false;
+  const baseKey = startupBatchKeyFromSignal(signal);
+  if (baseKey && startupBatchSignalKeys.has(baseKey)) {
+    return true;
   }
-  return startupBatchSignalKeys.has(key);
+
+  const key = dedupKeyFromSignal(signal, family);
+  if (key && startupBatchSignalKeys.has(key)) {
+    return true;
+  }
+
+  return false;
 }
 
 async function validateMtfAlignmentConsensus(symbol) {
@@ -363,6 +422,9 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
+      // This is the actual "WS-triggered signal detection" path.
+      // It reuses the same detection logic as the scan loops but bypasses the wait for
+      // the next boundary loop, so the signal is detected immediately on realtime WS candle data.
       const midFlip = await detectMidCandleFlip(symbol, tf);
 
       if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
@@ -405,6 +467,8 @@ function registerBybitWsListeners() {
         }
       }
 
+      // Root-candle opening detection with WS incoming kline.
+      // This is used to detect a new root candle without waiting for the scheduled boundary loop.
       const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
 
@@ -484,6 +548,7 @@ module.exports = {
       );
     }
 
+    // IMPORTANT: register actual bybitWS listeners before running loops
     registerBybitWsListeners();
 
     if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
@@ -1033,42 +1098,13 @@ module.exports = {
           'scanAllForStartup: enqueueing startup notification batch'
         );
 
-        // FIX 1: register startup batch with the real signal type to prevent duplicates
-        // after the initial startup summary block is already sent.
         for (const signal of newSignals) {
-          const family = signal.signalType || 'rootcandle_update';
-          registerStartupBatchSignal(signal, family);
+          registerStartupBatchSignal(signal, signal.signalType || 'rootcandle_update');
         }
 
-        if (typeof notificationQueue.enqueueStartupBatch === 'function') {
-          notificationQueue.enqueueStartupBatch(newSignals);
-        }
-
-        // Optional fallback: still send per-signal items for explicit per-block processing
-        for (const signal of newSignals) {
-          try {
-            const family = signal.signalType || 'rootcandle_update';
-            const queued = notificationQueue.enqueueSignal(
-              signal,
-              family
-            );
-
-            logger.info(
-              {
-                symbol: signal.symbol,
-                root_tf: signal.root_tf,
-                queued,
-                signalType: family
-              },
-              'poller.scanAllForStartup: startup signal enqueued individually'
-            );
-          } catch (err) {
-            logger.error(
-              { err, signal },
-              'poller.scanAllForStartup: failed to enqueue startup signal'
-            );
-          }
-        }
+        notificationQueue.enqueueStartupBatch(
+          newSignals
+        );
       } else {
         logger.info(
           'scanAllForStartup: no startup signals found'
@@ -1390,6 +1426,7 @@ module.exports = {
             ) || 0
           );
 
+          // New root candle already handled by root-candle loop.
           if (latestOpen > processedOpen) {
             logger.debug(
               {
@@ -1446,10 +1483,8 @@ module.exports = {
                   notifyImmediately: true
                 };
 
-                // FIX 2: family must be the actual signal type used at registration time.
-                const startupFamily = midSignalCandidate.signalType || 'midcandle_update';
-
-                if (isStartupBatchSignal(midSignalCandidate, startupFamily)) {
+                // 1) Do not duplicate startup-batch signals
+                if (isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
                   logger.debug(
                     {
                       symbol,
@@ -1462,7 +1497,9 @@ module.exports = {
                   continue;
                 }
 
-                if (!alreadyProcessedSignal(midSignalCandidate, startupFamily)) {
+                // 2) Always process new mid-candle root flips, even when MTF is not aligned
+                //    decision is set based on mtf validation below
+                if (!alreadyProcessedSignal(midSignalCandidate, 'midcandle')) {
                   const signal =
                     await signalManager.handleRootSignal(midSignalCandidate);
 
@@ -1516,6 +1553,7 @@ module.exports = {
               }
             }
           } else {
+            // 3) Existing active signal path remains monitoring-only, not signal detection
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1560,10 +1598,7 @@ module.exports = {
                 }
               };
 
-              if (
-                !alreadyProcessedSignal(alertSignalCandidate, 'mtf_alignment') &&
-                !isStartupBatchSignal(alertSignalCandidate, 'mtf_alignment')
-              ) {
+              if (!alreadyProcessedSignal(alertSignalCandidate, 'alignment') && !isStartupBatchSignal(alertSignalCandidate, 'alignment')) {
                 dbModule.setState(
                   alignmentStateKey,
                   String(true)
@@ -1638,9 +1673,7 @@ module.exports = {
 
     for (const signal of newSignals) {
       try {
-        const signalFamily = signal.signalType || 'midcandle_update';
-
-        if (isStartupBatchSignal(signal, signalFamily)) {
+        if (isStartupBatchSignal(signal, signal.signalType || 'midcandle_update')) {
           logger.debug(
             {
               symbol: signal.symbol,
@@ -1655,7 +1688,7 @@ module.exports = {
         const queued =
           notificationQueue.enqueueSignal(
             signal,
-            signalFamily
+            'midcandle_update'
           );
 
         logger.info(
@@ -1922,9 +1955,8 @@ module.exports = {
                 notifyImmediately: false
               };
 
-              const startupFamily = rootCandidate.signalType || 'rootcandle_update';
-
-              if (isStartupBatchSignal(rootCandidate, startupFamily)) {
+              // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
+              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
                 logger.debug(
                   {
                     symbol,
@@ -1934,7 +1966,7 @@ module.exports = {
                   },
                   'poller: skipping startup-batch duplicate root candle signal'
                 );
-              } else if (!alreadyProcessedSignal(rootCandidate, startupFamily)) {
+              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
                 const signal =
                   await signalManager.handleRootSignal(rootCandidate);
 
@@ -2030,40 +2062,10 @@ module.exports = {
         'poller: enqueueing root TF candle open notifications via summary + per-block flow'
       );
 
-      // FIX 3: This is the "summary block + all signals per block + recommended blocks" flow.
-      // The batch method should render the summary structure; the per-signal method ensures
-      // the individual signal blocks are also sent.
-      if (typeof notificationQueue.enqueueRootCandleOpenBatch === 'function') {
-        notificationQueue.enqueueRootCandleOpenBatch(
-          allBoundarySignals,
-          tfsToProcess.join(',')
-        );
-      }
-
-      for (const signal of allBoundarySignals) {
-        try {
-          const family = signal.signalType || 'rootcandle_update';
-          const queued = notificationQueue.enqueueSignal(
-            signal,
-            family
-          );
-
-          logger.info(
-            {
-              symbol: signal.symbol,
-              root_tf: signal.root_tf,
-              queued,
-              signalType: family
-            },
-            'poller: root opening signal enqueued individually'
-          );
-        } catch (err) {
-          logger.error(
-            { err, signal },
-            'poller: FAILED to enqueue root candle signal'
-          );
-        }
-      }
+      notificationQueue.enqueueRootCandleOpenBatch(
+        allBoundarySignals,
+        tfsToProcess.join(',')
+      );
     }
 
     return detectedNewCandles;
