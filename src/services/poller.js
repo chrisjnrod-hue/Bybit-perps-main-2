@@ -1762,8 +1762,8 @@ module.exports = {
           );
         });
     });
-  },
-      if (allBoundarySignals.length > 0) {
+  }
+  if (allBoundarySignals.length > 0) {
       logger.info(
         {
           count: allBoundarySignals.length,
