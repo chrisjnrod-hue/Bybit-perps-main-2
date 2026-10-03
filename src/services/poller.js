@@ -359,9 +359,9 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // This is the actual "WS-triggered signal detection" path.
-      // It reuses the same detection logic as the scan loops but bypasses the wait for
-      // the next boundary loop, so the signal is detected immediately on realtime WS candle data.
+      // =================================================================
+      // WS MID-CANDLE FLIP DETECTION (on the SAME root candle)
+      // =================================================================
       const midFlip = await detectMidCandleFlip(symbol, tf);
 
       if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
@@ -370,7 +370,7 @@ function registerBybitWsListeners() {
         if (mtfValidation.isAligned) {
           const eventId = buildEventId('midcandle', symbol, tf, openTime);
 
-          const signal = await signalManager.handleRootSignal({
+          const midSignalCandidate = {
             symbol,
             root_tf: tf,
             detected_at: Date.now(),
@@ -378,34 +378,61 @@ function registerBybitWsListeners() {
             eventId,
             signalType: 'midcandle_update',
             notifyImmediately: true
-          });
+          };
 
-          if (signal) {
-            const finalSignal = {
-              ...signal,
-              eventId,
-              notificationType: 'midcandle_update',
-              signalType: 'midcandle_update'
-            };
+          // Skip if already in startup batch
+          if (!isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
+            const signal = await signalManager.handleRootSignal(midSignalCandidate);
 
-            const queued = notificationQueue.enqueueSignal(finalSignal, 'midcandle_update');
+            if (signal) {
+              const finalSignal = {
+                ...signal,
+                eventId,
+                notificationType: 'midcandle_update',
+                signalType: 'midcandle_update'
+              };
 
-            logger.info(
+              const queued = notificationQueue.enqueueSignal(finalSignal, 'midcandle_update');
+
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  openTime,
+                  queued,
+                  eventId,
+                  source: 'ws_midcandle'
+                },
+                'poller.ws: ws-triggered midcandle update enqueued'
+              );
+            }
+          } else {
+            logger.debug(
               {
                 symbol,
                 tf,
                 openTime,
-                queued,
                 eventId
               },
-              'poller.ws: ws-triggered midcandle update enqueued'
+              'poller.ws: skipping startup-batch duplicate midcandle signal'
             );
           }
+        } else {
+          logger.debug(
+            {
+              symbol,
+              tf,
+              mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+              reason: mtfValidation.reason
+            },
+            'poller.ws: mid-candle flip detected but MTF not aligned; skipping'
+          );
         }
       }
 
-      // Root-candle opening detection with WS incoming kline.
-      // This is used to detect a new root candle without waiting for the scheduled boundary loop.
+      // =================================================================
+      // WS ROOT CANDLE OPENING DETECTION (NEW root candle boundary)
+      // =================================================================
       const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
 
@@ -418,7 +445,7 @@ function registerBybitWsListeners() {
           if (mtfValidation.isAligned) {
             const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
 
-            const signal = await signalManager.handleRootSignal({
+            const rootCandidate = {
               symbol,
               root_tf: tf,
               detected_at: Date.now(),
@@ -426,27 +453,49 @@ function registerBybitWsListeners() {
               eventId: rootEventId,
               signalType: 'rootcandle_update',
               notifyImmediately: false
-            });
+            };
 
-            if (signal) {
-              const rootSignal = {
-                ...signal,
-                eventId: rootEventId,
-                notificationType: 'new_root_candle',
-                signalType: 'rootcandle_update'
-              };
+            // Skip if already in startup batch
+            if (!isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+              const signal = await signalManager.handleRootSignal(rootCandidate);
 
-              notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
-              logger.info(
+              if (signal) {
+                const rootSignal = {
+                  ...signal,
+                  eventId: rootEventId,
+                  notificationType: 'new_root_candle',
+                  signalType: 'rootcandle_update'
+                };
+
+                notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
+
+                logger.info(
+                  {
+                    symbol,
+                    tf,
+                    openTime,
+                    rootEventId,
+                    source: 'ws_rootcandle'
+                  },
+                  'poller.ws: ws-triggered root candle signal enqueued'
+                );
+              }
+            } else {
+              logger.debug(
                 {
                   symbol,
                   tf,
                   openTime,
                   rootEventId
                 },
-                'poller.ws: ws-triggered root candle signal enqueued'
+                'poller.ws: skipping startup-batch duplicate root candle signal'
               );
             }
+          } else {
+            logger.debug(
+              { symbol, tf, reason: mtfValidation.reason },
+              'poller.ws: root flip detected but MTF consensus failed; skipping'
+            );
           }
         }
 
@@ -1363,7 +1412,7 @@ module.exports = {
             ) || 0
           );
 
-          // NEW ROOT TF CANDLE JUST OPENED: this is handled by the root-candle loop.
+          // NEW ROOT TF CANDLE JUST OPENED: this is handled by the root-candle loop + WS listeners.
           // Do not run mid-candle detection on the same candle, otherwise we duplicate the same root signal.
           if (latestOpen > processedOpen) {
             logger.debug(
@@ -1443,6 +1492,7 @@ module.exports = {
                       },
                       'poller.loop2: skipping startup-batch duplicate mid-candle signal'
                     );
+                    dbModule.setState(midCandleStateKey, Date.now());
                     continue;
                   }
 
@@ -1467,7 +1517,8 @@ module.exports = {
                           latestOpen,
                           eventId,
                           mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                          dedupKey
+                          dedupKey,
+                          source: 'loop2_fallback'
                         },
                         'poller.loop2: mid-candle histogram flip detected for new root signal (MTF aligned)'
                       );
@@ -1623,7 +1674,8 @@ module.exports = {
           {
             symbol: signal.symbol,
             root_tf: signal.root_tf,
-            queued
+            queued,
+            source: 'loop2_fallback'
           },
           'poller.loop2: midcandle update enqueued'
         );
@@ -1660,8 +1712,8 @@ module.exports = {
       } catch (err) {
         logger.error(
           {
-          err,
-          alert
+            err,
+            alert
           },
           'poller.loop2: FAILED to enqueue alignment alert'
         );
