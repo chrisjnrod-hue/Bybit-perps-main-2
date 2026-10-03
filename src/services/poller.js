@@ -1763,7 +1763,7 @@ module.exports = {
         });
     });
   }
-  if (allBoundarySignals.length > 0) {
+      if (allBoundarySignals.length > 0) {
       logger.info(
         {
           count: allBoundarySignals.length,
@@ -1777,8 +1777,6 @@ module.exports = {
         tfsToProcess.join(',')
       );
     } else if (detectedNewCandles) {
-      // Keep the existing root-boundary summary behavior alive even when
-      // the signal is valid but gets filtered before being added to the batch.
       logger.info(
         {
           timeframes: tfsToProcess
@@ -1793,6 +1791,7 @@ module.exports = {
     }
 
     return detectedNewCandles;
+  },
 
   async runRootTfCandleOpenLoop() {
     while (isRunning) {
