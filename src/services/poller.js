@@ -289,78 +289,74 @@ module.exports = {
       }
     }
 
-    // Bind WebSockets listener for real-time boundary detection
     this.bindWsListeners();
 
-    // Start fallback clock loops (buffered to run AFTER WS listeners)
     this.startBoundaryScanLoop();
     logger.info(
-      'poller.start: boundary scan loop started (fallback)'
+      'poller.start: boundary scan loop started'
     );
 
     this.startRootTfCandleOpenLoop();
     logger.info(
-      'poller.start: root TF candle open loop started (fallback)'
+      'poller.start: root TF candle open loop started'
     );
   },
 
   bindWsListeners() {
     if (!bybitWs || typeof bybitWs.on !== 'function') {
-      logger.warn('poller: bybitWs.on is not available. Ensure bybitWs inherits EventEmitter and emits "kline" events to trigger WS boundary scans.');
+      logger.info('poller: bybitWs event emitter not attached; operating in polling mode.');
       return;
     }
 
-    bybitWs.on('kline', (data) => {
-      // Safely extract payload (adjust if your bybitWs payload structure differs slightly)
-      const symbol = data.symbol;
-      const rawTf = data.timeframe || data.interval;
-      const openTime = Number(data.open_time || data.openTime || data.start);
+    try {
+      bybitWs.on('kline', (data) => {
+        if (!data) return;
 
-      if (!symbol || !rawTf || !openTime) return;
+        const symbol = data.symbol;
+        const rawTf = data.timeframe || data.interval;
+        const openTime = Number(data.open_time || data.openTime || data.start);
 
-      const tf = normalizeRootTf(rawTf);
-      const rootTfs = buildRootTfs();
-      const now = Date.now();
+        if (!symbol || !rawTf || !openTime) return;
 
-      // 1. Root TF Boundary Detection via WS
-      if (rootTfs.includes(tf)) {
-        const stateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
-        const processed = Number(dbModule.getState(stateKey) || 0);
+        const tf = normalizeRootTf(rawTf);
+        const rootTfs = buildRootTfs();
+        const now = Date.now();
 
-        if (openTime > processed) {
-          if (!this.rootScanTimers[tf]) {
-            logger.info({ tf, symbol }, 'poller: WS detected new root candle open. Scheduling batched scan...');
-            // Debounce for 5 seconds to allow ALL symbols in the WS stream to update SQLite
-            this.rootScanTimers[tf] = setTimeout(() => {
-              this.runRootTfCandleOpenOnce([tf], Date.now());
-              this.rootScanTimers[tf] = null;
-            }, 5000); 
+        if (rootTfs.includes(tf)) {
+          const stateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
+          const processed = Number(dbModule.getState(stateKey) || 0);
+
+          if (openTime > processed) {
+            if (!this.rootScanTimers[tf]) {
+              logger.info({ tf, symbol }, 'poller: WS detected new root candle open');
+              this.rootScanTimers[tf] = setTimeout(() => {
+                this.runRootTfCandleOpenOnce([tf], Date.now());
+                this.rootScanTimers[tf] = null;
+              }, 8000); 
+            }
           }
         }
-      }
 
-      // 2. 5-Minute Boundary (Midcandle) Detection via WS
-      const current5mEpoch = Math.floor(now / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
-      const lastScanned5m = Number(dbModule.getState('poller.lastBoundaryScan') || 0);
+        const current5mEpoch = Math.floor(now / FIVE_MINUTES_MS) * FIVE_MINUTES_MS;
+        const lastScanned5m = Number(dbModule.getState('poller.lastBoundaryScan') || 0);
 
-      if (current5mEpoch > lastScanned5m) {
-        // Ensure the clock has technically passed the boundary by at least a second
-        if (now - current5mEpoch > 1000) {
+        if (current5mEpoch > lastScanned5m && (now - current5mEpoch > 2000)) {
           if (!this.boundaryScanTimer) {
             dbModule.setState('poller.lastBoundaryScan', current5mEpoch);
-            logger.info({ current5mEpoch: new Date(current5mEpoch).toISOString() }, 'poller: WS detected 5m boundary crossing. Scheduling midcandle scan...');
+            logger.info({ current5mEpoch: new Date(current5mEpoch).toISOString() }, 'poller: WS detected 5m boundary crossing');
             
-            // Debounce for 5 seconds to ensure DB is populated
             this.boundaryScanTimer = setTimeout(() => {
               this.runBoundaryScanOnce();
               this.boundaryScanTimer = null;
-            }, 5000);
+            }, 6000);
           }
         }
-      }
-    });
+      });
 
-    logger.info('poller: WS boundary listeners successfully bound for flip detection.');
+      logger.info('poller: WS boundary listeners successfully bound');
+    } catch (err) {
+      logger.warn({ err }, 'poller: failed to bind WS event listeners');
+    }
   },
 
   async initialScan(options = {}) {
@@ -1024,11 +1020,10 @@ module.exports = {
       const nextBoundary =
         this.getNextFiveMinuteBoundaryMs();
 
-      // IMPORTANT ADDITION: +5000ms offset
-      // If WS doesn't trigger it, fallback runs 5s late to ensure SQLite is populated.
+      // Buffer 10 seconds past 5m boundary to allow REST/WS database updates
       const delay = Math.max(
         0,
-        nextBoundary - Date.now() + 5000 
+        nextBoundary - Date.now() + 10000 
       );
 
       await sleep(delay);
@@ -1084,7 +1079,6 @@ module.exports = {
     const newSignals = [];
     const alignmentAlerts = [];
 
-    // Retrieve active summary signals snapshot ONCE per pass
     const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
 
     for (const row of validRows) {
@@ -1119,8 +1113,6 @@ module.exports = {
             ) || 0
           );
 
-          // If WS populated a brand new root candle, we skip midcandle evaluation 
-          // because it will be processed by the root TF boundary scanner.
           if (latestOpen > processedOpen) {
             continue;
           }
@@ -1135,7 +1127,6 @@ module.exports = {
           const isAlreadyInSummary = activeSignals.length > 0;
 
           if (!isAlreadyInSummary) {
-            // DEDUPLICATION CHECK: Ensure we haven't already fired midcandle for this specific candle
             const midCandleStateKey =
               `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
 
@@ -1143,6 +1134,9 @@ module.exports = {
               dbModule.getState(midCandleStateKey);
 
             if (!midCandleAlreadyReported) {
+              // Ensure live developing candle is refreshed before checking histogram flip
+              await this.seedKlinesForSymbol(symbol, tf);
+
               const midCandleFlip =
                 await detectMidCandleFlip(
                   symbol,
@@ -1198,7 +1192,6 @@ module.exports = {
                     );
                   }
 
-                  // Prevents duplicate midcandle signals for this candle open time
                   dbModule.setState(
                     midCandleStateKey,
                     Date.now()
@@ -1207,7 +1200,6 @@ module.exports = {
               }
             }
           } else {
-            // ALREADY ACTIVE: Only evaluate MTF alignment consensus changes
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1279,7 +1271,7 @@ module.exports = {
       }
     }
 
-    // REQUIREMENT 1: One signal per block for 5mboundary Midcandle
+    // Deliver mid-candle updates (1 signal per message block)
     for (const signal of newSignals) {
       try {
         notificationQueue.enqueueSignal(
@@ -1291,7 +1283,7 @@ module.exports = {
       }
     }
 
-    // REQUIREMENT 2: One signal per block MTF alignment alert
+    // Deliver MTF alignment alerts (1 signal per message block)
     for (const alert of alignmentAlerts) {
       try {
         notificationQueue.enqueueSignal(
@@ -1346,11 +1338,10 @@ module.exports = {
         }
       }
 
-      // IMPORTANT ADDITION: +5000ms offset
-      // Fallback delay ensuring DB is written to by WS before timer fires
+      // Buffer 12 seconds past timeframe boundary to ensure Bybit API has published new candle
       const delay = Math.max(
         0,
-        nextBoundaryMs - Date.now() + 5000 
+        nextBoundaryMs - Date.now() + 12000 
       );
 
       await sleep(delay);
@@ -1366,7 +1357,7 @@ module.exports = {
         for (let attempt = 1; attempt <= 3; attempt++) {
           scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
           if (scannedSuccess || attempt === 3) break;
-          await sleep(2000);
+          await sleep(3000);
         }
       } catch (err) {
         logger.error(
@@ -1449,7 +1440,11 @@ module.exports = {
             ) || 0
           );
 
-          if (latestOpen === null || latestOpen <= processedOpen) {
+          const tfMs = getRootTfMs(tf);
+          const expectedBoundaryOpen = Math.floor(nowMs / tfMs) * tfMs;
+
+          // Force fresh fetch if DB is trailing behind expected open time
+          if (latestOpen === null || latestOpen < expectedBoundaryOpen) {
             await this.seedKlinesForSymbol(symbol, tf);
             latestOpen = getLatestOpenTime(db, symbol, tf);
           }
@@ -1492,14 +1487,12 @@ module.exports = {
                     notificationType: 'new_root_candle'
                   });
 
-                  // DEDUPLICATION: Prevents the 5m loop from pushing this as a midcandle alert
                   const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
                   dbModule.setState(midCandleStateKey, Date.now());
                 }
               }
             }
 
-            // DEDUPLICATION: Prevents this root candle open from being processed a second time
             dbModule.setState(
               processedStateKey,
               latestOpen
@@ -1514,7 +1507,7 @@ module.exports = {
       }
     }
 
-    // REQUIREMENT 3: Newroottfcandleopen summary+signal blocks+recommended blocks
+    // Deliver batch update (Summary + Signal Blocks + Recommended Blocks)
     if (allBoundarySignals.length > 0) {
       notificationQueue.enqueueStartupBatch(allBoundarySignals);
     }
