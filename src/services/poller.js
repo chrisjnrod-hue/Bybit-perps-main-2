@@ -1763,6 +1763,36 @@ module.exports = {
         });
     });
   },
+      if (allBoundarySignals.length > 0) {
+      logger.info(
+        {
+          count: allBoundarySignals.length,
+          timeframes: tfsToProcess
+        },
+        'poller: enqueueing root TF candle open notifications via summary + per-block flow'
+      );
+
+      notificationQueue.enqueueRootCandleOpenBatch(
+        allBoundarySignals,
+        tfsToProcess.join(',')
+      );
+    } else if (detectedNewCandles) {
+      // Keep the existing root-boundary summary behavior alive even when
+      // the signal is valid but gets filtered before being added to the batch.
+      logger.info(
+        {
+          timeframes: tfsToProcess
+        },
+        'poller: root TF candle open boundary detected; dispatching batch summary'
+      );
+
+      notificationQueue.enqueueRootCandleOpenBatch(
+        [],
+        tfsToProcess.join(',')
+      );
+    }
+
+    return detectedNewCandles;
 
   async runRootTfCandleOpenLoop() {
     while (isRunning) {
