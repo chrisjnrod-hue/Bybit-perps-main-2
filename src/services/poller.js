@@ -1952,7 +1952,7 @@ module.exports = {
                 candle_open_time: latestOpen,
                 eventId,
                 signalType: 'rootcandle_update',
-                notifyImmediately: false
+                notifyImmediately: true
               };
 
               // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
