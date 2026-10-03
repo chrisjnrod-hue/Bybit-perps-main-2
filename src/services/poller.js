@@ -1935,100 +1935,95 @@ module.exports = {
                 tf
               );
 
-            const mtfValidation =
-              await validateMtfAlignmentConsensus(symbol);
+            if (flip) {
+              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-            const eventId = buildEventId(
-              'rootcandle',
-              symbol,
-              tf,
-              latestOpen
-            );
-
-            const rootCandidate = {
-              symbol,
-              root_tf: tf,
-              detected_at: Date.now(),
-              candle_open_time: latestOpen,
-              eventId,
-              signalType: 'rootcandle_update',
-              notifyImmediately: false
-            };
-
-            // FIX:
-            // Do not block summary/per-block generation on "MACD flip == false".
-            // Root candle boundary should still produce the summary block and per-block
-            // signals for follow-up monitoring/recommendation logic.
-            if (
-              isStartupBatchSignal(rootCandidate, 'rootcandle')
-            ) {
-              logger.debug(
-                {
-                  symbol,
-                  tf,
-                  latestOpen,
-                  eventId
-                },
-                'poller: skipping startup-batch duplicate root candle signal'
+              const eventId = buildEventId(
+                'rootcandle',
+                symbol,
+                tf,
+                latestOpen
               );
-            } else if (
-              !alreadyProcessedSignal(rootCandidate, 'rootcandle')
-            ) {
-              const signal =
-                await signalManager.handleRootSignal(rootCandidate);
 
-              if (signal) {
-                const decision =
-                  flip && mtfValidation.isAligned
-                    ? 'accept'
-                    : 'monitor';
+              const rootCandidate = {
+                symbol,
+                root_tf: tf,
+                detected_at: Date.now(),
+                candle_open_time: latestOpen,
+                eventId,
+                signalType: 'rootcandle_update',
+                notifyImmediately: false
+              };
 
-                const finalSignal = {
-                  ...signal,
-                  eventId,
-                  notificationType: 'new_root_candle',
-                  signalType: 'rootcandle_update',
-                  state: decision,
-                  meta: {
-                    ...(signal.meta || {}),
-                    mtfScore: mtfValidation.mtfScore,
-                    mtfAligned: mtfValidation.isAligned,
-                    alignment: mtfValidation.alignment || {},
-                    decision,
-                    acceptReason:
-                      flip && mtfValidation.isAligned
-                        ? 'mtf_alignment_met'
-                        : 'mtf_alignment_monitor',
-                    tvScore: 0,
-                    tvSource: 'loop2',
-                    hasFlip: !!flip
-                  }
-                };
-
-                allBoundarySignals.push(finalSignal);
-
-                const midCandleStateKey =
-                  `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-
-                dbModule.setState(
-                  midCandleStateKey,
-                  Date.now()
-                );
-
-                logger.info(
+              // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
+              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+                logger.debug(
                   {
                     symbol,
                     tf,
                     latestOpen,
-                    eventId,
-                    flip,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    decision,
-                    mtfAligned: mtfValidation.isAligned
+                    eventId
                   },
-                  'poller: root candle boundary signal enqueued with decision tag'
+                  'poller: skipping startup-batch duplicate root candle signal'
                 );
+              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+                const signal =
+                  await signalManager.handleRootSignal(rootCandidate);
+
+                if (signal) {
+                  const decision =
+                    mtfValidation.isAligned
+                      ? 'accept'
+                      : 'monitor';
+
+                  const finalSignal = {
+                    ...signal,
+                    eventId,
+                    notificationType: 'new_root_candle',
+                    signalType: 'rootcandle_update',
+                    state: decision,
+                    meta: {
+                      ...(signal.meta || {}),
+                      mtfScore: mtfValidation.mtfScore,
+                      mtfAligned: mtfValidation.isAligned,
+                      alignment: mtfValidation.alignment || {},
+                      decision,
+                      acceptReason: mtfValidation.isAligned
+                        ? 'mtf_alignment_met'
+                        : 'mtf_alignment_monitor',
+                      tvScore: 0,
+                      tvSource: 'loop2'
+                    }
+                  };
+
+                  allBoundarySignals.push(finalSignal);
+
+                  const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                  dbModule.setState(midCandleStateKey, Date.now());
+
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      latestOpen,
+                      eventId,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      decision,
+                      mtfAligned: mtfValidation.isAligned
+                    },
+                    'poller: root candle flip detected and enqueued with decision tag'
+                  );
+                }
               }
+            } else {
+              logger.debug(
+                {
+                  symbol,
+                  tf,
+                  latestOpen
+                },
+                'poller: new root candle found but no MACD flip'
+              );
             }
 
             dbModule.setState(
@@ -2069,6 +2064,18 @@ module.exports = {
 
       notificationQueue.enqueueRootCandleOpenBatch(
         allBoundarySignals,
+        tfsToProcess.join(',')
+      );
+    } else if (detectedNewCandles) {
+      logger.info(
+        {
+          timeframes: tfsToProcess
+        },
+        'poller: root TF candle open boundary detected; dispatching batch summary'
+      );
+
+      notificationQueue.enqueueRootCandleOpenBatch(
+        [],
         tfsToProcess.join(',')
       );
     }
