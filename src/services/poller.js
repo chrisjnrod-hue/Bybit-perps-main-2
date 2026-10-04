@@ -21,7 +21,6 @@ const FIVE_MINUTES_MS = 5 * 60 * 1000;
 let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
-let firstBoundaryScanned = false;
 
 // Global de-dupe registry used across 5m mid-candle, MTF alignment, and root-TF reopen flows.
 // Key format: symbol|root_tf|candle_open_time|signal_family
@@ -282,31 +281,10 @@ function alreadyProcessedSignal(signal, family = 'generic') {
   return false;
 }
 
-/**
- * FIXED: Timeframe-aware expiry
- * 1H signals expire after 2 × 60m = 120 minutes
- * 4H signals expire after 2 × 240m = 480 minutes  
- * 1D signals expire after 2 × 1440m = 2880 minutes
- */
-function clearExpiredProcessedSignalKeys() {
-  const rootTfs = buildRootTfs();
+function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   const now = Date.now();
 
-  const tfDurations = {};
-  for (const tf of rootTfs) {
-    tfDurations[tf] = getRootTfMs(tf);
-  }
-
   for (const [key, ts] of processedEventKeys.entries()) {
-    const parts = key.split('|');
-    if (parts.length < 2) {
-      continue;
-    }
-
-    const tf = parts[1];
-    const tfMs = tfDurations[tf] || 60 * 60 * 1000;
-    const ttlMs = tfMs * 2;
-
     if (now - ts > ttlMs) {
       processedEventKeys.delete(key);
     }
@@ -365,18 +343,6 @@ function isStartupBatchSignal(signal, family = 'generic') {
   }
 
   return false;
-}
-
-/**
- * FIXED: Clear startup batch cache at first boundary scan only
- * Only called once; preserves startup signal blocking after first boundary
- */
-function clearStartupBatchCacheAtFirstBoundary() {
-  if (!firstBoundaryScanned) {
-    firstBoundaryScanned = true;
-    startupBatchSignalKeys.clear();
-    logger.info('poller: cleared startup batch signal cache at first boundary scan');
-  }
 }
 
 async function validateMtfAlignmentConsensus(symbol) {
@@ -1396,7 +1362,6 @@ module.exports = {
 
   async runBoundaryScanOnce() {
     clearExpiredProcessedSignalKeys();
-    clearStartupBatchCacheAtFirstBoundary();
 
     const boundary = new Date();
 
@@ -1987,21 +1952,11 @@ module.exports = {
                 candle_open_time: latestOpen,
                 eventId,
                 signalType: 'rootcandle_update',
-                notifyImmediately: true
+                notifyImmediately: false
               };
 
-              // FIXED: Check if already processed by 5-min loop before enqueueing
-              if (alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
-                logger.debug(
-                  {
-                    symbol,
-                    tf,
-                    latestOpen,
-                    eventId
-                  },
-                  'poller: root candle already processed; skipping duplicate'
-                );
-              } else if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+              // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
+              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
                 logger.debug(
                   {
                     symbol,
@@ -2011,7 +1966,7 @@ module.exports = {
                   },
                   'poller: skipping startup-batch duplicate root candle signal'
                 );
-              } else {
+              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
                 const signal =
                   await signalManager.handleRootSignal(rootCandidate);
 
@@ -2037,7 +1992,7 @@ module.exports = {
                         ? 'mtf_alignment_met'
                         : 'mtf_alignment_monitor',
                       tvScore: 0,
-                      tvSource: 'root_tf_loop'
+                      tvSource: 'loop2'
                     }
                   };
 
@@ -2098,132 +2053,18 @@ module.exports = {
       }
     }
 
-    // FIXED: Enqueue all signals for delivery + log all three blocks
     if (allBoundarySignals.length > 0) {
       logger.info(
         {
           count: allBoundarySignals.length,
           timeframes: tfsToProcess
         },
-        'poller: enqueueing root TF candle open signals'
+        'poller: enqueueing root TF candle open notifications via summary + per-block flow'
       );
 
-      for (const signal of allBoundarySignals) {
-        try {
-          const queued = notificationQueue.enqueueSignal(
-            signal,
-            'new_root_candle'
-          );
-
-          logger.info(
-            {
-              symbol: signal.symbol,
-              timeframe: normalizeRootTf(signal.root_tf),
-              eventId: signal.eventId,
-              queued,
-              decision: signal.meta?.decision
-            },
-            'poller: root candle signal enqueued'
-          );
-        } catch (err) {
-          logger.error(
-            {
-              err,
-              symbol: signal.symbol,
-              tf: signal.root_tf
-            },
-            'poller: FAILED to enqueue root candle signal'
-          );
-        }
-      }
-    }
-
-    // SUMMARY BLOCK
-    const summaryBlock = {
-      timestamp: new Date(nowMs).toISOString(),
-      scanType: 'root_tf_candle_open',
-      timeframes: tfsToProcess,
-      totalSymbolsScanned: validRows.length,
-      newCandlesDetected: detectedNewCandles,
-      signalsGenerated: allBoundarySignals.length,
-      acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
-      monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
-      avgMtfScore: allBoundarySignals.length > 0
-        ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
-        : 'N/A',
-      detailedBreakdown: tfsToProcess.map(tf => {
-        const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
-        return {
-          timeframe: tf,
-          signalCount: tfSignals.length,
-          acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
-          monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
-        };
-      })
-    };
-
-    logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
-
-    // SIGNAL PER BLOCK
-    for (const signal of allBoundarySignals) {
-      const signalBlock = {
-        symbol: signal.symbol,
-        timeframe: normalizeRootTf(signal.root_tf),
-        candleOpenTime: new Date(signal.candle_open_time).toISOString(),
-        eventId: signal.eventId,
-        decision: signal.meta?.decision || 'unknown',
-        mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
-        mtfAligned: signal.meta?.mtfAligned || false,
-        alignmentDetails: signal.meta?.alignment || {},
-        acceptReason: signal.meta?.acceptReason || 'none',
-        confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
-      };
-
-      logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
-    }
-
-    // RECOMMENDED BLOCKS
-    const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
-    const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
-
-    if (acceptedSignals.length > 0) {
-      const acceptedBlock = {
-        actionType: 'ACCEPT',
-        count: acceptedSignals.length,
-        reason: 'MTF alignment threshold met (≥ 60%)',
-        signals: acceptedSignals.map(s => ({
-          symbol: s.symbol,
-          timeframe: normalizeRootTf(s.root_tf),
-          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-        })),
-        recommendation: 'Process these signals for potential trade entry'
-      };
-
-      logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
-    }
-
-    if (monitorSignals.length > 0) {
-      const monitorBlock = {
-        actionType: 'MONITOR',
-        count: monitorSignals.length,
-        reason: 'MTF alignment below threshold (< 60%)',
-        signals: monitorSignals.map(s => ({
-          symbol: s.symbol,
-          timeframe: normalizeRootTf(s.root_tf),
-          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-        })),
-        recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
-      };
-
-      logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
-    }
-
-    if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
-      logger.info(
-        { timeframes: tfsToProcess },
-        'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+      notificationQueue.enqueueRootCandleOpenBatch(
+        allBoundarySignals,
+        tfsToProcess.join(',')
       );
     }
 
