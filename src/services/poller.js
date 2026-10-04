@@ -1,3 +1,4 @@
+const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
 const bybitWs = require('./bybitWs');
@@ -2189,7 +2190,7 @@ module.exports = {
     );
 
     return detectedNewCandles;
-  }              
+  },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
     return `poller.loop2.processedCandle.${symbol}.${tf}`;
