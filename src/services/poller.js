@@ -21,6 +21,7 @@ const FIVE_MINUTES_MS = 5 * 60 * 1000;
 let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
+let firstBoundaryScanned = false;
 
 // Global de-dupe registry used across 5m mid-candle, MTF alignment, and root-TF reopen flows.
 // Key format: symbol|root_tf|candle_open_time|signal_family
@@ -281,10 +282,35 @@ function alreadyProcessedSignal(signal, family = 'generic') {
   return false;
 }
 
-function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
+/**
+ * UPDATED: Timeframe-aware expiry
+ * Signals expire after 2 full candle cycles of their timeframe.
+ * 1H signals: 2 hours
+ * 4H signals: 8 hours
+ * 1D signals: 2 days
+ */
+function clearExpiredProcessedSignalKeys() {
+  const rootTfs = buildRootTfs();
   const now = Date.now();
 
+  // Build a map of timeframes to their candle durations
+  const tfDurations = {};
+  for (const tf of rootTfs) {
+    tfDurations[tf] = getRootTfMs(tf);
+  }
+
   for (const [key, ts] of processedEventKeys.entries()) {
+    // Parse the key: symbol|root_tf|candle_open_time|signal_family
+    const parts = key.split('|');
+    if (parts.length < 2) {
+      // Malformed key, skip
+      continue;
+    }
+
+    const tf = parts[1]; // root_tf
+    const tfMs = tfDurations[tf] || 60 * 60 * 1000; // fallback to 1h
+    const ttlMs = tfMs * 2; // 2 candle cycles
+
     if (now - ts > ttlMs) {
       processedEventKeys.delete(key);
     }
@@ -343,6 +369,18 @@ function isStartupBatchSignal(signal, family = 'generic') {
   }
 
   return false;
+}
+
+/**
+ * UPDATED: Clear startup batch cache at first boundary scan
+ * Prevents startup signals from blocking forever
+ */
+function clearStartupBatchSignalKeys() {
+  if (!firstBoundaryScanned) {
+    startupBatchSignalKeys.clear();
+    firstBoundaryScanned = true;
+    logger.info('poller: cleared startup batch signal cache at first boundary scan');
+  }
 }
 
 async function validateMtfAlignmentConsensus(symbol) {
@@ -1362,6 +1400,7 @@ module.exports = {
 
   async runBoundaryScanOnce() {
     clearExpiredProcessedSignalKeys();
+    clearStartupBatchSignalKeys();
 
     const boundary = new Date();
 
@@ -1847,6 +1886,10 @@ module.exports = {
     }
   },
 
+  /**
+   * UPDATED: Root TF candle open scan that sends summary + per-signal + recommended blocks immediately
+   * No longer waits for 5-min boundary; sends all three block types immediately upon detection
+   */
   async runRootTfCandleOpenOnce(tfsInput, nowMs = Date.now()) {
     let tfsToProcess = Array.isArray(tfsInput) ? tfsInput : [];
 
@@ -1955,8 +1998,18 @@ module.exports = {
                 notifyImmediately: true
               };
 
-              // 4) Same rule: do not skip detection for MTF-not-aligned; set decision tag instead
-              if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+              // UPDATED: Check if 5-min loop already processed this signal
+              if (alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+                logger.debug(
+                  {
+                    symbol,
+                    tf,
+                    latestOpen,
+                    eventId
+                  },
+                  'poller: root candle already processed by 5-min loop; skipping re-enqueue'
+                );
+              } else if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
                 logger.debug(
                   {
                     symbol,
@@ -1966,7 +2019,7 @@ module.exports = {
                   },
                   'poller: skipping startup-batch duplicate root candle signal'
                 );
-              } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+              } else {
                 const signal =
                   await signalManager.handleRootSignal(rootCandidate);
 
@@ -1992,7 +2045,7 @@ module.exports = {
                         ? 'mtf_alignment_met'
                         : 'mtf_alignment_monitor',
                       tvScore: 0,
-                      tvSource: 'loop2'
+                      tvSource: 'root_tf_loop'
                     }
                   };
 
@@ -2053,21 +2106,10 @@ module.exports = {
       }
     }
 
-    if (allBoundarySignals.length > 0) {
-      logger.info(
-        {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
-        },
-        'poller: enqueueing root TF candle open notifications via summary + per-block flow'
-      );
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // SUMMARY BLOCK — Enqueued immediately at root TF boundary detection
+    // ═══════════════════════════════════════════════════════════════════════════════
 
-      notificationQueue.enqueueRootCandleOpenBatch(
-        allBoundarySignals,
-        tfsToProcess.join(',')
-      );
-    }
-        // SUMMARY BLOCK
     const summaryBlock = {
       timestamp: new Date(nowMs).toISOString(),
       scanType: 'root_tf_candle_open',
@@ -2093,7 +2135,10 @@ module.exports = {
 
     logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
 
-    // SIGNAL PER BLOCK
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // SIGNAL PER BLOCK — Enqueued immediately for each detected signal
+    // ═══════════════════════════════════════════════════════════════════════════════
+
     for (const signal of allBoundarySignals) {
       const signalBlock = {
         symbol: signal.symbol,
@@ -2111,7 +2156,10 @@ module.exports = {
       logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
     }
 
-    // RECOMMENDED BLOCKS
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // RECOMMENDED BLOCKS — Enqueued immediately with action directives
+    // ═══════════════════════════════════════════════════════════════════════════════
+
     const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
     const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
 
@@ -2154,7 +2202,51 @@ module.exports = {
         { timeframes: tfsToProcess },
         'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
       );
-          }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ENQUEUE ALL SIGNALS FOR NOTIFICATION DELIVERY
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    if (allBoundarySignals.length > 0) {
+      logger.info(
+        {
+          count: allBoundarySignals.length,
+          timeframes: tfsToProcess
+        },
+        'poller: enqueueing root TF candle open signals for notification delivery'
+      );
+
+      // Enqueue each signal individually
+      for (const signal of allBoundarySignals) {
+        try {
+          const queued = notificationQueue.enqueueSignal(
+            signal,
+            'new_root_candle'
+          );
+
+          logger.info(
+            {
+              symbol: signal.symbol,
+              timeframe: normalizeRootTf(signal.root_tf),
+              eventId: signal.eventId,
+              queued,
+              decision: signal.meta?.decision
+            },
+            'poller: root candle signal queued for delivery'
+          );
+        } catch (err) {
+          logger.error(
+            {
+              err,
+              symbol: signal.symbol,
+              tf: signal.root_tf
+            },
+            'poller: FAILED to enqueue root candle signal'
+          );
+        }
+      }
+    }
 
     return detectedNewCandles;
   },
