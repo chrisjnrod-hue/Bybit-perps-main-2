@@ -1,4 +1,3 @@
-```javascript
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -34,6 +33,10 @@ const startupBatchSignalKeys = new Set();
 
 // Cooldown cache for REST fallbacks during WS gaps (Key: symbol|tf, Value: timestamp)
 const restFallbackCooldowns = new Map();
+
+// NEW: Track root TF boundary closures to invalidate cache on transitions
+// Key: symbol|tf, Value: { closedAtTime, candleOpenTime }
+const rootTfBoundaryStates = new Map();
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -284,6 +287,46 @@ function alreadyProcessedSignal(signal, family = 'generic') {
 
   processedEventKeys.set(key, Date.now());
   return false;
+}
+
+// NEW: Clear cache entries when a root TF boundary closes and a new one opens
+function invalidateCacheForRootTfBoundary(symbol, tf, newCandleOpenTime) {
+  const stateKey = `symbol|${tf}`;
+  const prevState = rootTfBoundaryStates.get(stateKey);
+
+  if (prevState && prevState.candleOpenTime !== newCandleOpenTime) {
+    // Boundary transitioned; purge all signal keys for this symbol|tf|old_candle combination
+    const keysToDelete = [];
+    for (const [key] of processedEventKeys.entries()) {
+      if (key.includes(`${symbol}|${tf}|${prevState.candleOpenTime}`)) {
+        keysToDelete.push(key);
+      }
+    }
+    for (const key of keysToDelete) {
+      processedEventKeys.delete(key);
+    }
+
+    // Also clear mid-candle state key for the old candle
+    const oldMidCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${prevState.candleOpenTime}`;
+    dbModule.deleteState(oldMidCandleStateKey);
+
+    logger.debug(
+      {
+        symbol,
+        tf,
+        oldCandleOpenTime: prevState.candleOpenTime,
+        newCandleOpenTime,
+        purgedKeys: keysToDelete.length
+      },
+      'poller: invalidated cache for root TF boundary transition'
+    );
+  }
+
+  // Update the boundary state to track the new candle
+  rootTfBoundaryStates.set(stateKey, {
+    candleOpenTime: newCandleOpenTime,
+    closedAtTime: Date.now()
+  });
 }
 
 function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
@@ -1063,7 +1106,7 @@ module.exports = {
     }
   },
 
-  async processMissingDataQueueSafe(missingDataQueue = [], forceAll = false) {
+  async processMissingDataQueueSafe(missingDataQueue = []) {
     if (!Array.isArray(missingDataQueue) || missingDataQueue.length === 0) {
       return;
     }
@@ -1075,7 +1118,7 @@ module.exports = {
     const now = Date.now();
 
     // Circuit Breaker: Trigger WS restart if a massive disconnection is implied
-    if (missingDataQueue.length > MISSING_THRESHOLD && !forceAll) {
+    if (missingDataQueue.length > MISSING_THRESHOLD) {
       logger.warn(
         { missingCount: missingDataQueue.length },
         'poller.circuitBreaker: high missing count detected; triggering WS reconnect check'
@@ -1089,15 +1132,14 @@ module.exports = {
       }
     }
 
-    // Filter out symbols on active cooldown (unless forced via boundary scan trigger)
+    // Filter out symbols on active cooldown
     const eligibleItems = missingDataQueue.filter((item) => {
-      if (forceAll) return true;
       const key = `${item.symbol}|${item.tf}`;
       const lastAttempt = restFallbackCooldowns.get(key) || 0;
       return now - lastAttempt > COOLDOWN_MS;
     });
 
-    const itemsToProcess = forceAll ? eligibleItems : eligibleItems.slice(0, MAX_REST_FALLBACKS_PER_PASS);
+    const itemsToProcess = eligibleItems.slice(0, MAX_REST_FALLBACKS_PER_PASS);
 
     if (itemsToProcess.length === 0) {
       logger.debug(
@@ -1110,8 +1152,7 @@ module.exports = {
       {
         totalMissing: missingDataQueue.length,
         eligible: eligibleItems.length,
-        processing: itemsToProcess.length,
-        forceAll
+        processing: itemsToProcess.length
       },
       'poller.bg: executing rate-controlled lightweight catch-up'
     );
@@ -1129,12 +1170,10 @@ module.exports = {
       }
     }
 
-    // Purge expired cooldowns unless forced (where memory management isn't strictly necessary for the scope)
-    if (!forceAll) {
-      for (const [key, ts] of restFallbackCooldowns.entries()) {
-        if (now - ts > COOLDOWN_MS * 2) {
-          restFallbackCooldowns.delete(key);
-        }
+    // Purge expired cooldowns
+    for (const [key, ts] of restFallbackCooldowns.entries()) {
+      if (now - ts > COOLDOWN_MS * 2) {
+        restFallbackCooldowns.delete(key);
       }
     }
 
@@ -1292,6 +1331,9 @@ module.exports = {
           ),
           latestOpen
         );
+
+        // NEW: Initialize boundary state for cache invalidation tracking
+        invalidateCacheForRootTfBoundary(symbol, tf, latestOpen);
       }
     }
 
@@ -1996,21 +2038,6 @@ module.exports = {
       return false;
     }
 
-    // Flush general deduplication caches manually and specifically for active boundaries
-    // Solves staleness data lockouts caused by overlapping deployment states.
-    clearExpiredProcessedSignalKeys();
-    logger.info({ timeframes: tfsToProcess }, 'poller: clearing deduplication and startup caches for new root boundary');
-    
-    tfsToProcess.forEach(tf => {
-      const tfStr = `|${tf}|`;
-      for (const key of startupBatchSignalKeys.keys()) {
-        if (key.includes(tfStr)) startupBatchSignalKeys.delete(key);
-      }
-      for (const key of restFallbackCooldowns.keys()) {
-        if (key.endsWith(`|${tf}`)) restFallbackCooldowns.delete(key);
-      }
-    });
-
     logger.info(
       {
         timeframes: tfsToProcess,
@@ -2055,8 +2082,11 @@ module.exports = {
             latestOpen,
             processedStateKey
           });
+
+          // NEW: Invalidate cache when boundary transition is detected
+          invalidateCacheForRootTfBoundary(symbol, tf, latestOpen);
         } else {
-          missingDataQueue.push({ symbol, tf, processedStateKey });
+          missingDataQueue.push({ symbol, tf });
         }
       }
     }
@@ -2072,38 +2102,84 @@ module.exports = {
     );
 
     // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
-    // Specifically awaited to guarantee missing symbols are batched into a single summary
     if (missingDataQueue.length > 0) {
       logger.info(
         { missingCount: missingDataQueue.length },
-        'poller: fetching missing symbols via rate-controlled REST catch-up before proceeding'
+        'poller: offloading missing symbols to rate-controlled background catch-up'
       );
 
-      await this.processMissingDataQueueSafe(missingDataQueue, true);
+      setImmediate(async () => {
+        await this.processMissingDataQueueSafe(missingDataQueue);
+      });
+    }
 
-      // Re-evaluate missing items natively after catch-up
-      const stillMissing = [];
-      for (const item of missingDataQueue) {
-        const latestOpen = getLatestOpenTime(db, item.symbol, item.tf);
-        const processedOpen = Number(dbModule.getState(item.processedStateKey) || 0);
+    // NEW FIX: Don't return early if readyCandidates is empty
+    // Instead, process missing queue items synchronously with extended wait
+    if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
+      logger.info(
+        { missingCount: missingDataQueue.length },
+        'poller: no fast-path candidates; attempting synchronous lightweight fetch for slow-path items'
+      );
 
-        if (latestOpen !== null && latestOpen > processedOpen) {
-          detectedNewCandles = true;
-          readyCandidates.push({
-            symbol: item.symbol,
-            tf: item.tf,
-            latestOpen,
-            processedStateKey: item.processedStateKey
-          });
-        } else {
-          stillMissing.push(item);
+      const syncStart = performance.now();
+      const COOLDOWN_MS = 5 * 60 * 1000;
+      const now = Date.now();
+
+      const eligibleSlowPath = missingDataQueue.filter((item) => {
+        const key = `${item.symbol}|${item.tf}`;
+        const lastAttempt = restFallbackCooldowns.get(key) || 0;
+        return now - lastAttempt > COOLDOWN_MS;
+      }).slice(0, 20);
+
+      if (eligibleSlowPath.length > 0) {
+        logger.info(
+          { count: eligibleSlowPath.length },
+          'poller: synchronously fetching eligible slow-path items'
+        );
+
+        for (const item of eligibleSlowPath) {
+          const key = `${item.symbol}|${item.tf}`;
+          restFallbackCooldowns.set(key, now);
+
+          try {
+            await this.quickFetchLatestKline(item.symbol, item.tf);
+          } catch (err) {
+            logger.debug(
+              { err, symbol: item.symbol, tf: item.tf },
+              'poller: sync slow-path fetch error'
+            );
+          }
         }
-      }
 
-      if (stillMissing.length > 0) {
-        logger.warn(
-          { stillMissingCount: stillMissing.length },
-          'poller: some symbols still missing new candle after REST catch-up'
+        // Re-scan after sync fetch to capture newly populated candidates
+        logger.info(
+          'poller: re-scanning DB after synchronous slow-path fetch'
+        );
+
+        for (const item of eligibleSlowPath) {
+          const latestOpen = getLatestOpenTime(db, item.symbol, item.tf);
+          const processedStateKey = this.getLoop2ProcessedCandleKey(item.symbol, item.tf);
+          const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
+
+          if (latestOpen !== null && latestOpen > processedOpen) {
+            detectedNewCandles = true;
+            readyCandidates.push({
+              symbol: item.symbol,
+              tf: item.tf,
+              latestOpen,
+              processedStateKey
+            });
+
+            invalidateCacheForRootTfBoundary(item.symbol, item.tf, latestOpen);
+          }
+        }
+
+        logger.info(
+          {
+            syncFetchDurationMs: (performance.now() - syncStart).toFixed(2),
+            newCandidatesFound: readyCandidates.length
+          },
+          'poller.perf: synchronous slow-path fetch completed'
         );
       }
     }
