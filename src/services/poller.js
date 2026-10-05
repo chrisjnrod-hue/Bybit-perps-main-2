@@ -31,6 +31,9 @@ const processedEventKeys = new Map();
 // through mid-candle / root-candle loops after the initial summary batch was sent.
 const startupBatchSignalKeys = new Set();
 
+// Cooldown cache for REST fallbacks during WS gaps (Key: symbol|tf, Value: timestamp)
+const restFallbackCooldowns = new Map();
+
 function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms || 0);
@@ -423,9 +426,6 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // This is the actual "WS-triggered signal detection" path.
-      // It reuses the same detection logic as the scan loops but bypasses the wait for
-      // the next boundary loop, so the signal is detected immediately on realtime WS candle data.
       const midFlip = await detectMidCandleFlip(symbol, tf);
 
       if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
@@ -468,9 +468,8 @@ function registerBybitWsListeners() {
         }
       }
 
-      // Root-candle opening detection with WS incoming kline.
-      // This is used to detect a new root candle without waiting for the scheduled boundary loop.
-      const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
+      // Decoupled WebSocket state key: prevents advancing boundary loop's processedOpen watermark
+      const processedStateKey = `poller.ws.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
 
       if (openTime > processedOpen) {
@@ -549,7 +548,6 @@ module.exports = {
       );
     }
 
-    // IMPORTANT: register actual bybitWS listeners before running loops
     registerBybitWsListeners();
 
     if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
@@ -1015,6 +1013,135 @@ module.exports = {
     }
   },
 
+  async quickFetchLatestKline(symbol, tf) {
+    try {
+      const interval = normalizeRootTf(tf) === 'D' ? 'D' : String(tf);
+
+      // Fetch only the 2 latest candles from REST to update state cleanly
+      const klines = await limiter.schedule(() =>
+        bybit.fetchKlines(symbol, interval, 2)
+      );
+
+      if (!klines || klines.length === 0) {
+        return;
+      }
+
+      const db = dbModule.get();
+      const insert = db.prepare(
+        `
+          INSERT OR IGNORE INTO klines
+            (symbol, timeframe, open_time, open, high, low, close, volume)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `
+      );
+
+      const insertMany = db.transaction((rows) => {
+        for (const kline of rows) {
+          insert.run(
+            symbol,
+            tf,
+            kline.open_time,
+            kline.open,
+            kline.high,
+            kline.low,
+            kline.close,
+            kline.volume
+          );
+        }
+      });
+
+      insertMany(klines);
+
+      if (typeof macdUtil.computeAndStoreMacd === 'function') {
+        await macdUtil.computeAndStoreMacd(symbol, tf);
+      } else if (typeof macdUtil.computeMacdHistogram === 'function') {
+        await macdUtil.computeMacdHistogram(symbol, tf);
+      }
+    } catch (err) {
+      logger.debug({ err, symbol, tf }, 'quickFetchLatestKline: fetch failed');
+    }
+  },
+
+  async processMissingDataQueueSafe(missingDataQueue = []) {
+    if (!Array.isArray(missingDataQueue) || missingDataQueue.length === 0) {
+      return;
+    }
+
+    const bgStart = performance.now();
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const MAX_REST_FALLBACKS_PER_PASS = 30;
+    const MISSING_THRESHOLD = 50;
+    const now = Date.now();
+
+    // Circuit Breaker: Trigger WS restart if a massive disconnection is implied
+    if (missingDataQueue.length > MISSING_THRESHOLD) {
+      logger.warn(
+        { missingCount: missingDataQueue.length },
+        'poller.circuitBreaker: high missing count detected; triggering WS reconnect check'
+      );
+      if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
+        try {
+          bybitWs.start();
+        } catch (err) {
+          logger.error({ err }, 'poller.circuitBreaker: failed to restart WS connection');
+        }
+      }
+    }
+
+    // Filter out symbols on active cooldown
+    const eligibleItems = missingDataQueue.filter((item) => {
+      const key = `${item.symbol}|${item.tf}`;
+      const lastAttempt = restFallbackCooldowns.get(key) || 0;
+      return now - lastAttempt > COOLDOWN_MS;
+    });
+
+    const itemsToProcess = eligibleItems.slice(0, MAX_REST_FALLBACKS_PER_PASS);
+
+    if (itemsToProcess.length === 0) {
+      logger.debug(
+        'poller.bg: all missing items on cooldown or queue capped; skipping REST fallback'
+      );
+      return;
+    }
+
+    logger.info(
+      {
+        totalMissing: missingDataQueue.length,
+        eligible: eligibleItems.length,
+        processing: itemsToProcess.length
+      },
+      'poller.bg: executing rate-controlled lightweight catch-up'
+    );
+
+    let fetchedCount = 0;
+    for (const item of itemsToProcess) {
+      const key = `${item.symbol}|${item.tf}`;
+      restFallbackCooldowns.set(key, now);
+
+      try {
+        await this.quickFetchLatestKline(item.symbol, item.tf);
+        fetchedCount++;
+      } catch (err) {
+        logger.debug({ err, symbol: item.symbol, tf: item.tf }, 'poller.bg: lightweight fetch error');
+      }
+    }
+
+    // Purge expired cooldowns
+    for (const [key, ts] of restFallbackCooldowns.entries()) {
+      if (now - ts > COOLDOWN_MS * 2) {
+        restFallbackCooldowns.delete(key);
+      }
+    }
+
+    logger.info(
+      {
+        durationMs: (performance.now() - bgStart).toFixed(2),
+        fetchedCount
+      },
+      'poller.perf: rate-controlled kline catch-up completed'
+    );
+  },
+
   async scanAllForStartup() {
     if (startupComplete) {
       logger.debug(
@@ -1427,7 +1554,6 @@ module.exports = {
             ) || 0
           );
 
-          // New root candle already handled by root-candle loop.
           if (latestOpen > processedOpen) {
             logger.debug(
               {
@@ -1484,7 +1610,6 @@ module.exports = {
                   notifyImmediately: true
                 };
 
-                // 1) Do not duplicate startup-batch signals
                 if (isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
                   logger.debug(
                     {
@@ -1498,8 +1623,6 @@ module.exports = {
                   continue;
                 }
 
-                // 2) Always process new mid-candle root flips, even when MTF is not aligned
-                //    decision is set based on mtf validation below
                 if (!alreadyProcessedSignal(midSignalCandidate, 'midcandle')) {
                   const signal =
                     await signalManager.handleRootSignal(midSignalCandidate);
@@ -1554,7 +1677,6 @@ module.exports = {
               }
             }
           } else {
-            // 3) Existing active signal path remains monitoring-only, not signal detection
             const activeSignal = activeSignals[0];
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1929,31 +2051,15 @@ module.exports = {
       'poller.perf: [1/4] Fast path DB classification completed'
     );
 
-    // STEP 2: SLOW PATH - ASYNCHRONOUS BACKGROUND SEEDING (NON-BLOCKING)
+    // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
     if (missingDataQueue.length > 0) {
       logger.info(
         { missingCount: missingDataQueue.length },
-        'poller: offloading missing symbols to non-blocking background seeding'
+        'poller: offloading missing symbols to rate-controlled background catch-up'
       );
 
       setImmediate(async () => {
-        const bgStart = performance.now();
-        let seededCount = 0;
-        for (const item of missingDataQueue) {
-          try {
-            await this.seedKlinesForSymbol(item.symbol, item.tf);
-            seededCount++;
-          } catch (err) {
-            logger.debug({ err, symbol: item.symbol, tf: item.tf }, 'poller.bg: background seed failed');
-          }
-        }
-        logger.info(
-          {
-            durationMs: (performance.now() - bgStart).toFixed(2),
-            seededCount
-          },
-          'poller.perf: background kline seeding finished'
-        );
+        await this.processMissingDataQueueSafe(missingDataQueue);
       });
     }
 
@@ -2041,7 +2147,6 @@ module.exports = {
           }
         }
 
-        // Mark as processed in local DB state so loop doesn't re-scan
         dbModule.setState(processedStateKey, latestOpen);
       } catch (err) {
         logger.debug(
