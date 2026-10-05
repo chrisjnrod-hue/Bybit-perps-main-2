@@ -295,6 +295,68 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   }
 }
 
+function evictAndRefreshTimeframeBoundaryState(dueTfs = [], nowMs = Date.now()) {
+  if (!Array.isArray(dueTfs) || dueTfs.length === 0) return;
+
+  const normalizedTfs = dueTfs.map(normalizeRootTf).filter(Boolean);
+  logger.info({ dueTfs: normalizedTfs }, 'poller: executing timeframe boundary cache eviction and state refresh');
+
+  const db = dbModule.get();
+
+  // 1. Evict in-memory deduplication keys for due timeframes
+  for (const [key, ts] of processedEventKeys.entries()) {
+    const parts = key.split('|');
+    if (parts.length >= 2) {
+      const tf = parts[1];
+      if (normalizedTfs.includes(tf)) {
+        processedEventKeys.delete(key);
+      }
+    }
+  }
+
+  // 2. Clear REST fallback cooldowns for due timeframes
+  for (const key of restFallbackCooldowns.keys()) {
+    const parts = key.split('|');
+    if (parts.length >= 2) {
+      const tf = normalizeRootTf(parts[1]);
+      if (normalizedTfs.includes(tf)) {
+        restFallbackCooldowns.delete(key);
+      }
+    }
+  }
+
+  // 3. Reset mid-candle & alignment state markers in SQLite/dbModule for due timeframes
+  try {
+    if (db) {
+      const symbolsRows = db.prepare('SELECT symbol FROM symbols').all();
+      for (const row of symbolsRows) {
+        const symbol = row.symbol;
+        for (const tf of normalizedTfs) {
+          const alignmentStateKey = `poller.loop2.alignment.${symbol}.${tf}`;
+          dbModule.setState(alignmentStateKey, String(false));
+        }
+      }
+    }
+  } catch (err) {
+    logger.debug({ err }, 'poller: error resetting DB state flags during boundary eviction');
+  }
+
+  // 4. Reset internal MACD / SignalManager MTF structures/caches if clear functions exist
+  try {
+    if (macdUtil && typeof macdUtil.clearCache === 'function') {
+      macdUtil.clearCache();
+    }
+    if (signalManager && typeof signalManager.clearCache === 'function') {
+      signalManager.clearCache();
+    }
+    if (signalManager && typeof signalManager.refreshMtfCache === 'function') {
+      signalManager.refreshMtfCache();
+    }
+  } catch (err) {
+    logger.debug({ err }, 'poller: error resetting module caches during boundary eviction');
+  }
+}
+
 function registerStartupBatchSignal(signal, family = 'generic') {
   const baseKey = startupBatchKeyFromSignal(signal);
   if (baseKey) {
@@ -468,7 +530,6 @@ function registerBybitWsListeners() {
         }
       }
 
-      // Decoupled WebSocket state key: prevents advancing boundary loop's processedOpen watermark
       const processedStateKey = `poller.ws.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
 
@@ -1017,7 +1078,6 @@ module.exports = {
     try {
       const interval = normalizeRootTf(tf) === 'D' ? 'D' : String(tf);
 
-      // Fetch only the 2 latest candles from REST to update state cleanly
       const klines = await limiter.schedule(() =>
         bybit.fetchKlines(symbol, interval, 2)
       );
@@ -1073,7 +1133,6 @@ module.exports = {
     const MISSING_THRESHOLD = 50;
     const now = Date.now();
 
-    // Circuit Breaker: Trigger WS restart if a massive disconnection is implied
     if (missingDataQueue.length > MISSING_THRESHOLD) {
       logger.warn(
         { missingCount: missingDataQueue.length },
@@ -1088,7 +1147,6 @@ module.exports = {
       }
     }
 
-    // Filter out symbols on active cooldown
     const eligibleItems = missingDataQueue.filter((item) => {
       const key = `${item.symbol}|${item.tf}`;
       const lastAttempt = restFallbackCooldowns.get(key) || 0;
@@ -1126,7 +1184,6 @@ module.exports = {
       }
     }
 
-    // Purge expired cooldowns
     for (const [key, ts] of restFallbackCooldowns.entries()) {
       if (now - ts > COOLDOWN_MS * 2) {
         restFallbackCooldowns.delete(key);
@@ -1709,15 +1766,16 @@ module.exports = {
                 eventId: buildEventId('mtf_align', symbol, tf, Date.now()),
                 signalType: 'mtf_alignment',
                 notificationType: 'mtf_alignment',
-                state: 'monitor',
+                state: 'accept',
                 meta: {
                   ...(activeSignal.meta || {}),
                   alignment: mtfValidation.alignment || {},
-                  decision: 'monitor',
-                  acceptReason: 'mtf_alignment_alert',
+                  decision: 'accept',
+                  acceptReason: 'mtf_alignment_met',
                   tvScore: 0,
                   tvSource: 'loop2',
-                  mtfScore: mtfValidation.mtfScore
+                  mtfScore: mtfValidation.mtfScore,
+                  mtfAligned: true
                 }
               };
 
@@ -1737,15 +1795,16 @@ module.exports = {
                   eventId: alertEventId,
                   signalType: 'mtf_alignment',
                   notificationType: 'mtf_alignment',
-                  state: 'monitor',
+                  state: 'accept',
                   meta: {
                     ...(activeSignal.meta || {}),
                     alignment: mtfValidation.alignment || {},
-                    decision: 'monitor',
-                    acceptReason: 'mtf_alignment_alert',
+                    decision: 'accept',
+                    acceptReason: 'mtf_alignment_met',
                     tvScore: 0,
                     tvSource: 'loop2',
-                    mtfScore: mtfValidation.mtfScore
+                    mtfScore: mtfValidation.mtfScore,
+                    mtfAligned: true
                   }
                 });
 
@@ -1757,7 +1816,7 @@ module.exports = {
                     positiveCount: mtfValidation.positiveCount,
                     totalCount: mtfValidation.totalCount
                   },
-                  'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+                  'poller.loop2: MTF alignment alert created with ACCEPT classification (100% consensus met)'
                 );
               }
             } else if (!isAllPositive && previousAligned) {
@@ -1847,11 +1906,12 @@ module.exports = {
             symbol: alert.symbol,
             root_tf: alert.root_tf,
             queued,
+            decision: alert.meta && alert.meta.decision,
             mtfScore: (
               alert.meta.mtfScore * 100
             ).toFixed(0) + '%'
           },
-          'poller.loop2: realtime alignment alert enqueued'
+          'poller.loop2: realtime alignment alert enqueued (accept)'
         );
       } catch (err) {
         logger.error(
@@ -1948,17 +2008,58 @@ module.exports = {
       try {
         const tfsToRun = dueTfs.length > 0 ? dueTfs : buildRootTfs();
 
-        let scannedSuccess = false;
+        // Evict expired boundary caches and refresh DB state flags exactly at boundary rollover
+        evictAndRefreshTimeframeBoundaryState(tfsToRun, Date.now());
+
+        const scanStartTime = performance.now();
+        const processedSymbolTfs = new Set();
+        const aggregatedSignals = new Map();
+        let detectedNewCandles = false;
+        let totalFastPath = 0;
+        let totalSlowPath = 0;
+
+        // Multi-pass aggregation across retry passes to capture all asynchronous exchange klines
         for (let attempt = 1; attempt <= 3; attempt++) {
           logger.info({ attempt, tfsToRun }, 'poller: executing root TF candle open scan pass');
 
-          scannedSuccess = await this.runRootTfCandleOpenOnce(tfsToRun, Date.now());
+          const passResult = await this.runRootTfCandleOpenPass(tfsToRun, Date.now(), processedSymbolTfs);
 
-          if (scannedSuccess || attempt === 3) break;
+          if (passResult) {
+            if (passResult.detectedNewCandles) {
+              detectedNewCandles = true;
+            }
+            totalFastPath += passResult.readyCount || 0;
+            totalSlowPath += passResult.missingCount || 0;
 
-          logger.warn({ attempt }, 'poller: new klines not fully ready; retrying in 2 seconds...');
-          await sleep(2000);
+            if (Array.isArray(passResult.signals)) {
+              for (const sig of passResult.signals) {
+                const sigKey = `${sig.symbol}|${normalizeRootTf(sig.root_tf)}`;
+                if (!aggregatedSignals.has(sigKey)) {
+                  aggregatedSignals.set(sigKey, sig);
+                }
+              }
+            }
+          }
+
+          if (attempt < 3) {
+            logger.info({ attempt }, 'poller: waiting 2s for remaining async exchange klines...');
+            await sleep(2000);
+          }
         }
+
+        const allBoundarySignals = Array.from(aggregatedSignals.values());
+
+        // Emit notifications & unified summary block for ALL captured signals
+        this.emitRootCandleOpenSummaryAndNotifications({
+          allBoundarySignals,
+          tfsToProcess: tfsToRun,
+          detectedNewCandles,
+          scanStartTime,
+          totalFastPath,
+          totalSlowPath,
+          nowMs: Date.now()
+        });
+
       } catch (err) {
         logger.error(
           {
@@ -1971,7 +2072,6 @@ module.exports = {
   },
 
   async runRootTfCandleOpenOnce(tfsInput, nowMs = Date.now()) {
-    const scanStartTime = performance.now();
     let tfsToProcess = Array.isArray(tfsInput) ? tfsInput : [];
 
     if (tfsToProcess.length === 0) {
@@ -1991,14 +2091,28 @@ module.exports = {
       return false;
     }
 
-    logger.info(
-      {
-        timeframes: tfsToProcess,
-        timestamp: new Date(nowMs).toISOString()
-      },
-      'poller: root TF candle open boundary scan started'
-    );
+    evictAndRefreshTimeframeBoundaryState(tfsToProcess, nowMs);
 
+    const scanStartTime = performance.now();
+    const processedSymbolTfs = new Set();
+    const passResult = await this.runRootTfCandleOpenPass(tfsToProcess, nowMs, processedSymbolTfs);
+
+    if (passResult && passResult.signals) {
+      this.emitRootCandleOpenSummaryAndNotifications({
+        allBoundarySignals: passResult.signals,
+        tfsToProcess,
+        detectedNewCandles: passResult.detectedNewCandles,
+        scanStartTime,
+        totalFastPath: passResult.readyCount,
+        totalSlowPath: passResult.missingCount,
+        nowMs
+      });
+    }
+
+    return passResult ? passResult.detectedNewCandles : false;
+  },
+
+  async runRootTfCandleOpenPass(tfsToProcess, nowMs = Date.now(), processedSymbolTfs = new Set()) {
     const db = dbModule.get();
     const rows = db
       .prepare(
@@ -2016,9 +2130,6 @@ module.exports = {
     const missingDataQueue = [];
     let detectedNewCandles = false;
 
-    // STEP 1: FAST PATH VS. SLOW PATH SEPARATION
-    const dbCheckStart = performance.now();
-
     for (const row of validRows) {
       const symbol = row.symbol;
 
@@ -2026,6 +2137,11 @@ module.exports = {
         const latestOpen = getLatestOpenTime(db, symbol, tf);
         const processedStateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
         const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
+        const candidateKey = `${symbol}|${tf}|${latestOpen}`;
+
+        if (processedSymbolTfs.has(candidateKey)) {
+          continue;
+        }
 
         if (latestOpen !== null && latestOpen > processedOpen) {
           detectedNewCandles = true;
@@ -2033,7 +2149,8 @@ module.exports = {
             symbol,
             tf,
             latestOpen,
-            processedStateKey
+            processedStateKey,
+            candidateKey
           });
         } else {
           missingDataQueue.push({ symbol, tf });
@@ -2041,42 +2158,26 @@ module.exports = {
       }
     }
 
-    const dbCheckDuration = (performance.now() - dbCheckStart).toFixed(2);
-    logger.info(
-      {
-        durationMs: dbCheckDuration,
-        readyCount: readyCandidates.length,
-        missingCount: missingDataQueue.length
-      },
-      'poller.perf: [1/4] Fast path DB classification completed'
-    );
-
-    // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
     if (missingDataQueue.length > 0) {
-      logger.info(
-        { missingCount: missingDataQueue.length },
-        'poller: offloading missing symbols to rate-controlled background catch-up'
-      );
-
       setImmediate(async () => {
         await this.processMissingDataQueueSafe(missingDataQueue);
       });
     }
 
     if (readyCandidates.length === 0) {
-      logger.info(
-        { durationMs: (performance.now() - scanStartTime).toFixed(2) },
-        'poller: no new WebSocket candle data present in DB yet; fast path complete'
-      );
-      return false;
+      return {
+        detectedNewCandles,
+        readyCount: 0,
+        missingCount: missingDataQueue.length,
+        signals: []
+      };
     }
 
-    // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
-    const computeStart = performance.now();
-    const allBoundarySignals = [];
+    const passSignals = [];
 
     const candidatePromises = readyCandidates.map(async (candidate) => {
-      const { symbol, tf, latestOpen, processedStateKey } = candidate;
+      const { symbol, tf, latestOpen, processedStateKey, candidateKey } = candidate;
+      processedSymbolTfs.add(candidateKey);
 
       try {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
@@ -2161,21 +2262,39 @@ module.exports = {
     const evaluatedResults = await Promise.all(candidatePromises);
     for (const res of evaluatedResults) {
       if (res) {
-        allBoundarySignals.push(res);
+        passSignals.push(res);
       }
     }
 
-    const computeDuration = (performance.now() - computeStart).toFixed(2);
-    logger.info(
-      {
-        durationMs: computeDuration,
-        processedCandidates: readyCandidates.length,
-        signalsFound: allBoundarySignals.length
-      },
-      'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
-    );
+    return {
+      detectedNewCandles,
+      readyCount: readyCandidates.length,
+      missingCount: missingDataQueue.length,
+      signals: passSignals
+    };
+  },
 
-    // STEP 4: INSTANT SUMMARY & RECOMMENDED BLOCK BROADCAST
+  emitRootCandleOpenSummaryAndNotifications(options = {}) {
+    const {
+      allBoundarySignals = [],
+      tfsToProcess = [],
+      detectedNewCandles = false,
+      scanStartTime = performance.now(),
+      totalFastPath = 0,
+      totalSlowPath = 0,
+      nowMs = Date.now()
+    } = options;
+
+    const db = dbModule.get();
+    let validRowsCount = 0;
+    try {
+      validRowsCount = db
+        .prepare(`SELECT count(*) as count FROM symbols`)
+        .get()?.count || 0;
+    } catch (err) {
+      validRowsCount = 0;
+    }
+
     const broadcastStart = performance.now();
 
     if (allBoundarySignals.length > 0) {
@@ -2198,9 +2317,9 @@ module.exports = {
       timestamp: new Date(nowMs).toISOString(),
       scanType: 'root_tf_candle_open',
       timeframes: tfsToProcess,
-      totalSymbolsScanned: validRows.length,
-      fastPathProcessed: readyCandidates.length,
-      slowPathQueued: missingDataQueue.length,
+      totalSymbolsScanned: validRowsCount,
+      fastPathProcessed: totalFastPath,
+      slowPathQueued: totalSlowPath,
       newCandlesDetected: detectedNewCandles,
       signalsGenerated: allBoundarySignals.length,
       acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
@@ -2293,8 +2412,6 @@ module.exports = {
       },
       'poller.perf: [4/4] Root TF candle open scan completed successfully'
     );
-
-    return detectedNewCandles;
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
