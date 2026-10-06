@@ -23,28 +23,27 @@ let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
 
-// Global de-dupe registry used across 5m mid-candle, MTF alignment, and root-TF reopen flows.
+// Global de-dupe registry used across root-TF and MTF alignment flows
 // Key format: symbol|root_tf|candle_open_time|signal_family
 const processedEventKeys = new Map();
 
-// Tracks startup-batch signals so the poller does not re-queue the same signal again
-// through mid-candle / root-candle loops after the initial summary batch was sent.
+// Tracks startup-batch signals
 const startupBatchSignalKeys = new Set();
 
-// Cooldown cache for REST fallbacks during WS gaps (Key: symbol|tf, Value: timestamp)
+// Cooldown cache for REST fallbacks during WS gaps
 const restFallbackCooldowns = new Map();
 
-// Track root TF boundary closures to invalidate cache on transitions
-// Key: poller.loop2.processedCandle.${symbol}.${tf}, Value: { candleOpenTime, lastProcessedTime }
+// Track root TF boundary state - Key: poller.loop2.processedCandle.${symbol}.${tf}
 const rootTfBoundaryStates = new Map();
 
+// Track MTF alignment state for each symbol/TF to prevent duplicate alerts
+// Key: ${symbol}|${tf}, Value: { lastAlignmentState, lastFlipTime }
+const mtfAlignmentStates = new Map();
+
 // ============================================================================
-// DATABASE SAFETY GUARDS - Prevent crashes from stale/closed DB connections
+// DATABASE SAFETY GUARDS
 // ============================================================================
 
-/**
- * Check if the database module is ready and accessible
- */
 function isDbReady() {
   if (!dbModule || typeof dbModule.get !== 'function') {
     return false;
@@ -62,9 +61,6 @@ function isDbReady() {
   }
 }
 
-/**
- * Safely acquire a database connection
- */
 function safeGetDb() {
   if (!isDbReady()) {
     logger.debug('poller: db is not ready');
@@ -84,9 +80,6 @@ function safeGetDb() {
   }
 }
 
-/**
- * Safely retrieve a state value from persistent storage
- */
 function safeGetState(key) {
   if (!dbModule || typeof dbModule.getState !== 'function') {
     logger.debug('poller: dbModule.getState not available');
@@ -102,9 +95,6 @@ function safeGetState(key) {
   }
 }
 
-/**
- * Safely set a state value in persistent storage
- */
 function safeSetState(key, value) {
   if (!dbModule || typeof dbModule.setState !== 'function') {
     logger.debug('poller: dbModule.setState not available');
@@ -120,9 +110,6 @@ function safeSetState(key, value) {
   }
 }
 
-/**
- * Safely delete a state value from persistent storage
- */
 function safeDeleteState(key) {
   if (!dbModule || typeof dbModule.deleteState !== 'function') {
     logger.debug('poller: dbModule.deleteState not available');
@@ -272,67 +259,6 @@ function getNextTimeframeBoundaryMs(tf, nowMs = Date.now()) {
   return alignedFloor + tfMs + epochStart;
 }
 
-function calculateHistogramFlip(histogramRows = []) {
-  if (!Array.isArray(histogramRows) || histogramRows.length < 2) {
-    return false;
-  }
-
-  const current = histogramRows[histogramRows.length - 1];
-  const previous = histogramRows[histogramRows.length - 2];
-
-  const currentHistogram = Number(current?.histogram);
-  const previousHistogram = Number(previous?.histogram);
-
-  if (
-    !Number.isFinite(currentHistogram) ||
-    !Number.isFinite(previousHistogram)
-  ) {
-    return false;
-  }
-
-  return (previousHistogram <= 0 && currentHistogram > 0);
-}
-
-async function detectMidCandleFlip(symbol, timeframe) {
-  try {
-    if (
-      macdUtil &&
-      typeof macdUtil.isMacdFlip === 'function'
-    ) {
-      return await macdUtil.isMacdFlip(
-        symbol,
-        timeframe
-      );
-    }
-  } catch (err) {
-    logger.debug(
-      { err, symbol, timeframe },
-      'poller: isMacdFlip mid-candle detection failed'
-    );
-  }
-
-  try {
-    if (
-      macdUtil &&
-      typeof macdUtil.computeMacdHistogram === 'function'
-    ) {
-      const histogram = await macdUtil.computeMacdHistogram(
-        symbol,
-        timeframe
-      );
-
-      return calculateHistogramFlip(histogram);
-    }
-  } catch (err) {
-    logger.debug(
-      { err, symbol, timeframe },
-      'poller: computeMacdHistogram mid-candle detection failed'
-    );
-  }
-
-  return false;
-}
-
 function buildEventId(type, symbol, timeframe, candleOpenTime) {
   return [
     type,
@@ -402,15 +328,11 @@ function alreadyProcessedSignal(signal, family = 'generic') {
   return false;
 }
 
-/**
- * Track root TF boundary state and invalidate cache on transitions
- */
 function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
   const stateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
   const prevState = rootTfBoundaryStates.get(stateKey);
 
   if (prevState && prevState.candleOpenTime !== candleOpenTime) {
-    // Boundary transitioned; purge all signal keys for this symbol|tf|old_candle combination
     const keysToDelete = [];
     for (const [key] of processedEventKeys.entries()) {
       if (key.includes(`${symbol}|${tf}|${prevState.candleOpenTime}`)) {
@@ -420,10 +342,6 @@ function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
     for (const key of keysToDelete) {
       processedEventKeys.delete(key);
     }
-
-    // Also clear mid-candle state key for the old candle
-    const oldMidCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${prevState.candleOpenTime}`;
-    safeDeleteState(oldMidCandleStateKey);
 
     logger.debug(
       {
@@ -437,7 +355,6 @@ function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
     );
   }
 
-  // Update the boundary state to track the new candle
   rootTfBoundaryStates.set(stateKey, {
     candleOpenTime,
     lastProcessedTime: Date.now()
@@ -479,13 +396,10 @@ function registerStartupBatchSignal(signal, family = 'generic') {
   if (symbol && rootTf) {
     const families = [
       'generic',
-      'midcandle',
       'rootcandle',
       'alignment',
-      'ws_midcandle',
       'ws_rootcandle',
       'rootcandle_update',
-      'midcandle_update',
       'mtf_alignment'
     ];
     for (const fam of families) {
@@ -540,6 +454,54 @@ async function validateMtfAlignmentConsensus(symbol) {
   };
 }
 
+/**
+ * Check if MTF alignment state has changed and should trigger an alert
+ * CRITICAL: Only fires when MTF reaches 100% AND last TF candle just opened
+ */
+function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
+  const stateKey = `${symbol}|${tf}`;
+  const prevState = mtfAlignmentStates.get(stateKey);
+
+  const isNow100Percent = mtfValidation.positiveCount === mtfValidation.totalCount && mtfValidation.totalCount > 0;
+
+  if (!prevState) {
+    // First time tracking this symbol/tf
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    // Only fire if 100% aligned on first check
+    return isNow100Percent;
+  }
+
+  const wasAlignedBefore = prevState.lastAlignmentState;
+
+  // State changed from non-aligned to 100% aligned: FIRE ALERT
+  if (!wasAlignedBefore && isNow100Percent) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return true;
+  }
+
+  // State is still 100% but no change: don't fire (prevents duplicate)
+  if (wasAlignedBefore && isNow100Percent) {
+    return false;
+  }
+
+  // State changed from aligned to non-aligned: reset state but don't fire alert
+  if (wasAlignedBefore && !isNow100Percent) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return false;
+  }
+
+  return false;
+}
+
 function registerBybitWsListeners() {
   if (
     !bybitWs ||
@@ -585,49 +547,7 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      const midFlip = await detectMidCandleFlip(symbol, tf);
-
-      if (midFlip && !alreadyProcessedSignal(wsSignal, 'ws_midcandle')) {
-        const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-        if (mtfValidation.isAligned) {
-          const eventId = buildEventId('midcandle', symbol, tf, openTime);
-
-          const signal = await signalManager.handleRootSignal({
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            candle_open_time: openTime,
-            eventId,
-            signalType: 'midcandle_update',
-            notifyImmediately: true
-          });
-
-          if (signal) {
-            const finalSignal = {
-              ...signal,
-              eventId,
-              notificationType: 'midcandle_update',
-              signalType: 'midcandle_update'
-            };
-
-            const queued = notificationQueue.enqueueSignal(finalSignal, 'midcandle_update');
-
-            logger.info(
-              {
-                symbol,
-                tf,
-                openTime,
-                queued,
-                eventId
-              },
-              'poller.ws: ws-triggered midcandle update enqueued'
-            );
-          }
-        }
-      }
-
-      // Decoupled WebSocket state key: prevents advancing boundary loop's processedOpen watermark
+      // Decoupled WebSocket state key
       const processedStateKey = `poller.ws.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
@@ -664,7 +584,8 @@ function registerBybitWsListeners() {
                   symbol,
                   tf,
                   openTime,
-                  rootEventId
+                  rootEventId,
+                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                 },
                 'poller.ws: ws-triggered root candle signal enqueued'
               );
@@ -1202,7 +1123,6 @@ module.exports = {
     try {
       const interval = normalizeRootTf(tf) === 'D' ? 'D' : String(tf);
 
-      // Fetch only the 2 latest candles from REST to update state cleanly
       const klines = await limiter.schedule(() =>
         bybit.fetchKlines(symbol, interval, 2)
       );
@@ -1267,7 +1187,6 @@ module.exports = {
     const MISSING_THRESHOLD = 50;
     const now = Date.now();
 
-    // Circuit Breaker: Trigger WS restart if a massive disconnection is implied
     if (missingDataQueue.length > MISSING_THRESHOLD) {
       logger.warn(
         { missingCount: missingDataQueue.length },
@@ -1282,7 +1201,6 @@ module.exports = {
       }
     }
 
-    // Filter out symbols on active cooldown
     const eligibleItems = missingDataQueue.filter((item) => {
       const key = `${item.symbol}|${item.tf}`;
       const lastAttempt = restFallbackCooldowns.get(key) || 0;
@@ -1320,7 +1238,6 @@ module.exports = {
       }
     }
 
-    // Purge expired cooldowns
     for (const [key, ts] of restFallbackCooldowns.entries()) {
       if (now - ts > COOLDOWN_MS * 2) {
         restFallbackCooldowns.delete(key);
@@ -1491,7 +1408,6 @@ module.exports = {
           latestOpen
         );
 
-        // Initialize boundary state for cache invalidation tracking
         trackRootTfBoundaryState(symbol, tf, latestOpen);
       }
     }
@@ -1707,7 +1623,7 @@ module.exports = {
       {
         boundary: boundary.toISOString()
       },
-      'poller.loop2: starting five-minute boundary scan (mid-candle detection via WS)'
+      'poller.loop2: starting five-minute boundary scan (MTF alignment detection)'
     );
 
     const db = safeGetDb();
@@ -1732,7 +1648,6 @@ module.exports = {
       );
 
       const rootTfs = buildRootTfs();
-      const newSignals = [];
       const alignmentAlerts = [];
 
       const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
@@ -1769,188 +1684,30 @@ module.exports = {
               ) || 0
             );
 
-            if (latestOpen > processedOpen) {
-              logger.debug(
-                {
-                  symbol,
-                  tf,
-                  latestOpen,
-                  processedOpen
-                },
-                'poller.loop2: new root candle detected; skipping mid-candle detection for this root candle'
-              );
-              continue;
-            }
-
-            const activeSignals = latestSignals.filter((signal) => {
-              return (
-                signal.symbol === symbol &&
-                normalizeRootTf(signal.root_tf) === tf
-              );
-            });
-
-            const isAlreadyInSummary = activeSignals.length > 0;
-
-            if (!isAlreadyInSummary) {
-              const midCandleStateKey =
-                `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-
-              const midCandleAlreadyReported =
-                safeGetState(midCandleStateKey);
-
-              if (!midCandleAlreadyReported) {
-                const midCandleFlip =
-                  await detectMidCandleFlip(
-                    symbol,
-                    tf
-                  );
-
-                if (midCandleFlip) {
-                  const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-                  const eventId = buildEventId(
-                    'midcandle',
-                    symbol,
-                    tf,
-                    latestOpen
-                  );
-
-                  const midSignalCandidate = {
-                    symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    candle_open_time: latestOpen,
-                    eventId,
-                    signalType: 'midcandle_update',
-                    notifyImmediately: true
-                  };
-
-                  if (isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
-                    logger.debug(
-                      {
-                        symbol,
-                        tf,
-                        latestOpen,
-                        eventId
-                      },
-                      'poller.loop2: skipping startup-batch duplicate mid-candle signal'
-                    );
-                    continue;
-                  }
-
-                  if (!alreadyProcessedSignal(midSignalCandidate, 'midcandle')) {
-                    const signal =
-                      await signalManager.handleRootSignal(midSignalCandidate);
-
-                    if (signal) {
-                      const decision =
-                        mtfValidation.isAligned
-                          ? 'accept'
-                          : 'monitor';
-
-                      const finalSignal = {
-                        ...signal,
-                        eventId,
-                        notificationType: 'midcandle_update',
-                        signalType: 'midcandle_update',
-                        state: decision,
-                        meta: {
-                          ...(signal.meta || {}),
-                          mtfScore: mtfValidation.mtfScore,
-                          mtfAligned: mtfValidation.isAligned,
-                          alignment: mtfValidation.alignment || {},
-                          decision,
-                          acceptReason: mtfValidation.isAligned
-                            ? 'mtf_alignment_met'
-                            : 'mtf_alignment_monitor',
-                          tvScore: 0,
-                          tvSource: 'loop2'
-                        }
-                      };
-
-                      newSignals.push(finalSignal);
-
-                      // CRITICAL: Only set mid-candle state AFTER signal is confirmed created
-                      safeSetState(
-                        midCandleStateKey,
-                        Date.now()
-                      );
-
-                      logger.info(
-                        {
-                          symbol,
-                          tf,
-                          latestOpen,
-                          eventId,
-                          mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                          decision,
-                          mtfAligned: mtfValidation.isAligned
-                        },
-                        'poller.loop2: mid-candle histogram flip detected and enqueued with decision tag'
-                      );
-                    }
-                  }
-                }
-              }
-            } else {
-              const activeSignal = activeSignals[0];
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-              const alignmentStateKey =
-                `poller.loop2.alignment.${symbol}.${tf}`;
-
-              const previousAlignedState =
-                safeGetState(
-                  alignmentStateKey
+            // CRITICAL: Only check MTF alignment when we have an active signal for this symbol/tf
+            if (latestOpen <= processedOpen) {
+              const activeSignals = latestSignals.filter((signal) => {
+                return (
+                  signal.symbol === symbol &&
+                  normalizeRootTf(signal.root_tf) === tf
                 );
+              });
 
-              const previousAligned =
-                previousAlignedState === 'true' ||
-                previousAlignedState === true;
+              if (activeSignals.length > 0) {
+                // We have an active root signal - check if MTF alignment just became 100%
+                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-              const isAllPositive =
-                mtfValidation.totalCount > 0 &&
-                mtfValidation.positiveCount === mtfValidation.totalCount;
-
-              const shouldAlert =
-                isAllPositive &&
-                !previousAligned;
-
-              if (shouldAlert) {
-                const alertSignalCandidate = {
-                  ...activeSignal,
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  eventId: buildEventId('mtf_align', symbol, tf, Date.now()),
-                  signalType: 'mtf_alignment',
-                  notificationType: 'mtf_alignment',
-                  state: 'accept',
-                  meta: {
-                    ...(activeSignal.meta || {}),
-                    alignment: mtfValidation.alignment || {},
-                    decision: 'accept',
-                    acceptReason: 'mtf_alignment_alert',
-                    tvScore: 0,
-                    tvSource: 'loop2',
-                    mtfScore: mtfValidation.mtfScore
-                  }
-                };
-
-                if (!alreadyProcessedSignal(alertSignalCandidate, 'alignment') && !isStartupBatchSignal(alertSignalCandidate, 'alignment')) {
-                  safeSetState(
-                    alignmentStateKey,
-                    String(true)
-                  );
-
-                  const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
+                // Check if this should trigger an MTF alignment alert
+                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation)) {
+                  const activeSignal = activeSignals[0];
+                  const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
 
                   alignmentAlerts.push({
                     ...activeSignal,
                     symbol,
                     root_tf: tf,
                     detected_at: Date.now(),
-                    eventId: alertEventId,
+                    eventId,
                     signalType: 'mtf_alignment',
                     notificationType: 'mtf_alignment',
                     state: 'accept',
@@ -1958,10 +1715,12 @@ module.exports = {
                       ...(activeSignal.meta || {}),
                       alignment: mtfValidation.alignment || {},
                       decision: 'accept',
-                      acceptReason: 'mtf_alignment_alert',
+                      acceptReason: 'mtf_alignment_alert_100_percent',
                       tvScore: 0,
                       tvSource: 'loop2',
-                      mtfScore: mtfValidation.mtfScore
+                      mtfScore: mtfValidation.mtfScore,
+                      positiveCount: mtfValidation.positiveCount,
+                      totalCount: mtfValidation.totalCount
                     }
                   });
 
@@ -1973,28 +1732,9 @@ module.exports = {
                       positiveCount: mtfValidation.positiveCount,
                       totalCount: mtfValidation.totalCount
                     },
-                    'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+                    'poller.loop2: MTF alignment reached 100% - alert generated'
                   );
                 }
-              } else if (!isAllPositive && previousAligned) {
-                safeSetState(
-                  alignmentStateKey,
-                  String(false)
-                );
-
-                logger.info(
-                  {
-                    symbol,
-                    tf,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                  },
-                  'poller.loop2: MTF alignment dropped below 100%'
-                );
-              } else if (previousAlignedState === undefined) {
-                safeSetState(
-                  alignmentStateKey,
-                  String(false)
-                );
               }
             }
           } catch (err) {
@@ -2010,46 +1750,7 @@ module.exports = {
         }
       }
 
-      for (const signal of newSignals) {
-        try {
-          if (isStartupBatchSignal(signal, signal.signalType || 'midcandle_update')) {
-            logger.debug(
-              {
-                symbol: signal.symbol,
-                root_tf: signal.root_tf,
-                eventId: signal.eventId
-              },
-              'poller.loop2: skipping startup-batch duplicate midcandle enqueue'
-            );
-            continue;
-          }
-
-          const queued =
-            notificationQueue.enqueueSignal(
-              signal,
-              'midcandle_update'
-            );
-
-          logger.info(
-            {
-              symbol: signal.symbol,
-              root_tf: signal.root_tf,
-              queued,
-              decision: signal.meta && signal.meta.decision
-            },
-            'poller.loop2: midcandle update enqueued'
-          );
-        } catch (err) {
-          logger.error(
-            {
-              err,
-              signal
-            },
-            'poller.loop2: FAILED to enqueue midcandle update'
-          );
-        }
-      }
-
+      // Enqueue all MTF alignment alerts (no duplicates due to shouldFireMtfAlignmentAlert check)
       for (const alert of alignmentAlerts) {
         try {
           const queued =
@@ -2065,9 +1766,10 @@ module.exports = {
               queued,
               mtfScore: (
                 alert.meta.mtfScore * 100
-              ).toFixed(0) + '%'
+              ).toFixed(0) + '%',
+              eventId: alert.eventId
             },
-            'poller.loop2: realtime alignment alert enqueued'
+            'poller.loop2: MTF alignment alert enqueued'
           );
         } catch (err) {
           logger.error(
@@ -2082,10 +1784,9 @@ module.exports = {
 
       logger.info(
         {
-          newSignals: newSignals.length,
           alignmentAlerts: alignmentAlerts.length
         },
-        'poller.loop2: exact five-minute boundary scan completed'
+        'poller.loop2: five-minute boundary scan completed'
       );
     } catch (err) {
       logger.error({ err }, 'poller.loop2: scan iteration failed');
@@ -2261,7 +1962,6 @@ module.exports = {
               processedStateKey
             });
 
-            // Track boundary state with correct key format
             trackRootTfBoundaryState(symbol, tf, latestOpen);
           } else {
             missingDataQueue.push({ symbol, tf });
@@ -2279,7 +1979,7 @@ module.exports = {
         'poller.perf: [1/4] Fast path DB classification completed'
       );
 
-      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
+      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP
       if (missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
@@ -2292,7 +1992,7 @@ module.exports = {
       }
 
       // CRITICAL FIX: Don't return early if readyCandidates is empty
-      // Instead, process missing queue items synchronously with extended wait
+      // Process missing queue items synchronously with extended wait
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
@@ -2329,7 +2029,7 @@ module.exports = {
             }
           }
 
-          // Re-scan after sync fetch to capture newly populated candidates
+          // Re-scan after sync fetch
           logger.info(
             'poller: re-scanning DB after synchronous slow-path fetch'
           );
@@ -2399,7 +2099,6 @@ module.exports = {
                 { symbol, tf, latestOpen, eventId },
                 'poller: skipping startup-batch duplicate root candle signal'
               );
-              // CRITICAL: Still advance state key even for duplicates
               safeSetState(processedStateKey, latestOpen);
               return null;
             } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
@@ -2424,12 +2123,9 @@ module.exports = {
                       ? 'mtf_alignment_met'
                       : 'mtf_alignment_monitor',
                     tvScore: 0,
-                    tvSource: 'loop2'
+                    tvSource: 'loop3'
                   }
                 };
-
-                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-                safeSetState(midCandleStateKey, Date.now());
 
                 logger.info(
                   {
@@ -2444,16 +2140,13 @@ module.exports = {
                   'poller: root candle flip detected and enqueued with decision tag'
                 );
 
-                // CRITICAL: Only advance state key AFTER signal is successfully created
                 safeSetState(processedStateKey, latestOpen);
-
                 return finalSignal;
               }
             }
           }
 
-          // CRITICAL: Only advance state key if NO flip was detected OR state already higher
-          // This ensures we re-check candles that don't have flips yet
+          // Only advance state key if NO flip was detected
           const existingState = Number(safeGetState(processedStateKey) || 0);
           if (existingState < latestOpen) {
             safeSetState(processedStateKey, latestOpen);
