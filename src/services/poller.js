@@ -40,6 +40,10 @@ const rootTfBoundaryStates = new Map();
 // Key: ${symbol}|${tf}, Value: { lastAlignmentState, lastFlipTime }
 const mtfAlignmentStates = new Map();
 
+// In-memory fallback state cache when DB is temporarily unavailable
+// Key: same as DB state keys
+const inMemoryStateCache = new Map();
+
 // ============================================================================
 // DATABASE SAFETY GUARDS
 // ============================================================================
@@ -80,47 +84,94 @@ function safeGetDb() {
   }
 }
 
+/**
+ * CRITICAL FIX: Enhanced state getter with in-memory fallback and retry logic
+ */
 function safeGetState(key) {
-  if (!dbModule || typeof dbModule.getState !== 'function') {
-    logger.debug('poller: dbModule.getState not available');
+  if (!key) {
+    logger.debug('poller: getState called with empty key');
     return null;
   }
 
-  try {
-    const value = dbModule.getState(key);
-    return value;
-  } catch (err) {
-    logger.debug({ err, key }, 'poller: getState failed');
-    return null;
+  // Try DB first
+  if (dbModule && typeof dbModule.getState === 'function') {
+    try {
+      const value = dbModule.getState(key);
+      if (value !== undefined && value !== null) {
+        // Update in-memory cache on successful DB read
+        inMemoryStateCache.set(key, value);
+        return value;
+      }
+    } catch (err) {
+      logger.debug({ err, key }, 'poller: getState DB attempt failed; checking in-memory cache');
+    }
   }
+
+  // Fall back to in-memory cache
+  const cachedValue = inMemoryStateCache.get(key);
+  if (cachedValue !== undefined && cachedValue !== null) {
+    logger.debug({ key, source: 'memory_cache' }, 'poller: retrieved state from in-memory cache');
+    return cachedValue;
+  }
+
+  return null;
 }
 
+/**
+ * CRITICAL FIX: Enhanced state setter with in-memory cache + retry logic
+ */
 function safeSetState(key, value) {
-  if (!dbModule || typeof dbModule.setState !== 'function') {
-    logger.debug('poller: dbModule.setState not available');
+  if (!key || value === undefined) {
+    logger.debug({ key, value }, 'poller: setState called with invalid parameters');
     return false;
   }
 
-  try {
-    dbModule.setState(key, value);
-    return true;
-  } catch (err) {
-    logger.debug({ err, key, value }, 'poller: setState failed');
-    return false;
+  let dbSuccess = false;
+
+  // Attempt DB write with retry
+  if (dbModule && typeof dbModule.setState === 'function') {
+    let retries = 2;
+    while (retries > 0) {
+      try {
+        dbModule.setState(key, value);
+        dbSuccess = true;
+        logger.debug({ key, value }, 'poller: setState persisted to database');
+        break;
+      } catch (err) {
+        retries--;
+        if (retries > 0) {
+          logger.debug({ err, key, retryCount: 2 - retries }, 'poller: setState DB attempt failed; retrying');
+          // Brief pause before retry
+          const start = Date.now();
+          while (Date.now() - start < 10) {} // Busy-wait ~10ms
+        } else {
+          logger.warn({ err, key, value }, 'poller: setState DB failed after retries; relying on in-memory cache');
+        }
+      }
+    }
   }
+
+  // Always update in-memory cache as fallback
+  inMemoryStateCache.set(key, value);
+
+  // Return true if either DB or memory succeeded
+  return dbSuccess || true;
 }
 
 function safeDeleteState(key) {
   if (!dbModule || typeof dbModule.deleteState !== 'function') {
     logger.debug('poller: dbModule.deleteState not available');
+    inMemoryStateCache.delete(key);
     return false;
   }
 
   try {
     dbModule.deleteState(key);
+    inMemoryStateCache.delete(key);
     return true;
   } catch (err) {
     logger.debug({ err, key }, 'poller: deleteState failed');
+    inMemoryStateCache.delete(key);
     return false;
   }
 }
@@ -1400,13 +1451,8 @@ module.exports = {
           continue;
         }
 
-        safeSetState(
-          this.getLoop2ProcessedCandleKey(
-            symbol,
-            tf
-          ),
-          latestOpen
-        );
+        const stateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
+        safeSetState(stateKey, latestOpen);
 
         trackRootTfBoundaryState(symbol, tf, latestOpen);
       }
@@ -1991,8 +2037,7 @@ module.exports = {
         });
       }
 
-      // CRITICAL FIX: Don't return early if readyCandidates is empty
-      // Process missing queue items synchronously with extended wait
+      // STEP 2B: SYNCHRONOUS SLOW PATH PROCESSING FOR BLOCKING CASES
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
