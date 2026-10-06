@@ -34,9 +34,113 @@ const startupBatchSignalKeys = new Set();
 // Cooldown cache for REST fallbacks during WS gaps (Key: symbol|tf, Value: timestamp)
 const restFallbackCooldowns = new Map();
 
-// NEW: Track root TF boundary closures to invalidate cache on transitions
-// Key: symbol|tf, Value: { closedAtTime, candleOpenTime }
+// Track root TF boundary closures to invalidate cache on transitions
+// Key: poller.loop2.processedCandle.${symbol}.${tf}, Value: { candleOpenTime, lastProcessedTime }
 const rootTfBoundaryStates = new Map();
+
+// ============================================================================
+// DATABASE SAFETY GUARDS - Prevent crashes from stale/closed DB connections
+// ============================================================================
+
+/**
+ * Check if the database module is ready and accessible
+ */
+function isDbReady() {
+  if (!dbModule || typeof dbModule.get !== 'function') {
+    return false;
+  }
+
+  try {
+    const db = dbModule.get();
+    if (!db || typeof db.prepare !== 'function') {
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.debug({ err }, 'poller: db readiness check failed');
+    return false;
+  }
+}
+
+/**
+ * Safely acquire a database connection
+ */
+function safeGetDb() {
+  if (!isDbReady()) {
+    logger.debug('poller: db is not ready');
+    return null;
+  }
+
+  try {
+    const db = dbModule.get();
+    if (!db) {
+      logger.debug('poller: dbModule.get() returned null');
+      return null;
+    }
+    return db;
+  } catch (err) {
+    logger.debug({ err }, 'poller: failed to acquire database connection');
+    return null;
+  }
+}
+
+/**
+ * Safely retrieve a state value from persistent storage
+ */
+function safeGetState(key) {
+  if (!dbModule || typeof dbModule.getState !== 'function') {
+    logger.debug('poller: dbModule.getState not available');
+    return null;
+  }
+
+  try {
+    const value = dbModule.getState(key);
+    return value;
+  } catch (err) {
+    logger.debug({ err, key }, 'poller: getState failed');
+    return null;
+  }
+}
+
+/**
+ * Safely set a state value in persistent storage
+ */
+function safeSetState(key, value) {
+  if (!dbModule || typeof dbModule.setState !== 'function') {
+    logger.debug('poller: dbModule.setState not available');
+    return false;
+  }
+
+  try {
+    dbModule.setState(key, value);
+    return true;
+  } catch (err) {
+    logger.debug({ err, key, value }, 'poller: setState failed');
+    return false;
+  }
+}
+
+/**
+ * Safely delete a state value from persistent storage
+ */
+function safeDeleteState(key) {
+  if (!dbModule || typeof dbModule.deleteState !== 'function') {
+    logger.debug('poller: dbModule.deleteState not available');
+    return false;
+  }
+
+  try {
+    dbModule.deleteState(key);
+    return true;
+  } catch (err) {
+    logger.debug({ err, key }, 'poller: deleteState failed');
+    return false;
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -108,28 +212,37 @@ function isUsdtSymbol(symbol) {
 }
 
 function getLatestOpenTime(db, symbol, timeframe) {
-  const row = db
-    .prepare(
-      `
-        SELECT open_time
-        FROM klines
-        WHERE symbol = ?
-          AND timeframe = ?
-        ORDER BY open_time DESC
-        LIMIT 1
-      `
-    )
-    .get(symbol, timeframe);
-
-  if (!row) {
+  if (!db) {
     return null;
   }
 
-  const openTime = Number(row.open_time);
+  try {
+    const row = db
+      .prepare(
+        `
+          SELECT open_time
+          FROM klines
+          WHERE symbol = ?
+            AND timeframe = ?
+          ORDER BY open_time DESC
+          LIMIT 1
+        `
+      )
+      .get(symbol, timeframe);
 
-  return Number.isFinite(openTime)
-    ? openTime
-    : null;
+    if (!row) {
+      return null;
+    }
+
+    const openTime = Number(row.open_time);
+
+    return Number.isFinite(openTime)
+      ? openTime
+      : null;
+  } catch (err) {
+    logger.debug({ err, symbol, timeframe }, 'poller: getLatestOpenTime query failed');
+    return null;
+  }
 }
 
 function getRootTfMs(tf) {
@@ -289,12 +402,14 @@ function alreadyProcessedSignal(signal, family = 'generic') {
   return false;
 }
 
-// NEW: Clear cache entries when a root TF boundary closes and a new one opens
-function invalidateCacheForRootTfBoundary(symbol, tf, newCandleOpenTime) {
-  const stateKey = `symbol|${tf}`;
+/**
+ * Track root TF boundary state and invalidate cache on transitions
+ */
+function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
+  const stateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
   const prevState = rootTfBoundaryStates.get(stateKey);
 
-  if (prevState && prevState.candleOpenTime !== newCandleOpenTime) {
+  if (prevState && prevState.candleOpenTime !== candleOpenTime) {
     // Boundary transitioned; purge all signal keys for this symbol|tf|old_candle combination
     const keysToDelete = [];
     for (const [key] of processedEventKeys.entries()) {
@@ -308,14 +423,14 @@ function invalidateCacheForRootTfBoundary(symbol, tf, newCandleOpenTime) {
 
     // Also clear mid-candle state key for the old candle
     const oldMidCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${prevState.candleOpenTime}`;
-    dbModule.deleteState(oldMidCandleStateKey);
+    safeDeleteState(oldMidCandleStateKey);
 
     logger.debug(
       {
         symbol,
         tf,
         oldCandleOpenTime: prevState.candleOpenTime,
-        newCandleOpenTime,
+        newCandleOpenTime: candleOpenTime,
         purgedKeys: keysToDelete.length
       },
       'poller: invalidated cache for root TF boundary transition'
@@ -324,8 +439,8 @@ function invalidateCacheForRootTfBoundary(symbol, tf, newCandleOpenTime) {
 
   // Update the boundary state to track the new candle
   rootTfBoundaryStates.set(stateKey, {
-    candleOpenTime: newCandleOpenTime,
-    closedAtTime: Date.now()
+    candleOpenTime,
+    lastProcessedTime: Date.now()
   });
 }
 
@@ -514,7 +629,7 @@ function registerBybitWsListeners() {
 
       // Decoupled WebSocket state key: prevents advancing boundary loop's processedOpen watermark
       const processedStateKey = `poller.ws.processedCandle.${symbol}.${tf}`;
-      const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
+      const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
       if (openTime > processedOpen) {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
@@ -557,7 +672,7 @@ function registerBybitWsListeners() {
           }
         }
 
-        dbModule.setState(processedStateKey, openTime);
+        safeSetState(processedStateKey, openTime);
       }
     } catch (err) {
       logger.debug(
@@ -567,6 +682,10 @@ function registerBybitWsListeners() {
     }
   });
 }
+
+// ============================================================================
+// MODULE EXPORTS
+// ============================================================================
 
 module.exports = {
   start() {
@@ -597,13 +716,17 @@ module.exports = {
     if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
       try {
         bybitWs.start();
-        const db = dbModule.get();
+        const db = safeGetDb();
         if (db) {
-          const rows = db.prepare('SELECT symbol FROM symbols').all();
-          if (rows && rows.length > 0) {
-            const symbols = rows.map((r) => r.symbol).filter(isUsdtSymbol);
-            const count = bybitWs.subscribeSymbols(symbols);
-            logger.info({ count }, 'poller.start: subscribed symbols to WS stream');
+          try {
+            const rows = db.prepare('SELECT symbol FROM symbols').all();
+            if (rows && rows.length > 0) {
+              const symbols = rows.map((r) => r.symbol).filter(isUsdtSymbol);
+              const count = bybitWs.subscribeSymbols(symbols);
+              logger.info({ count }, 'poller.start: subscribed symbols to WS stream');
+            }
+          } catch (err) {
+            logger.debug({ err }, 'poller.start: failed to query symbols');
           }
         }
       } catch (err) {
@@ -695,124 +818,133 @@ module.exports = {
       return [];
     }
 
-    const db = dbModule.get();
-
-    const insert = db.prepare(
-      `
-        INSERT OR REPLACE INTO symbols
-          (symbol, base, quote, fetched_at)
-        VALUES (?, ?, ?, ?)
-      `
-    );
-
-    const now = Date.now();
-
-    const insertMany = db.transaction((rows) => {
-      for (const symbolInfo of rows) {
-        if (
-          !symbolInfo ||
-          !symbolInfo.symbol
-        ) {
-          continue;
-        }
-
-        insert.run(
-          symbolInfo.symbol,
-          symbolInfo.base ||
-            symbolInfo.symbol.replace(
-              /USDT(\.P)?$/i,
-              ''
-            ),
-          symbolInfo.quote || 'USDT',
-          now
-        );
-      }
-    });
-
-    const validSymbols = allSymbols.filter((symbolInfo) =>
-      symbolInfo &&
-      symbolInfo.symbol &&
-      isUsdtSymbol(symbolInfo.symbol)
-    );
-
-    insertMany(validSymbols);
-
-    logger.info(
-      {
-        total: validSymbols.length
-      },
-      'poller.initialScan: symbols persisted'
-    );
-
-    if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
-      try {
-        bybitWs.start();
-        const subCount = bybitWs.subscribeSymbols(validSymbols);
-        logger.info({ subCount }, 'poller.initialScan: subscribed symbols to WS stream');
-      } catch (err) {
-        logger.warn({ err }, 'poller.initialScan: WS subscription error');
-      }
+    const db = safeGetDb();
+    if (!db) {
+      logger.error('poller.initialScan: database not available');
+      return [];
     }
 
-    const seedSymbols =
-      bybit.getSeedSymbols(validSymbols);
+    try {
+      const insert = db.prepare(
+        `
+          INSERT OR REPLACE INTO symbols
+            (symbol, base, quote, fetched_at)
+          VALUES (?, ?, ?, ?)
+        `
+      );
 
-    if (
-      seedSymbols &&
-      seedSymbols.length > 0
-    ) {
-      const invalidSymbols = seedSymbols.filter(
-        (seedSymbol) => {
-          const symbol = String(
-            seedSymbol.symbol || ''
-          ).toUpperCase();
+      const now = Date.now();
 
+      const insertMany = db.transaction((rows) => {
+        for (const symbolInfo of rows) {
           if (
-            /USDT[QHUZ0-9]/.test(
-              symbol.slice(-6)
-            )
+            !symbolInfo ||
+            !symbolInfo.symbol
           ) {
-            return true;
+            continue;
           }
 
-          return !/USDT(\.P)?$/.test(symbol);
+          insert.run(
+            symbolInfo.symbol,
+            symbolInfo.base ||
+              symbolInfo.symbol.replace(
+                /USDT(\.P)?$/i,
+                ''
+              ),
+            symbolInfo.quote || 'USDT',
+            now
+          );
         }
+      });
+
+      const validSymbols = allSymbols.filter((symbolInfo) =>
+        symbolInfo &&
+        symbolInfo.symbol &&
+        isUsdtSymbol(symbolInfo.symbol)
       );
 
-      if (invalidSymbols.length > 0) {
-        logger.error(
-          {
-            count: invalidSymbols.length,
-            samples: invalidSymbols
-              .slice(0, 5)
-              .map((item) => item.symbol)
-          },
-          'poller.initialScan: invalid symbols in seed list'
-        );
-      }
+      insertMany(validSymbols);
 
-      if (seed) {
-        setImmediate(() => {
-          this.backgroundSeedKlines(seedSymbols)
-            .catch((err) => {
-              logger.debug(
-                { err },
-                'poller.initialScan: background seeding failed'
-              );
-            });
-        });
-      } else {
-        logger.debug(
-          'poller.initialScan: background seeding disabled'
-        );
-      }
-    } else {
       logger.info(
-        'poller.initialScan: no seed symbols to process'
+        {
+          total: validSymbols.length
+        },
+        'poller.initialScan: symbols persisted'
       );
-    }
 
-    return validSymbols;
+      if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
+        try {
+          bybitWs.start();
+          const subCount = bybitWs.subscribeSymbols(validSymbols);
+          logger.info({ subCount }, 'poller.initialScan: subscribed symbols to WS stream');
+        } catch (err) {
+          logger.warn({ err }, 'poller.initialScan: WS subscription error');
+        }
+      }
+
+      const seedSymbols =
+        bybit.getSeedSymbols(validSymbols);
+
+      if (
+        seedSymbols &&
+        seedSymbols.length > 0
+      ) {
+        const invalidSymbols = seedSymbols.filter(
+          (seedSymbol) => {
+            const symbol = String(
+              seedSymbol.symbol || ''
+            ).toUpperCase();
+
+            if (
+              /USDT[QHUZ0-9]/.test(
+                symbol.slice(-6)
+              )
+            ) {
+              return true;
+            }
+
+            return !/USDT(\.P)?$/.test(symbol);
+          }
+        );
+
+        if (invalidSymbols.length > 0) {
+          logger.error(
+            {
+              count: invalidSymbols.length,
+              samples: invalidSymbols
+                .slice(0, 5)
+                .map((item) => item.symbol)
+            },
+            'poller.initialScan: invalid symbols in seed list'
+          );
+        }
+
+        if (seed) {
+          setImmediate(() => {
+            this.backgroundSeedKlines(seedSymbols)
+              .catch((err) => {
+                logger.debug(
+                  { err },
+                  'poller.initialScan: background seeding failed'
+                );
+              });
+          });
+        } else {
+          logger.debug(
+            'poller.initialScan: background seeding disabled'
+          );
+        }
+      } else {
+        logger.info(
+          'poller.initialScan: no seed symbols to process'
+        );
+      }
+
+      return validSymbols;
+    } catch (err) {
+      logger.error({ err }, 'poller.initialScan: transaction failed');
+      return [];
+    }
   },
 
   async performWsInitialScan() {
@@ -961,50 +1093,59 @@ module.exports = {
             continue;
           }
 
-          const db = dbModule.get();
+          const db = safeGetDb();
+          if (!db) {
+            logger.debug({ symbol, tf }, 'seedKlinesForSymbol: db not available');
+            continue;
+          }
 
-          const insert = db.prepare(
-            `
-              INSERT OR IGNORE INTO klines
-                (
+          try {
+            const insert = db.prepare(
+              `
+                INSERT OR IGNORE INTO klines
+                  (
+                    symbol,
+                    timeframe,
+                    open_time,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume
+                  )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `
+            );
+
+            const insertMany = db.transaction((rows) => {
+              for (const kline of rows) {
+                insert.run(
                   symbol,
-                  timeframe,
-                  open_time,
-                  open,
-                  high,
-                  low,
-                  close,
-                  volume
-                )
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `
-          );
+                  tf,
+                  kline.open_time,
+                  kline.open,
+                  kline.high,
+                  kline.low,
+                  kline.close,
+                  kline.volume
+                );
+              }
+            });
 
-          const insertMany = db.transaction((rows) => {
-            for (const kline of rows) {
-              insert.run(
+            insertMany(klines);
+
+            logger.debug(
+              {
                 symbol,
                 tf,
-                kline.open_time,
-                kline.open,
-                kline.high,
-                kline.low,
-                kline.close,
-                kline.volume
-              );
-            }
-          });
-
-          insertMany(klines);
-
-          logger.debug(
-            {
-              symbol,
-              tf,
-              count: klines.length
-            },
-            'seedKlinesForSymbol: klines persisted'
-          );
+                count: klines.length
+              },
+              'seedKlinesForSymbol: klines persisted'
+            );
+          } catch (err) {
+            logger.debug({ err, symbol, tf }, 'seedKlinesForSymbol: transaction failed');
+            continue;
+          }
 
           try {
             if (
@@ -1070,36 +1211,45 @@ module.exports = {
         return;
       }
 
-      const db = dbModule.get();
-      const insert = db.prepare(
-        `
-          INSERT OR IGNORE INTO klines
-            (symbol, timeframe, open_time, open, high, low, close, volume)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `
-      );
+      const db = safeGetDb();
+      if (!db) {
+        logger.debug({ symbol, tf }, 'quickFetchLatestKline: db not available');
+        return;
+      }
 
-      const insertMany = db.transaction((rows) => {
-        for (const kline of rows) {
-          insert.run(
-            symbol,
-            tf,
-            kline.open_time,
-            kline.open,
-            kline.high,
-            kline.low,
-            kline.close,
-            kline.volume
-          );
+      try {
+        const insert = db.prepare(
+          `
+            INSERT OR IGNORE INTO klines
+              (symbol, timeframe, open_time, open, high, low, close, volume)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `
+        );
+
+        const insertMany = db.transaction((rows) => {
+          for (const kline of rows) {
+            insert.run(
+              symbol,
+              tf,
+              kline.open_time,
+              kline.open,
+              kline.high,
+              kline.low,
+              kline.close,
+              kline.volume
+            );
+          }
+        });
+
+        insertMany(klines);
+
+        if (typeof macdUtil.computeAndStoreMacd === 'function') {
+          await macdUtil.computeAndStoreMacd(symbol, tf);
+        } else if (typeof macdUtil.computeMacdHistogram === 'function') {
+          await macdUtil.computeMacdHistogram(symbol, tf);
         }
-      });
-
-      insertMany(klines);
-
-      if (typeof macdUtil.computeAndStoreMacd === 'function') {
-        await macdUtil.computeAndStoreMacd(symbol, tf);
-      } else if (typeof macdUtil.computeMacdHistogram === 'function') {
-        await macdUtil.computeMacdHistogram(symbol, tf);
+      } catch (err) {
+        logger.debug({ err, symbol, tf }, 'quickFetchLatestKline: transaction failed');
       }
     } catch (err) {
       logger.debug({ err, symbol, tf }, 'quickFetchLatestKline: fetch failed');
@@ -1199,7 +1349,11 @@ module.exports = {
     );
 
     try {
-      const db = dbModule.get();
+      const db = safeGetDb();
+      if (!db) {
+        logger.error('scanAllForStartup: database not available');
+        return [];
+      }
 
       const rows = db
         .prepare(
@@ -1308,6 +1462,11 @@ module.exports = {
   },
 
   initializeBoundaryCandleState(rows, db) {
+    if (!db) {
+      logger.error('initializeBoundaryCandleState: db is null');
+      return;
+    }
+
     const rootTfs = buildRootTfs();
 
     for (const row of rows) {
@@ -1324,7 +1483,7 @@ module.exports = {
           continue;
         }
 
-        dbModule.setState(
+        safeSetState(
           this.getLoop2ProcessedCandleKey(
             symbol,
             tf
@@ -1332,8 +1491,8 @@ module.exports = {
           latestOpen
         );
 
-        // NEW: Initialize boundary state for cache invalidation tracking
-        invalidateCacheForRootTfBoundary(symbol, tf, latestOpen);
+        // Initialize boundary state for cache invalidation tracking
+        trackRootTfBoundaryState(symbol, tf, latestOpen);
       }
     }
 
@@ -1363,7 +1522,11 @@ module.exports = {
 
     for (const tf of rootTfs) {
       try {
-        const db = dbModule.get();
+        const db = safeGetDb();
+        if (!db) {
+          logger.debug({ symbol, tf }, 'scanSymbolRoots: db not available');
+          continue;
+        }
 
         const selectStatement = db.prepare(
           `
@@ -1547,241 +1710,219 @@ module.exports = {
       'poller.loop2: starting five-minute boundary scan (mid-candle detection via WS)'
     );
 
-    const db = dbModule.get();
+    const db = safeGetDb();
+    if (!db) {
+      logger.warn('poller.loop2: database not available; skipping boundary scan');
+      return;
+    }
 
-    const rows = db
-      .prepare(
-        `
-          SELECT symbol
-          FROM symbols
-          ORDER BY symbol COLLATE NOCASE ASC
-        `
-      )
-      .all();
+    try {
+      const rows = db
+        .prepare(
+          `
+            SELECT symbol
+            FROM symbols
+            ORDER BY symbol COLLATE NOCASE ASC
+          `
+        )
+        .all();
 
-    const validRows = rows.filter((row) =>
-      isUsdtSymbol(row.symbol)
-    );
+      const validRows = rows.filter((row) =>
+        isUsdtSymbol(row.symbol)
+      );
 
-    const rootTfs = buildRootTfs();
-    const newSignals = [];
-    const alignmentAlerts = [];
+      const rootTfs = buildRootTfs();
+      const newSignals = [];
+      const alignmentAlerts = [];
 
-    const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
+      const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
 
-    for (const row of validRows) {
-      const symbol = row.symbol;
+      for (const row of validRows) {
+        const symbol = row.symbol;
 
-      for (const tf of rootTfs) {
-        try {
-          let latestOpen = getLatestOpenTime(
-            db,
-            symbol,
-            tf
-          );
-
-          if (latestOpen === null) {
-            await this.seedKlinesForSymbol(symbol, tf);
-            latestOpen = getLatestOpenTime(db, symbol, tf);
-          }
-
-          if (latestOpen === null) {
-            continue;
-          }
-
-          const processedStateKey =
-            this.getLoop2ProcessedCandleKey(
+        for (const tf of rootTfs) {
+          try {
+            let latestOpen = getLatestOpenTime(
+              db,
               symbol,
               tf
             );
 
-          const processedOpen = Number(
-            dbModule.getState(
-              processedStateKey
-            ) || 0
-          );
+            if (latestOpen === null) {
+              await this.seedKlinesForSymbol(symbol, tf);
+              latestOpen = getLatestOpenTime(db, symbol, tf);
+            }
 
-          if (latestOpen > processedOpen) {
-            logger.debug(
-              {
+            if (latestOpen === null) {
+              continue;
+            }
+
+            const processedStateKey =
+              this.getLoop2ProcessedCandleKey(
                 symbol,
-                tf,
-                latestOpen,
-                processedOpen
-              },
-              'poller.loop2: new root candle detected; skipping mid-candle detection for this root candle'
+                tf
+              );
+
+            const processedOpen = Number(
+              safeGetState(
+                processedStateKey
+              ) || 0
             );
-            continue;
-          }
 
-          const activeSignals = latestSignals.filter((signal) => {
-            return (
-              signal.symbol === symbol &&
-              normalizeRootTf(signal.root_tf) === tf
-            );
-          });
-
-          const isAlreadyInSummary = activeSignals.length > 0;
-
-          if (!isAlreadyInSummary) {
-            const midCandleStateKey =
-              `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-
-            const midCandleAlreadyReported =
-              dbModule.getState(midCandleStateKey);
-
-            if (!midCandleAlreadyReported) {
-              const midCandleFlip =
-                await detectMidCandleFlip(
-                  symbol,
-                  tf
-                );
-
-              if (midCandleFlip) {
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-                const eventId = buildEventId(
-                  'midcandle',
+            if (latestOpen > processedOpen) {
+              logger.debug(
+                {
                   symbol,
                   tf,
-                  latestOpen
-                );
+                  latestOpen,
+                  processedOpen
+                },
+                'poller.loop2: new root candle detected; skipping mid-candle detection for this root candle'
+              );
+              continue;
+            }
 
-                const midSignalCandidate = {
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  eventId,
-                  signalType: 'midcandle_update',
-                  notifyImmediately: true
-                };
+            const activeSignals = latestSignals.filter((signal) => {
+              return (
+                signal.symbol === symbol &&
+                normalizeRootTf(signal.root_tf) === tf
+              );
+            });
 
-                if (isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
-                  logger.debug(
-                    {
-                      symbol,
-                      tf,
-                      latestOpen,
-                      eventId
-                    },
-                    'poller.loop2: skipping startup-batch duplicate mid-candle signal'
+            const isAlreadyInSummary = activeSignals.length > 0;
+
+            if (!isAlreadyInSummary) {
+              const midCandleStateKey =
+                `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+
+              const midCandleAlreadyReported =
+                safeGetState(midCandleStateKey);
+
+              if (!midCandleAlreadyReported) {
+                const midCandleFlip =
+                  await detectMidCandleFlip(
+                    symbol,
+                    tf
                   );
-                  continue;
-                }
 
-                if (!alreadyProcessedSignal(midSignalCandidate, 'midcandle')) {
-                  const signal =
-                    await signalManager.handleRootSignal(midSignalCandidate);
+                if (midCandleFlip) {
+                  const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                  if (signal) {
-                    const decision =
-                      mtfValidation.isAligned
-                        ? 'accept'
-                        : 'monitor';
+                  const eventId = buildEventId(
+                    'midcandle',
+                    symbol,
+                    tf,
+                    latestOpen
+                  );
 
-                    const finalSignal = {
-                      ...signal,
-                      eventId,
-                      notificationType: 'midcandle_update',
-                      signalType: 'midcandle_update',
-                      state: decision,
-                      meta: {
-                        ...(signal.meta || {}),
-                        mtfScore: mtfValidation.mtfScore,
-                        mtfAligned: mtfValidation.isAligned,
-                        alignment: mtfValidation.alignment || {},
-                        decision,
-                        acceptReason: mtfValidation.isAligned
-                          ? 'mtf_alignment_met'
-                          : 'mtf_alignment_monitor',
-                        tvScore: 0,
-                        tvSource: 'loop2'
-                      }
-                    };
+                  const midSignalCandidate = {
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    candle_open_time: latestOpen,
+                    eventId,
+                    signalType: 'midcandle_update',
+                    notifyImmediately: true
+                  };
 
-                    newSignals.push(finalSignal);
-
-                    logger.info(
+                  if (isStartupBatchSignal(midSignalCandidate, 'midcandle')) {
+                    logger.debug(
                       {
                         symbol,
                         tf,
                         latestOpen,
-                        eventId,
-                        mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                        decision,
-                        mtfAligned: mtfValidation.isAligned
+                        eventId
                       },
-                      'poller.loop2: mid-candle histogram flip detected and enqueued with decision tag'
+                      'poller.loop2: skipping startup-batch duplicate mid-candle signal'
                     );
+                    continue;
                   }
 
-                  dbModule.setState(
-                    midCandleStateKey,
-                    Date.now()
-                  );
+                  if (!alreadyProcessedSignal(midSignalCandidate, 'midcandle')) {
+                    const signal =
+                      await signalManager.handleRootSignal(midSignalCandidate);
+
+                    if (signal) {
+                      const decision =
+                        mtfValidation.isAligned
+                          ? 'accept'
+                          : 'monitor';
+
+                      const finalSignal = {
+                        ...signal,
+                        eventId,
+                        notificationType: 'midcandle_update',
+                        signalType: 'midcandle_update',
+                        state: decision,
+                        meta: {
+                          ...(signal.meta || {}),
+                          mtfScore: mtfValidation.mtfScore,
+                          mtfAligned: mtfValidation.isAligned,
+                          alignment: mtfValidation.alignment || {},
+                          decision,
+                          acceptReason: mtfValidation.isAligned
+                            ? 'mtf_alignment_met'
+                            : 'mtf_alignment_monitor',
+                          tvScore: 0,
+                          tvSource: 'loop2'
+                        }
+                      };
+
+                      newSignals.push(finalSignal);
+
+                      // CRITICAL: Only set mid-candle state AFTER signal is confirmed created
+                      safeSetState(
+                        midCandleStateKey,
+                        Date.now()
+                      );
+
+                      logger.info(
+                        {
+                          symbol,
+                          tf,
+                          latestOpen,
+                          eventId,
+                          mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                          decision,
+                          mtfAligned: mtfValidation.isAligned
+                        },
+                        'poller.loop2: mid-candle histogram flip detected and enqueued with decision tag'
+                      );
+                    }
+                  }
                 }
               }
-            }
-          } else {
-            const activeSignal = activeSignals[0];
-            const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            } else {
+              const activeSignal = activeSignals[0];
+              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-            const alignmentStateKey =
-              `poller.loop2.alignment.${symbol}.${tf}`;
+              const alignmentStateKey =
+                `poller.loop2.alignment.${symbol}.${tf}`;
 
-            const previousAlignedState =
-              dbModule.getState(
-                alignmentStateKey
-              );
-
-            const previousAligned =
-              previousAlignedState === 'true' ||
-              previousAlignedState === true;
-
-            const isAllPositive =
-              mtfValidation.totalCount > 0 &&
-              mtfValidation.positiveCount === mtfValidation.totalCount;
-
-            const shouldAlert =
-              isAllPositive &&
-              !previousAligned;
-
-            if (shouldAlert) {
-              const alertSignalCandidate = {
-                ...activeSignal,
-                symbol,
-                root_tf: tf,
-                detected_at: Date.now(),
-                eventId: buildEventId('mtf_align', symbol, tf, Date.now()),
-                signalType: 'mtf_alignment',
-                notificationType: 'mtf_alignment',
-                state: 'accept',
-                meta: {
-                  ...(activeSignal.meta || {}),
-                  alignment: mtfValidation.alignment || {},
-                  decision: 'accept',
-                  acceptReason: 'mtf_alignment_alert',
-                  tvScore: 0,
-                  tvSource: 'loop2',
-                  mtfScore: mtfValidation.mtfScore
-                }
-              };
-
-              if (!alreadyProcessedSignal(alertSignalCandidate, 'alignment') && !isStartupBatchSignal(alertSignalCandidate, 'alignment')) {
-                dbModule.setState(
-                  alignmentStateKey,
-                  String(true)
+              const previousAlignedState =
+                safeGetState(
+                  alignmentStateKey
                 );
 
-                const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
+              const previousAligned =
+                previousAlignedState === 'true' ||
+                previousAlignedState === true;
 
-                alignmentAlerts.push({
+              const isAllPositive =
+                mtfValidation.totalCount > 0 &&
+                mtfValidation.positiveCount === mtfValidation.totalCount;
+
+              const shouldAlert =
+                isAllPositive &&
+                !previousAligned;
+
+              if (shouldAlert) {
+                const alertSignalCandidate = {
                   ...activeSignal,
                   symbol,
                   root_tf: tf,
                   detected_at: Date.now(),
-                  eventId: alertEventId,
+                  eventId: buildEventId('mtf_align', symbol, tf, Date.now()),
                   signalType: 'mtf_alignment',
                   notificationType: 'mtf_alignment',
                   state: 'accept',
@@ -1794,130 +1935,161 @@ module.exports = {
                     tvSource: 'loop2',
                     mtfScore: mtfValidation.mtfScore
                   }
-                });
+                };
+
+                if (!alreadyProcessedSignal(alertSignalCandidate, 'alignment') && !isStartupBatchSignal(alertSignalCandidate, 'alignment')) {
+                  safeSetState(
+                    alignmentStateKey,
+                    String(true)
+                  );
+
+                  const alertEventId = buildEventId('mtf_align', symbol, tf, Date.now());
+
+                  alignmentAlerts.push({
+                    ...activeSignal,
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    eventId: alertEventId,
+                    signalType: 'mtf_alignment',
+                    notificationType: 'mtf_alignment',
+                    state: 'accept',
+                    meta: {
+                      ...(activeSignal.meta || {}),
+                      alignment: mtfValidation.alignment || {},
+                      decision: 'accept',
+                      acceptReason: 'mtf_alignment_alert',
+                      tvScore: 0,
+                      tvSource: 'loop2',
+                      mtfScore: mtfValidation.mtfScore
+                    }
+                  });
+
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      positiveCount: mtfValidation.positiveCount,
+                      totalCount: mtfValidation.totalCount
+                    },
+                    'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+                  );
+                }
+              } else if (!isAllPositive && previousAligned) {
+                safeSetState(
+                  alignmentStateKey,
+                  String(false)
+                );
 
                 logger.info(
                   {
                     symbol,
                     tf,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    positiveCount: mtfValidation.positiveCount,
-                    totalCount: mtfValidation.totalCount
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
                   },
-                  'poller.loop2: MTF alignment alert created for existing active signal (100% consensus met)'
+                  'poller.loop2: MTF alignment dropped below 100%'
+                );
+              } else if (previousAlignedState === undefined) {
+                safeSetState(
+                  alignmentStateKey,
+                  String(false)
                 );
               }
-            } else if (!isAllPositive && previousAligned) {
-              dbModule.setState(
-                alignmentStateKey,
-                String(false)
-              );
-
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                },
-                'poller.loop2: MTF alignment dropped below 100%'
-              );
-            } else if (previousAlignedState === undefined) {
-              dbModule.setState(
-                alignmentStateKey,
-                String(false)
-              );
             }
+          } catch (err) {
+            logger.debug(
+              {
+                err,
+                symbol,
+                tf
+              },
+              'poller.loop2: symbol/timeframe scan failed'
+            );
           }
-        } catch (err) {
-          logger.debug(
-            {
-              err,
-              symbol,
-              tf
-            },
-            'poller.loop2: symbol/timeframe scan failed'
-          );
         }
       }
-    }
 
-    for (const signal of newSignals) {
-      try {
-        if (isStartupBatchSignal(signal, signal.signalType || 'midcandle_update')) {
-          logger.debug(
+      for (const signal of newSignals) {
+        try {
+          if (isStartupBatchSignal(signal, signal.signalType || 'midcandle_update')) {
+            logger.debug(
+              {
+                symbol: signal.symbol,
+                root_tf: signal.root_tf,
+                eventId: signal.eventId
+              },
+              'poller.loop2: skipping startup-batch duplicate midcandle enqueue'
+            );
+            continue;
+          }
+
+          const queued =
+            notificationQueue.enqueueSignal(
+              signal,
+              'midcandle_update'
+            );
+
+          logger.info(
             {
               symbol: signal.symbol,
               root_tf: signal.root_tf,
-              eventId: signal.eventId
+              queued,
+              decision: signal.meta && signal.meta.decision
             },
-            'poller.loop2: skipping startup-batch duplicate midcandle enqueue'
+            'poller.loop2: midcandle update enqueued'
           );
-          continue;
+        } catch (err) {
+          logger.error(
+            {
+              err,
+              signal
+            },
+            'poller.loop2: FAILED to enqueue midcandle update'
+          );
         }
-
-        const queued =
-          notificationQueue.enqueueSignal(
-            signal,
-            'midcandle_update'
-          );
-
-        logger.info(
-          {
-            symbol: signal.symbol,
-            root_tf: signal.root_tf,
-            queued,
-            decision: signal.meta && signal.meta.decision
-          },
-          'poller.loop2: midcandle update enqueued'
-        );
-      } catch (err) {
-        logger.error(
-          {
-            err,
-            signal
-          },
-          'poller.loop2: FAILED to enqueue midcandle update'
-        );
       }
-    }
 
-    for (const alert of alignmentAlerts) {
-      try {
-        const queued =
-          notificationQueue.enqueueSignal(
-            alert,
-            'mtf_alignment'
+      for (const alert of alignmentAlerts) {
+        try {
+          const queued =
+            notificationQueue.enqueueSignal(
+              alert,
+              'mtf_alignment'
+            );
+
+          logger.info(
+            {
+              symbol: alert.symbol,
+              root_tf: alert.root_tf,
+              queued,
+              mtfScore: (
+                alert.meta.mtfScore * 100
+              ).toFixed(0) + '%'
+            },
+            'poller.loop2: realtime alignment alert enqueued'
           );
-
-        logger.info(
-          {
-            symbol: alert.symbol,
-            root_tf: alert.root_tf,
-            queued,
-            mtfScore: (
-              alert.meta.mtfScore * 100
-            ).toFixed(0) + '%'
-          },
-          'poller.loop2: realtime alignment alert enqueued'
-        );
-      } catch (err) {
-        logger.error(
-          {
-            err,
-            alert
-          },
-          'poller.loop2: FAILED to enqueue alignment alert'
-        );
+        } catch (err) {
+          logger.error(
+            {
+              err,
+              alert
+            },
+            'poller.loop2: FAILED to enqueue alignment alert'
+          );
+        }
       }
-    }
 
-    logger.info(
-      {
-        newSignals: newSignals.length,
-        alignmentAlerts: alignmentAlerts.length
-      },
-      'poller.loop2: exact five-minute boundary scan completed'
-    );
+      logger.info(
+        {
+          newSignals: newSignals.length,
+          alignmentAlerts: alignmentAlerts.length
+        },
+        'poller.loop2: exact five-minute boundary scan completed'
+      );
+    } catch (err) {
+      logger.error({ err }, 'poller.loop2: scan iteration failed');
+    }
   },
 
   startRootTfCandleOpenLoop() {
@@ -2046,376 +2218,397 @@ module.exports = {
       'poller: root TF candle open boundary scan started'
     );
 
-    const db = dbModule.get();
-    const rows = db
-      .prepare(
-        `
-          SELECT symbol
-          FROM symbols
-          ORDER BY symbol COLLATE NOCASE ASC
-        `
-      )
-      .all();
-
-    const validRows = rows.filter((row) => isUsdtSymbol(row.symbol));
-
-    const readyCandidates = [];
-    const missingDataQueue = [];
-    let detectedNewCandles = false;
-
-    // STEP 1: FAST PATH VS. SLOW PATH SEPARATION
-    const dbCheckStart = performance.now();
-
-    for (const row of validRows) {
-      const symbol = row.symbol;
-
-      for (const tf of tfsToProcess) {
-        const latestOpen = getLatestOpenTime(db, symbol, tf);
-        const processedStateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
-        const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
-
-        if (latestOpen !== null && latestOpen > processedOpen) {
-          detectedNewCandles = true;
-          readyCandidates.push({
-            symbol,
-            tf,
-            latestOpen,
-            processedStateKey
-          });
-
-          // NEW: Invalidate cache when boundary transition is detected
-          invalidateCacheForRootTfBoundary(symbol, tf, latestOpen);
-        } else {
-          missingDataQueue.push({ symbol, tf });
-        }
-      }
+    const db = safeGetDb();
+    if (!db) {
+      logger.warn('poller: database not available; skipping root TF candle open scan');
+      return false;
     }
 
-    const dbCheckDuration = (performance.now() - dbCheckStart).toFixed(2);
-    logger.info(
-      {
-        durationMs: dbCheckDuration,
-        readyCount: readyCandidates.length,
-        missingCount: missingDataQueue.length
-      },
-      'poller.perf: [1/4] Fast path DB classification completed'
-    );
+    try {
+      const rows = db
+        .prepare(
+          `
+            SELECT symbol
+            FROM symbols
+            ORDER BY symbol COLLATE NOCASE ASC
+          `
+        )
+        .all();
 
-    // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
-    if (missingDataQueue.length > 0) {
-      logger.info(
-        { missingCount: missingDataQueue.length },
-        'poller: offloading missing symbols to rate-controlled background catch-up'
-      );
+      const validRows = rows.filter((row) => isUsdtSymbol(row.symbol));
 
-      setImmediate(async () => {
-        await this.processMissingDataQueueSafe(missingDataQueue);
-      });
-    }
+      const readyCandidates = [];
+      const missingDataQueue = [];
+      let detectedNewCandles = false;
 
-    // NEW FIX: Don't return early if readyCandidates is empty
-    // Instead, process missing queue items synchronously with extended wait
-    if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
-      logger.info(
-        { missingCount: missingDataQueue.length },
-        'poller: no fast-path candidates; attempting synchronous lightweight fetch for slow-path items'
-      );
+      // STEP 1: FAST PATH VS. SLOW PATH SEPARATION
+      const dbCheckStart = performance.now();
 
-      const syncStart = performance.now();
-      const COOLDOWN_MS = 5 * 60 * 1000;
-      const now = Date.now();
+      for (const row of validRows) {
+        const symbol = row.symbol;
 
-      const eligibleSlowPath = missingDataQueue.filter((item) => {
-        const key = `${item.symbol}|${item.tf}`;
-        const lastAttempt = restFallbackCooldowns.get(key) || 0;
-        return now - lastAttempt > COOLDOWN_MS;
-      }).slice(0, 20);
-
-      if (eligibleSlowPath.length > 0) {
-        logger.info(
-          { count: eligibleSlowPath.length },
-          'poller: synchronously fetching eligible slow-path items'
-        );
-
-        for (const item of eligibleSlowPath) {
-          const key = `${item.symbol}|${item.tf}`;
-          restFallbackCooldowns.set(key, now);
-
-          try {
-            await this.quickFetchLatestKline(item.symbol, item.tf);
-          } catch (err) {
-            logger.debug(
-              { err, symbol: item.symbol, tf: item.tf },
-              'poller: sync slow-path fetch error'
-            );
-          }
-        }
-
-        // Re-scan after sync fetch to capture newly populated candidates
-        logger.info(
-          'poller: re-scanning DB after synchronous slow-path fetch'
-        );
-
-        for (const item of eligibleSlowPath) {
-          const latestOpen = getLatestOpenTime(db, item.symbol, item.tf);
-          const processedStateKey = this.getLoop2ProcessedCandleKey(item.symbol, item.tf);
-          const processedOpen = Number(dbModule.getState(processedStateKey) || 0);
+        for (const tf of tfsToProcess) {
+          const latestOpen = getLatestOpenTime(db, symbol, tf);
+          const processedStateKey = this.getLoop2ProcessedCandleKey(symbol, tf);
+          const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
           if (latestOpen !== null && latestOpen > processedOpen) {
             detectedNewCandles = true;
             readyCandidates.push({
-              symbol: item.symbol,
-              tf: item.tf,
+              symbol,
+              tf,
               latestOpen,
               processedStateKey
             });
 
-            invalidateCacheForRootTfBoundary(item.symbol, item.tf, latestOpen);
+            // Track boundary state with correct key format
+            trackRootTfBoundaryState(symbol, tf, latestOpen);
+          } else {
+            missingDataQueue.push({ symbol, tf });
           }
         }
-
-        logger.info(
-          {
-            syncFetchDurationMs: (performance.now() - syncStart).toFixed(2),
-            newCandidatesFound: readyCandidates.length
-          },
-          'poller.perf: synchronous slow-path fetch completed'
-        );
-      }
-    }
-
-    if (readyCandidates.length === 0) {
-      logger.info(
-        { durationMs: (performance.now() - scanStartTime).toFixed(2) },
-        'poller: no new WebSocket candle data present in DB yet; fast path complete'
-      );
-      return false;
-    }
-
-    // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
-    const computeStart = performance.now();
-    const allBoundarySignals = [];
-
-    const candidatePromises = readyCandidates.map(async (candidate) => {
-      const { symbol, tf, latestOpen, processedStateKey } = candidate;
-
-      try {
-        const flip = await macdUtil.isMacdFlip(symbol, tf);
-
-        if (flip) {
-          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-          const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
-
-          const rootCandidate = {
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            candle_open_time: latestOpen,
-            eventId,
-            signalType: 'rootcandle_update',
-            notifyImmediately: true
-          };
-
-          if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
-            logger.debug(
-              { symbol, tf, latestOpen, eventId },
-              'poller: skipping startup-batch duplicate root candle signal'
-            );
-          } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
-            const signal = await signalManager.handleRootSignal(rootCandidate);
-
-            if (signal) {
-              const decision = mtfValidation.isAligned ? 'accept' : 'monitor';
-
-              const finalSignal = {
-                ...signal,
-                eventId,
-                notificationType: 'new_root_candle',
-                signalType: 'rootcandle_update',
-                state: decision,
-                meta: {
-                  ...(signal.meta || {}),
-                  mtfScore: mtfValidation.mtfScore,
-                  mtfAligned: mtfValidation.isAligned,
-                  alignment: mtfValidation.alignment || {},
-                  decision,
-                  acceptReason: mtfValidation.isAligned
-                    ? 'mtf_alignment_met'
-                    : 'mtf_alignment_monitor',
-                  tvScore: 0,
-                  tvSource: 'loop2'
-                }
-              };
-
-              const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
-              dbModule.setState(midCandleStateKey, Date.now());
-
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  latestOpen,
-                  eventId,
-                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                  decision,
-                  mtfAligned: mtfValidation.isAligned
-                },
-                'poller: root candle flip detected and enqueued with decision tag'
-              );
-
-              return finalSignal;
-            }
-          }
-        }
-
-        dbModule.setState(processedStateKey, latestOpen);
-      } catch (err) {
-        logger.debug(
-          { err, symbol, tf },
-          'poller: error evaluating fast-path candidate'
-        );
       }
 
-      return null;
-    });
-
-    const evaluatedResults = await Promise.all(candidatePromises);
-    for (const res of evaluatedResults) {
-      if (res) {
-        allBoundarySignals.push(res);
-      }
-    }
-
-    const computeDuration = (performance.now() - computeStart).toFixed(2);
-    logger.info(
-      {
-        durationMs: computeDuration,
-        processedCandidates: readyCandidates.length,
-        signalsFound: allBoundarySignals.length
-      },
-      'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
-    );
-
-    // STEP 4: INSTANT SUMMARY & RECOMMENDED BLOCK BROADCAST
-    const broadcastStart = performance.now();
-
-    if (allBoundarySignals.length > 0) {
+      const dbCheckDuration = (performance.now() - dbCheckStart).toFixed(2);
       logger.info(
         {
-          count: allBoundarySignals.length,
-          timeframes: tfsToProcess
+          durationMs: dbCheckDuration,
+          readyCount: readyCandidates.length,
+          missingCount: missingDataQueue.length
         },
-        'poller: enqueueing root TF candle open notifications via summary + per-block flow'
+        'poller.perf: [1/4] Fast path DB classification completed'
       );
 
-      notificationQueue.enqueueRootCandleOpenBatch(
-        allBoundarySignals,
-        tfsToProcess.join(',')
-      );
-    }
+      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP & CIRCUIT BREAKER
+      if (missingDataQueue.length > 0) {
+        logger.info(
+          { missingCount: missingDataQueue.length },
+          'poller: offloading missing symbols to rate-controlled background catch-up'
+        );
 
-    // SUMMARY BLOCK
-    const summaryBlock = {
-      timestamp: new Date(nowMs).toISOString(),
-      scanType: 'root_tf_candle_open',
-      timeframes: tfsToProcess,
-      totalSymbolsScanned: validRows.length,
-      fastPathProcessed: readyCandidates.length,
-      slowPathQueued: missingDataQueue.length,
-      newCandlesDetected: detectedNewCandles,
-      signalsGenerated: allBoundarySignals.length,
-      acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
-      monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
-      avgMtfScore: allBoundarySignals.length > 0
-        ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
-        : 'N/A',
-      totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
-      detailedBreakdown: tfsToProcess.map(tf => {
-        const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
-        return {
-          timeframe: tf,
-          signalCount: tfSignals.length,
-          acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
-          monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
-        };
-      })
-    };
+        setImmediate(async () => {
+          await this.processMissingDataQueueSafe(missingDataQueue);
+        });
+      }
 
-    logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
+      // CRITICAL FIX: Don't return early if readyCandidates is empty
+      // Instead, process missing queue items synchronously with extended wait
+      if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
+        logger.info(
+          { missingCount: missingDataQueue.length },
+          'poller: no fast-path candidates; attempting synchronous lightweight fetch for slow-path items'
+        );
 
-    // SIGNAL PER BLOCK
-    for (const signal of allBoundarySignals) {
-      const signalBlock = {
-        symbol: signal.symbol,
-        timeframe: normalizeRootTf(signal.root_tf),
-        candleOpenTime: new Date(signal.candle_open_time).toISOString(),
-        eventId: signal.eventId,
-        decision: signal.meta?.decision || 'unknown',
-        mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
-        mtfAligned: signal.meta?.mtfAligned || false,
-        alignmentDetails: signal.meta?.alignment || {},
-        acceptReason: signal.meta?.acceptReason || 'none',
-        confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
-      };
+        const syncStart = performance.now();
+        const COOLDOWN_MS = 5 * 60 * 1000;
+        const now = Date.now();
 
-      logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
-    }
+        const eligibleSlowPath = missingDataQueue.filter((item) => {
+          const key = `${item.symbol}|${item.tf}`;
+          const lastAttempt = restFallbackCooldowns.get(key) || 0;
+          return now - lastAttempt > COOLDOWN_MS;
+        }).slice(0, 20);
 
-    // RECOMMENDED BLOCKS
-    const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
-    const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
+        if (eligibleSlowPath.length > 0) {
+          logger.info(
+            { count: eligibleSlowPath.length },
+            'poller: synchronously fetching eligible slow-path items'
+          );
 
-    if (acceptedSignals.length > 0) {
-      const acceptedBlock = {
-        actionType: 'ACCEPT',
-        count: acceptedSignals.length,
-        reason: 'MTF alignment threshold met (≥ 60%)',
-        signals: acceptedSignals.map(s => ({
-          symbol: s.symbol,
-          timeframe: normalizeRootTf(s.root_tf),
-          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-        })),
-        recommendation: 'Process these signals for potential trade entry'
-      };
+          for (const item of eligibleSlowPath) {
+            const key = `${item.symbol}|${item.tf}`;
+            restFallbackCooldowns.set(key, now);
 
-      logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
-    }
+            try {
+              await this.quickFetchLatestKline(item.symbol, item.tf);
+            } catch (err) {
+              logger.debug(
+                { err, symbol: item.symbol, tf: item.tf },
+                'poller: sync slow-path fetch error'
+              );
+            }
+          }
 
-    if (monitorSignals.length > 0) {
-      const monitorBlock = {
-        actionType: 'MONITOR',
-        count: monitorSignals.length,
-        reason: 'MTF alignment below threshold (< 60%)',
-        signals: monitorSignals.map(s => ({
-          symbol: s.symbol,
-          timeframe: normalizeRootTf(s.root_tf),
-          mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-          positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-        })),
-        recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
-      };
+          // Re-scan after sync fetch to capture newly populated candidates
+          logger.info(
+            'poller: re-scanning DB after synchronous slow-path fetch'
+          );
 
-      logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
-    }
+          for (const item of eligibleSlowPath) {
+            const latestOpen = getLatestOpenTime(db, item.symbol, item.tf);
+            const processedStateKey = this.getLoop2ProcessedCandleKey(item.symbol, item.tf);
+            const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
-    if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
+            if (latestOpen !== null && latestOpen > processedOpen) {
+              detectedNewCandles = true;
+              readyCandidates.push({
+                symbol: item.symbol,
+                tf: item.tf,
+                latestOpen,
+                processedStateKey
+              });
+
+              trackRootTfBoundaryState(item.symbol, item.tf, latestOpen);
+            }
+          }
+
+          logger.info(
+            {
+              syncFetchDurationMs: (performance.now() - syncStart).toFixed(2),
+              newCandidatesFound: readyCandidates.length
+            },
+            'poller.perf: synchronous slow-path fetch completed'
+          );
+        }
+      }
+
+      if (readyCandidates.length === 0) {
+        logger.info(
+          { durationMs: (performance.now() - scanStartTime).toFixed(2) },
+          'poller: no new WebSocket candle data present in DB yet; fast path complete'
+        );
+        return false;
+      }
+
+      // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
+      const computeStart = performance.now();
+      const allBoundarySignals = [];
+
+      const candidatePromises = readyCandidates.map(async (candidate) => {
+        const { symbol, tf, latestOpen, processedStateKey } = candidate;
+
+        try {
+          const flip = await macdUtil.isMacdFlip(symbol, tf);
+
+          if (flip) {
+            const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+            const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
+
+            const rootCandidate = {
+              symbol,
+              root_tf: tf,
+              detected_at: Date.now(),
+              candle_open_time: latestOpen,
+              eventId,
+              signalType: 'rootcandle_update',
+              notifyImmediately: true
+            };
+
+            if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+              logger.debug(
+                { symbol, tf, latestOpen, eventId },
+                'poller: skipping startup-batch duplicate root candle signal'
+              );
+              // CRITICAL: Still advance state key even for duplicates
+              safeSetState(processedStateKey, latestOpen);
+              return null;
+            } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+              const signal = await signalManager.handleRootSignal(rootCandidate);
+
+              if (signal) {
+                const decision = mtfValidation.isAligned ? 'accept' : 'monitor';
+
+                const finalSignal = {
+                  ...signal,
+                  eventId,
+                  notificationType: 'new_root_candle',
+                  signalType: 'rootcandle_update',
+                  state: decision,
+                  meta: {
+                    ...(signal.meta || {}),
+                    mtfScore: mtfValidation.mtfScore,
+                    mtfAligned: mtfValidation.isAligned,
+                    alignment: mtfValidation.alignment || {},
+                    decision,
+                    acceptReason: mtfValidation.isAligned
+                      ? 'mtf_alignment_met'
+                      : 'mtf_alignment_monitor',
+                    tvScore: 0,
+                    tvSource: 'loop2'
+                  }
+                };
+
+                const midCandleStateKey = `poller.loop2.midCandle.${symbol}.${tf}.${latestOpen}`;
+                safeSetState(midCandleStateKey, Date.now());
+
+                logger.info(
+                  {
+                    symbol,
+                    tf,
+                    latestOpen,
+                    eventId,
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                    decision,
+                    mtfAligned: mtfValidation.isAligned
+                  },
+                  'poller: root candle flip detected and enqueued with decision tag'
+                );
+
+                // CRITICAL: Only advance state key AFTER signal is successfully created
+                safeSetState(processedStateKey, latestOpen);
+
+                return finalSignal;
+              }
+            }
+          }
+
+          // CRITICAL: Only advance state key if NO flip was detected OR state already higher
+          // This ensures we re-check candles that don't have flips yet
+          const existingState = Number(safeGetState(processedStateKey) || 0);
+          if (existingState < latestOpen) {
+            safeSetState(processedStateKey, latestOpen);
+          }
+        } catch (err) {
+          logger.debug(
+            { err, symbol, tf },
+            'poller: error evaluating fast-path candidate'
+          );
+        }
+
+        return null;
+      });
+
+      const evaluatedResults = await Promise.all(candidatePromises);
+      for (const res of evaluatedResults) {
+        if (res) {
+          allBoundarySignals.push(res);
+        }
+      }
+
+      const computeDuration = (performance.now() - computeStart).toFixed(2);
       logger.info(
-        { timeframes: tfsToProcess },
-        'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+        {
+          durationMs: computeDuration,
+          processedCandidates: readyCandidates.length,
+          signalsFound: allBoundarySignals.length
+        },
+        'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
       );
+
+      // STEP 4: INSTANT SUMMARY & RECOMMENDED BLOCK BROADCAST
+      const broadcastStart = performance.now();
+
+      if (allBoundarySignals.length > 0) {
+        logger.info(
+          {
+            count: allBoundarySignals.length,
+            timeframes: tfsToProcess
+          },
+          'poller: enqueueing root TF candle open notifications via summary + per-block flow'
+        );
+
+        notificationQueue.enqueueRootCandleOpenBatch(
+          allBoundarySignals,
+          tfsToProcess.join(',')
+        );
+      }
+
+      // SUMMARY BLOCK
+      const summaryBlock = {
+        timestamp: new Date(nowMs).toISOString(),
+        scanType: 'root_tf_candle_open',
+        timeframes: tfsToProcess,
+        totalSymbolsScanned: validRows.length,
+        fastPathProcessed: readyCandidates.length,
+        slowPathQueued: missingDataQueue.length,
+        newCandlesDetected: detectedNewCandles,
+        signalsGenerated: allBoundarySignals.length,
+        acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
+        monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
+        avgMtfScore: allBoundarySignals.length > 0
+          ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
+          : 'N/A',
+        totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
+        detailedBreakdown: tfsToProcess.map(tf => {
+          const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
+          return {
+            timeframe: tf,
+            signalCount: tfSignals.length,
+            acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
+            monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
+          };
+        })
+      };
+
+      logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
+
+      // SIGNAL PER BLOCK
+      for (const signal of allBoundarySignals) {
+        const signalBlock = {
+          symbol: signal.symbol,
+          timeframe: normalizeRootTf(signal.root_tf),
+          candleOpenTime: new Date(signal.candle_open_time).toISOString(),
+          eventId: signal.eventId,
+          decision: signal.meta?.decision || 'unknown',
+          mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
+          mtfAligned: signal.meta?.mtfAligned || false,
+          alignmentDetails: signal.meta?.alignment || {},
+          acceptReason: signal.meta?.acceptReason || 'none',
+          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
+        };
+
+        logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
+      }
+
+      // RECOMMENDED BLOCKS
+      const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
+      const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
+
+      if (acceptedSignals.length > 0) {
+        const acceptedBlock = {
+          actionType: 'ACCEPT',
+          count: acceptedSignals.length,
+          reason: 'MTF alignment threshold met (≥ 60%)',
+          signals: acceptedSignals.map(s => ({
+            symbol: s.symbol,
+            timeframe: normalizeRootTf(s.root_tf),
+            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+          })),
+          recommendation: 'Process these signals for potential trade entry'
+        };
+
+        logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
+      }
+
+      if (monitorSignals.length > 0) {
+        const monitorBlock = {
+          actionType: 'MONITOR',
+          count: monitorSignals.length,
+          reason: 'MTF alignment below threshold (< 60%)',
+          signals: monitorSignals.map(s => ({
+            symbol: s.symbol,
+            timeframe: normalizeRootTf(s.root_tf),
+            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+          })),
+          recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
+        };
+
+        logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
+      }
+
+      if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
+        logger.info(
+          { timeframes: tfsToProcess },
+          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+        );
+      }
+
+      const totalScanDuration = (performance.now() - scanStartTime).toFixed(2);
+      logger.info(
+        {
+          totalScanDurationMs: totalScanDuration,
+          broadcastDurationMs: (performance.now() - broadcastStart).toFixed(2)
+        },
+        'poller.perf: [4/4] Root TF candle open scan completed successfully'
+      );
+
+      return detectedNewCandles;
+    } catch (err) {
+      logger.error({ err }, 'poller.runRootTfCandleOpenOnce: fatal error');
+      return false;
     }
-
-    const totalScanDuration = (performance.now() - scanStartTime).toFixed(2);
-    logger.info(
-      {
-        totalScanDurationMs: totalScanDuration,
-        broadcastDurationMs: (performance.now() - broadcastStart).toFixed(2)
-      },
-      'poller.perf: [4/4] Root TF candle open scan completed successfully'
-    );
-
-    return detectedNewCandles;
   },
 
   getLoop2ProcessedCandleKey(symbol, tf) {
