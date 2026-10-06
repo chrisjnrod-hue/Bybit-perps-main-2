@@ -77,6 +77,48 @@ function getSignalId(signal) {
   ].join('_');
 }
 
+function resolveQueueItemType(type, signal = null) {
+  const rawType = String(type || '')
+    .trim()
+    .toLowerCase();
+
+  if (!rawType) {
+    const notificationType = String(
+      getNotificationType(signal) || ''
+    )
+      .trim()
+      .toLowerCase();
+
+    const map = {
+      'new_root_candle': 'realtime',
+      'root_candle_update': 'realtime',
+      'rootcandle_update': 'realtime',
+      'mtf_alignment': 'mtf_alignment',
+      'mtfalign': 'mtf_alignment',
+      'midcandle_update': 'midcandle_update',
+      'candle_update': 'candle_update'
+    };
+
+    return map[notificationType] || 'realtime';
+  }
+
+  const map = {
+    'new_root_candle': 'realtime',
+    'root_candle_update': 'realtime',
+    'rootcandle_update': 'realtime',
+    'root_candle_open_batch': 'root_candle_open_batch',
+    'root_candle_batch': 'root_candle_batch',
+    'startup_batch': 'startup_batch',
+    'realtime': 'realtime',
+    'mtf_alignment': 'mtf_alignment',
+    'mtfalign': 'mtf_alignment',
+    'midcandle_update': 'midcandle_update',
+    'candle_update': 'candle_update'
+  };
+
+  return map[rawType] || rawType;
+}
+
 class NotificationQueue {
   constructor() {
     this.queue = [];
@@ -282,8 +324,14 @@ class NotificationQueue {
 
     this.reserveSignal(normalized);
 
+    const queueType =
+      resolveQueueItemType(
+        type,
+        normalized
+      );
+
     this.queue.push({
-      type,
+      type: queueType,
       signal: normalized,
       signalId,
       timestamp: Date.now()
@@ -293,6 +341,7 @@ class NotificationQueue {
       {
         signalId,
         type,
+        queueType,
         notificationType:
           normalized.notificationType,
         queueLength: this.queue.length
@@ -593,9 +642,16 @@ class NotificationQueue {
         const item =
           this.queue.shift();
 
+        const queueType =
+          resolveQueueItemType(
+            item.type,
+            item.signal
+          );
+
         logger.debug(
           {
-            type: item.type,
+            originalType: item.type,
+            resolvedType: queueType,
             queueRemaining:
               this.queue.length
           },
@@ -604,21 +660,21 @@ class NotificationQueue {
 
         try {
           if (
-            item.type === 'startup_batch'
+            queueType === 'startup_batch'
           ) {
             await this._processStartupBatch(
               item.signals
             );
             this.markBatchSent(item);
           } else if (
-            item.type === 'root_candle_batch'
+            queueType === 'root_candle_batch'
           ) {
             await this._processRootCandleBatch(
               item.signals
             );
             this.markBatchSent(item);
           } else if (
-            item.type === 'root_candle_open_batch'
+            queueType === 'root_candle_open_batch'
           ) {
             await this._processRootCandleOpenBatch(
               item.signals,
@@ -626,7 +682,7 @@ class NotificationQueue {
             );
             this.markBatchSent(item);
           } else if (
-            item.type === 'realtime'
+            queueType === 'realtime'
           ) {
             await this._processRealtimeSignal(
               item.signal
@@ -635,7 +691,7 @@ class NotificationQueue {
               item.signalId
             );
           } else if (
-            item.type === 'mtf_alignment'
+            queueType === 'mtf_alignment'
           ) {
             await this._processMtfAlignment(
               item.signal
@@ -644,7 +700,7 @@ class NotificationQueue {
               item.signalId
             );
           } else if (
-            item.type === 'midcandle_update'
+            queueType === 'midcandle_update'
           ) {
             await this._processMidCandleUpdate(
               item.signal
@@ -653,7 +709,7 @@ class NotificationQueue {
               item.signalId
             );
           } else if (
-            item.type === 'candle_update'
+            queueType === 'candle_update'
           ) {
             await this._processCandleUpdate(
               item.signal
@@ -663,7 +719,7 @@ class NotificationQueue {
             );
           } else {
             throw new Error(
-              `Unsupported notification queue item type: ${item.type}`
+              `Unsupported notification queue item type: ${queueType}`
             );
           }
         } catch (err) {
@@ -672,7 +728,8 @@ class NotificationQueue {
           logger.error(
             {
               err,
-              itemType: item.type
+              itemType: item.type,
+              resolvedType: queueType
             },
             'NotificationQueue: item processing failed'
           );
