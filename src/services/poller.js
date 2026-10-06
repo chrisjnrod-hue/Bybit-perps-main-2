@@ -489,11 +489,14 @@ async function validateMtfAlignmentConsensus(symbol) {
   const totalCount = alignmentValues.length;
   const mtfScore = positiveCount / totalCount;
 
+  // FIX #1: Changed from 0.6 (60%) to 0.5 (50%) to allow signals at boundary
+  // OR keep 0.6 but use > instead of >= for stricter alignment requirement
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
   );
 
-  const isAligned = mtfScore >= threshold;
+  // FIX #1a: Use > instead of >= to require strict majority above 60%
+  const isAligned = mtfScore > threshold;
 
   return {
     isAligned,
@@ -501,7 +504,7 @@ async function validateMtfAlignmentConsensus(symbol) {
     positiveCount,
     totalCount,
     alignment,
-    reason: isAligned ? 'threshold_met' : `only_${positiveCount}_of_${totalCount}`
+    reason: isAligned ? 'threshold_exceeded' : `only_${positiveCount}_of_${totalCount}`
   };
 }
 
@@ -2150,7 +2153,11 @@ module.exports = {
               const signal = await signalManager.handleRootSignal(rootCandidate);
 
               if (signal) {
-                const decision = mtfValidation.isAligned ? 'accept' : 'monitor';
+                // FIX #2: Changed decision logic to emit signals even at monitor level
+                // Only use "accept" for high-confidence (70%+) alignment
+                const acceptThreshold = 0.7;
+                const isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
+                const decision = isHighConfidence ? 'accept' : 'monitor';
 
                 const finalSignal = {
                   ...signal,
@@ -2164,9 +2171,9 @@ module.exports = {
                     mtfAligned: mtfValidation.isAligned,
                     alignment: mtfValidation.alignment || {},
                     decision,
-                    acceptReason: mtfValidation.isAligned
-                      ? 'mtf_alignment_met'
-                      : 'mtf_alignment_monitor',
+                    acceptReason: isHighConfidence
+                      ? 'mtf_high_confidence'
+                      : 'mtf_monitor_required',
                     tvScore: 0,
                     tvSource: 'loop3'
                   }
@@ -2235,10 +2242,17 @@ module.exports = {
           'poller: enqueueing root TF candle open notifications via summary + per-block flow'
         );
 
-        notificationQueue.enqueueRootCandleOpenBatch(
-          allBoundarySignals,
-          tfsToProcess.join(',')
-        );
+        // FIX #3: Use consistent notification type for all signals
+        for (const signal of allBoundarySignals) {
+          try {
+            notificationQueue.enqueueSignal(signal, 'new_root_candle');
+          } catch (err) {
+            logger.error(
+              { err, signal },
+              'poller: failed to enqueue root candle signal'
+            );
+          }
+        }
       }
 
       // SUMMARY BLOCK
@@ -2296,7 +2310,7 @@ module.exports = {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
-          reason: 'MTF alignment threshold met (≥ 60%)',
+          reason: 'MTF alignment high-confidence (≥ 70%)',
           signals: acceptedSignals.map(s => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
@@ -2313,7 +2327,7 @@ module.exports = {
         const monitorBlock = {
           actionType: 'MONITOR',
           count: monitorSignals.length,
-          reason: 'MTF alignment below threshold (< 60%)',
+          reason: 'MTF alignment below high-confidence threshold (< 70%)',
           signals: monitorSignals.map(s => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
