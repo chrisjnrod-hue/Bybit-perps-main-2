@@ -1,3 +1,4 @@
+// notificationQueue.js
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -82,6 +83,28 @@ function resolveQueueItemType(type, signal = null) {
     .trim()
     .toLowerCase();
 
+  const aliasMap = {
+    'new_root_candle_open': 'root_candle_open_batch',
+    'root_tf_candle_open': 'root_candle_open_batch',
+    'newroottfcandleopen': 'root_candle_open_batch',
+    'root_candle_open_batch': 'root_candle_open_batch',
+    'new_root_candle': 'realtime',
+    'root_candle_update': 'realtime',
+    'rootcandle_update': 'realtime',
+    'startup_batch': 'startup_batch',
+    'root_candle_batch': 'root_candle_batch',
+    'realtime': 'realtime',
+    'mtf_alignment': 'mtf_alignment',
+    'mtfalign': 'mtf_alignment',
+    'midcandle_update': 'midcandle_update',
+    'candle_update': 'candle_update',
+    'startup': 'startup_batch'
+  };
+
+  if (aliasMap[rawType]) {
+    return aliasMap[rawType];
+  }
+
   if (!rawType) {
     const notificationType = String(
       getNotificationType(signal) || ''
@@ -89,7 +112,10 @@ function resolveQueueItemType(type, signal = null) {
       .trim()
       .toLowerCase();
 
-    const map = {
+    const signalMap = {
+      'new_root_candle_open': 'root_candle_open_batch',
+      'root_tf_candle_open': 'root_candle_open_batch',
+      'newroottfcandleopen': 'root_candle_open_batch',
       'new_root_candle': 'realtime',
       'root_candle_update': 'realtime',
       'rootcandle_update': 'realtime',
@@ -99,7 +125,7 @@ function resolveQueueItemType(type, signal = null) {
       'candle_update': 'candle_update'
     };
 
-    return map[notificationType] || 'realtime';
+    return signalMap[notificationType] || 'realtime';
   }
 
   const map = {
@@ -107,6 +133,9 @@ function resolveQueueItemType(type, signal = null) {
     'root_candle_update': 'realtime',
     'rootcandle_update': 'realtime',
     'root_candle_open_batch': 'root_candle_open_batch',
+    'new_root_candle_open': 'root_candle_open_batch',
+    'root_tf_candle_open': 'root_candle_open_batch',
+    'newroottfcandleopen': 'root_candle_open_batch',
     'root_candle_batch': 'root_candle_batch',
     'startup_batch': 'startup_batch',
     'realtime': 'realtime',
@@ -412,10 +441,6 @@ class NotificationQueue {
     });
   }
 
-  /**
-   * FIXED: Properly enqueue root TF candle-open batch with unified state tracking
-   * Only deduplicates within current batch, allows new signals post-startup
-   */
   enqueueRootCandleOpenBatch(
     signals,
     tf = null,
@@ -482,7 +507,6 @@ class NotificationQueue {
         continue;
       }
 
-      // Only check sent signals during startup; post-startup, allow new signals
       if (isStartupPhase && this.isKnownSignal(signalWithType)) {
         logger.debug(
           {
@@ -855,21 +879,43 @@ class NotificationQueue {
     );
 
     if (
-      typeof telegram.sendRootCandleOpenSummary ===
-      'function'
+      typeof telegram.sendRootCandleOpenSummary !== 'function'
     ) {
+      logger.error(
+        {
+          tf,
+          count: signals.length
+        },
+        'NotificationQueue: missing telegram.sendRootCandleOpenSummary; aborting root TF candle-open dispatch'
+      );
+
+      throw new Error(
+        'telegram.sendRootCandleOpenSummary is not available'
+      );
+    }
+
+    try {
       await telegram.sendRootCandleOpenSummary({
         snapshot: signals,
         tf
       });
-    } else {
-      await telegram.sendRootCandleSummary({
-        snapshot: signals,
-        tf
-      });
+    } catch (err) {
+      logger.error(
+        {
+          err,
+          tf,
+          count: signals.length
+        },
+        'NotificationQueue: root TF candle-open batch flow failed'
+      );
+      throw err;
     }
 
     logger.info(
+      {
+        tf,
+        count: signals.length
+      },
       'NotificationQueue: root TF candle-open batch flow completed'
     );
   }
