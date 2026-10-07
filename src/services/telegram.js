@@ -1,3 +1,4 @@
+// telegram.js
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config');
 const logger = require('pino')();
@@ -8,7 +9,9 @@ let bot = null;
 const SUMMARY_TITLE_MAP = {
   startup: '📊 Startup Summary',
   new_root_candle: '🕔 New Root Candle Open',
+  new_root_candle_open: '🕔 New Root Candle Open',
   root_tf_candle_open: '🕔 Root TF Candle Open',
+  newroottfcandleopen: '🕔 New Root Candle Open',
   mtf_alignment: '⏱️ MTF Alignment Alert',
   midcandle_update: '⏳ Mid-Candle Update'
 };
@@ -30,6 +33,24 @@ function getNotificationType(signal) {
   }
 
   return null;
+}
+
+function normalizeNotificationType(signal) {
+  const type = getNotificationType(signal);
+
+  if (!type) {
+    return null;
+  }
+
+  const normalized = String(type).trim().toLowerCase();
+
+  const aliases = {
+    'new_root_candle_open': 'new_root_candle',
+    'root_tf_candle_open': 'new_root_candle',
+    'newroottfcandleopen': 'new_root_candle'
+  };
+
+  return aliases[normalized] || normalized;
 }
 
 module.exports = {
@@ -408,7 +429,7 @@ module.exports = {
       }`;
 
     const notificationType =
-      getNotificationType(signal);
+      normalizeNotificationType(signal);
 
     const eventTitle =
       notificationType
@@ -1033,9 +1054,33 @@ module.exports = {
     snapshot = [],
     tf = null
   } = {}) {
-    return this.sendRootCandleSummary({
-      snapshot,
+    if (!Array.isArray(snapshot)) {
+      logger.warn(
+        { tf },
+        'Telegram: sendRootCandleOpenSummary received invalid snapshot'
+      );
+      return false;
+    }
+
+    const filtered =
       tf
+        ? snapshot.filter((signal) => {
+            return String(signal.root_tf || '') === String(tf);
+          })
+        : snapshot;
+
+    const title =
+      tf
+        ? `🕔 New Root Candle Open (${tf})`
+        : SUMMARY_TITLE_MAP.new_root_candle;
+
+    await this.sendSummaryBlock({
+      snapshot: filtered,
+      title,
+      signalType: 'new_root_candle',
+      timeframeFilter: tf || null
     });
+
+    return true;
   }
 };
