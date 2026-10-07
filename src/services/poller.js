@@ -527,7 +527,7 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
 
   const mtfPurged = cleanupExpiredMtfAlignmentStates(24 * 60 * 60 * 1000);
   const rootTfPurged = cleanupExpiredRootTfBoundaryStates(7 * 24 * 60 * 60 * 1000);
-  const startupPurged = cleanupExpiredStartupBatchSignals(5 * 60 * 1000); // FIXED: 5 min TTL
+  const startupPurged = cleanupExpiredStartupBatchSignals(5 * 60 * 1000);
   const cooldownPurged = cleanupRestFallbackCooldowns(10 * 60 * 1000);
   const stateCachePurged = cleanupInMemoryStateCache(2 * 60 * 60 * 1000);
 
@@ -628,13 +628,10 @@ async function validateMtfAlignmentConsensus(symbol) {
   const totalCount = alignmentValues.length;
   const mtfScore = positiveCount / totalCount;
 
-  // FIX #1: Changed from 0.6 (60%) to 0.5 (50%) to allow signals at boundary
-  // OR keep 0.6 but use > instead of >= for stricter alignment requirement
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
   );
 
-  // FIX #1a: Use > instead of >= to require strict majority above 60%
   const isAligned = mtfScore > threshold;
 
   return {
@@ -658,18 +655,15 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
   const isNow100Percent = mtfValidation.positiveCount === mtfValidation.totalCount && mtfValidation.totalCount > 0;
 
   if (!prevState) {
-    // First time tracking this symbol/tf
     mtfAlignmentStates.set(stateKey, {
       lastAlignmentState: isNow100Percent,
       lastFlipTime: Date.now()
     });
-    // Only fire if 100% aligned on first check
     return isNow100Percent;
   }
 
   const wasAlignedBefore = prevState.lastAlignmentState;
 
-  // State changed from non-aligned to 100% aligned: FIRE ALERT
   if (!wasAlignedBefore && isNow100Percent) {
     mtfAlignmentStates.set(stateKey, {
       lastAlignmentState: isNow100Percent,
@@ -678,12 +672,10 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
     return true;
   }
 
-  // State is still 100% but no change: don't fire (prevents duplicate)
   if (wasAlignedBefore && isNow100Percent) {
     return false;
   }
 
-  // State changed from aligned to non-aligned: reset state but don't fire alert
   if (wasAlignedBefore && !isNow100Percent) {
     mtfAlignmentStates.set(stateKey, {
       lastAlignmentState: isNow100Percent,
@@ -1870,7 +1862,6 @@ module.exports = {
               ) || 0
             );
 
-            // FIX: Only process fresh candle data; stale data should not trigger MTF checks
             if (latestOpen > processedOpen) {
               const activeSignals = latestSignals.filter((signal) => {
                 return (
@@ -1880,10 +1871,8 @@ module.exports = {
               });
 
               if (activeSignals.length > 0) {
-                // We have an active root signal - check if MTF alignment just became 100%
                 const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                // Check if this should trigger an MTF alignment alert
                 if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation)) {
                   const activeSignal = activeSignals[0];
                   const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
@@ -1936,7 +1925,6 @@ module.exports = {
         }
       }
 
-      // Enqueue all MTF alignment alerts (no duplicates due to shouldFireMtfAlignmentAlert check)
       for (const alert of alignmentAlerts) {
         try {
           const queued =
@@ -2214,7 +2202,6 @@ module.exports = {
             }
           }
 
-          // Re-scan after sync fetch
           logger.info(
             'poller: re-scanning DB after synchronous slow-path fetch'
           );
@@ -2301,8 +2288,6 @@ module.exports = {
               const signal = await signalManager.handleRootSignal(rootCandidate);
 
               if (signal) {
-                // FIX #2: Changed decision logic to emit signals even at monitor level
-                // Only use "accept" for high-confidence (70%+) alignment
                 const acceptThreshold = 0.7;
                 const isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
                 const decision = isHighConfidence ? 'accept' : 'monitor';
@@ -2346,7 +2331,6 @@ module.exports = {
             }
           }
 
-          // Only advance state key if NO flip was detected
           const existingState = Number(safeGetState(processedStateKey) || 0);
           if (existingState < latestOpen) {
             safeSetState(processedStateKey, latestOpen);
@@ -2452,4 +2436,126 @@ module.exports = {
           candleOpenTime: new Date(signal.candle_open_time).toISOString(),
           eventId: signal.eventId,
           decision: signal.meta?.decision || 'unknown',
-          mtfScore: (signal.meta
+          mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
+          mtfAligned: signal.meta?.mtfAligned || false,
+          alignmentDetails: signal.meta?.alignment || {},
+          acceptReason: signal.meta?.acceptReason || 'none',
+          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
+        };
+
+        logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
+      }
+
+      // RECOMMENDED BLOCKS
+      const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
+      const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
+
+      if (acceptedSignals.length > 0) {
+        const acceptedBlock = {
+          actionType: 'ACCEPT',
+          count: acceptedSignals.length,
+          reason: 'MTF alignment high-confidence (≥ 70%)',
+          signals: acceptedSignals.map(s => ({
+            symbol: s.symbol,
+            timeframe: normalizeRootTf(s.root_tf),
+            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+          })),
+          recommendation: 'Process these signals for potential trade entry'
+        };
+
+        logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
+      }
+
+      if (monitorSignals.length > 0) {
+        const monitorBlock = {
+          actionType: 'MONITOR',
+          count: monitorSignals.length,
+          reason: 'MTF alignment below high-confidence threshold (< 70%)',
+          signals: monitorSignals.map(s => ({
+            symbol: s.symbol,
+            timeframe: normalizeRootTf(s.root_tf),
+            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+          })),
+          recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
+        };
+
+        logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
+      }
+
+      if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
+        logger.info(
+          { timeframes: tfsToProcess },
+          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+        );
+      }
+
+      const totalScanDuration = (performance.now() - scanStartTime).toFixed(2);
+      logger.info(
+        {
+          totalScanDurationMs: totalScanDuration,
+          broadcastDurationMs: (performance.now() - broadcastStart).toFixed(2)
+        },
+        'poller.perf: [4/4] Root TF candle open scan completed successfully'
+      );
+
+      return detectedNewCandles;
+    } catch (err) {
+      logger.error({ err }, 'poller.runRootTfCandleOpenOnce: fatal error');
+      return false;
+    }
+  },
+
+  getLoop2ProcessedCandleKey(symbol, tf) {
+    return `poller.loop2.processedCandle.${symbol}.${tf}`;
+  },
+
+  startCacheCleanupLoop() {
+    setImmediate(() => {
+      this.runCacheCleanupLoop()
+        .catch((err) => {
+          logger.error(
+            { err },
+            'poller: cache cleanup loop crashed'
+          );
+        });
+    });
+  },
+
+  async runCacheCleanupLoop() {
+    const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+    while (isRunning) {
+      await sleep(CLEANUP_INTERVAL_MS);
+
+      if (!isRunning) {
+        break;
+      }
+
+      try {
+        clearExpiredProcessedSignalKeys(60 * 60 * 1000);
+
+        logger.debug(
+          {
+            processedEventKeysSize: processedEventKeys.size,
+            mtfAlignmentStatesSize: mtfAlignmentStates.size,
+            rootTfBoundaryStatesSize: rootTfBoundaryStates.size,
+            startupBatchSignalKeysSize: startupBatchSignalKeys.size,
+            restFallbackCooldownsSize: restFallbackCooldowns.size,
+            inMemoryStateCacheSize: inMemoryStateCache.size,
+            macdFlipTrackerSize: macdFlipTracker.size
+          },
+          'poller: cache cleanup cycle completed'
+        );
+      } catch (err) {
+        logger.error({ err }, 'poller: cache cleanup failed');
+      }
+    }
+  },
+
+  stop() {
+    isRunning = false;
+    logger.info('poller: stopping loops');
+  }
+};
