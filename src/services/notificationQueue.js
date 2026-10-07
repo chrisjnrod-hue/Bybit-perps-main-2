@@ -412,9 +412,14 @@ class NotificationQueue {
     });
   }
 
+  /**
+   * FIXED: Properly enqueue root TF candle-open batch with unified state tracking
+   * Only deduplicates within current batch, allows new signals post-startup
+   */
   enqueueRootCandleOpenBatch(
     signals,
-    tf = null
+    tf = null,
+    isStartupPhase = false
   ) {
     if (!Array.isArray(signals)) {
       logger.warn(
@@ -463,8 +468,7 @@ class NotificationQueue {
 
       if (
         !signalId ||
-        reservedIds.has(signalId) ||
-        this.isKnownSignal(signalWithType)
+        reservedIds.has(signalId)
       ) {
         logger.debug(
           {
@@ -473,7 +477,21 @@ class NotificationQueue {
             notificationType:
               signalWithType.notificationType
           },
-          'NotificationQueue: filtering duplicate root TF candle-open signal'
+          'NotificationQueue: filtering duplicate within batch'
+        );
+        continue;
+      }
+
+      // Only check sent signals during startup; post-startup, allow new signals
+      if (isStartupPhase && this.isKnownSignal(signalWithType)) {
+        logger.debug(
+          {
+            signalId,
+            tf,
+            notificationType:
+              signalWithType.notificationType
+          },
+          'NotificationQueue: filtering startup-phase duplicate'
         );
         continue;
       }
