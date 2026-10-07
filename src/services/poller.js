@@ -1,3 +1,4 @@
+// poller.js (FULL UPDATED VERSION)
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -2375,10 +2376,12 @@ module.exports = {
         );
 
         // FIXED: Use proper batch enqueue instead of individual signals
+        // Group signals by timeframe and enqueue each group
         for (const tf of tfsToProcess) {
           const tfSignals = allBoundarySignals.filter(
             s => normalizeRootTf(s.root_tf) === tf
           );
+
           if (tfSignals.length > 0) {
             // Pass isStartupPhase=false to allow post-startup signals
             const queued = notificationQueue.enqueueRootCandleOpenBatch(
@@ -2391,10 +2394,21 @@ module.exports = {
               {
                 tf,
                 signalCount: tfSignals.length,
-                queued
+                queued,
+                batchType: 'root_candle_open_batch'
               },
-              'poller: root TF batch enqueued for timeframe'
+              'poller: root TF candle-open batch enqueued for timeframe'
             );
+
+            if (!queued) {
+              logger.error(
+                {
+                  tf,
+                  signalCount: tfSignals.length
+                },
+                'poller: FAILED to enqueue root TF candle-open batch for timeframe'
+              );
+            }
           }
         }
       }
