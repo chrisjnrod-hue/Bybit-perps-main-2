@@ -27,7 +27,7 @@ let boundaryScanInProgress = false;
 // Key format: symbol|root_tf|candle_open_time|signal_family
 const processedEventKeys = new Map();
 
-// Tracks startup-batch signals
+// Tracks startup-batch signals (REDUCED TTL: 5 minutes instead of 12 hours)
 // Map<signalKey, { firedAt }>
 const startupBatchSignalKeys = new Map();
 
@@ -35,6 +35,7 @@ const startupBatchSignalKeys = new Map();
 const restFallbackCooldowns = new Map();
 
 // Track root TF boundary state - Key: poller.loop2.processedCandle.${symbol}.${tf}
+// UNIFIED: Only one key format for all state tracking
 const rootTfBoundaryStates = new Map();
 
 // Track MTF alignment state for each symbol/TF to prevent duplicate alerts
@@ -458,7 +459,11 @@ function cleanupExpiredRootTfBoundaryStates(ttlMs = 7 * 24 * 60 * 60 * 1000) {
   return keysToDelete.length;
 }
 
-function cleanupExpiredStartupBatchSignals(ttlMs = 12 * 60 * 60 * 1000) {
+/**
+ * FIXED: Reduced TTL from 12 hours to 5 minutes
+ * Allows legitimate root candle signals to pass through after startup window
+ */
+function cleanupExpiredStartupBatchSignals(ttlMs = 5 * 60 * 1000) {
   const now = Date.now();
   const keysToDelete = [];
 
@@ -522,7 +527,7 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
 
   const mtfPurged = cleanupExpiredMtfAlignmentStates(24 * 60 * 60 * 1000);
   const rootTfPurged = cleanupExpiredRootTfBoundaryStates(7 * 24 * 60 * 60 * 1000);
-  const startupPurged = cleanupExpiredStartupBatchSignals(12 * 60 * 60 * 1000);
+  const startupPurged = cleanupExpiredStartupBatchSignals(5 * 60 * 1000); // FIXED: 5 min TTL
   const cooldownPurged = cleanupRestFallbackCooldowns(10 * 60 * 1000);
   const stateCachePurged = cleanupInMemoryStateCache(2 * 60 * 60 * 1000);
 
@@ -735,8 +740,8 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // Decoupled WebSocket state key
-      const processedStateKey = `poller.ws.processedCandle.${symbol}.${tf}`;
+      // FIXED: Use unified state key (poller.loop2.processedCandle)
+      const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
       if (openTime > processedOpen) {
@@ -2373,7 +2378,7 @@ module.exports = {
         'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
       );
 
-      // STEP 4: INSTANT SUMMARY & RECOMMENDED BLOCK BROADCAST
+      // STEP 4: BATCH ENQUEUE - FIXED TO USE PROPER NOTIFICATION FLOW
       const broadcastStart = performance.now();
 
       if (allBoundarySignals.length > 0) {
@@ -2382,17 +2387,29 @@ module.exports = {
             count: allBoundarySignals.length,
             timeframes: tfsToProcess
           },
-          'poller: enqueueing root TF candle open notifications via summary + per-block flow'
+          'poller: enqueueing root TF candle open batch notifications'
         );
 
-        // FIX #3: Use consistent notification type for all signals
-        for (const signal of allBoundarySignals) {
-          try {
-            notificationQueue.enqueueSignal(signal, 'new_root_candle');
-          } catch (err) {
-            logger.error(
-              { err, signal },
-              'poller: failed to enqueue root candle signal'
+        // FIXED: Use proper batch enqueue instead of individual signals
+        for (const tf of tfsToProcess) {
+          const tfSignals = allBoundarySignals.filter(
+            s => normalizeRootTf(s.root_tf) === tf
+          );
+          if (tfSignals.length > 0) {
+            // Pass isStartupPhase=false to allow post-startup signals
+            const queued = notificationQueue.enqueueRootCandleOpenBatch(
+              tfSignals,
+              tf,
+              false // isStartupPhase = false for live trading
+            );
+
+            logger.info(
+              {
+                tf,
+                signalCount: tfSignals.length,
+                queued
+              },
+              'poller: root TF batch enqueued for timeframe'
             );
           }
         }
@@ -2435,126 +2452,4 @@ module.exports = {
           candleOpenTime: new Date(signal.candle_open_time).toISOString(),
           eventId: signal.eventId,
           decision: signal.meta?.decision || 'unknown',
-          mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
-          mtfAligned: signal.meta?.mtfAligned || false,
-          alignmentDetails: signal.meta?.alignment || {},
-          acceptReason: signal.meta?.acceptReason || 'none',
-          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
-        };
-
-        logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
-      }
-
-      // RECOMMENDED BLOCKS
-      const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
-      const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
-
-      if (acceptedSignals.length > 0) {
-        const acceptedBlock = {
-          actionType: 'ACCEPT',
-          count: acceptedSignals.length,
-          reason: 'MTF alignment high-confidence (≥ 70%)',
-          signals: acceptedSignals.map(s => ({
-            symbol: s.symbol,
-            timeframe: normalizeRootTf(s.root_tf),
-            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-          })),
-          recommendation: 'Process these signals for potential trade entry'
-        };
-
-        logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
-      }
-
-      if (monitorSignals.length > 0) {
-        const monitorBlock = {
-          actionType: 'MONITOR',
-          count: monitorSignals.length,
-          reason: 'MTF alignment below high-confidence threshold (< 70%)',
-          signals: monitorSignals.map(s => ({
-            symbol: s.symbol,
-            timeframe: normalizeRootTf(s.root_tf),
-            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
-          })),
-          recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
-        };
-
-        logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
-      }
-
-      if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
-        logger.info(
-          { timeframes: tfsToProcess },
-          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
-        );
-      }
-
-      const totalScanDuration = (performance.now() - scanStartTime).toFixed(2);
-      logger.info(
-        {
-          totalScanDurationMs: totalScanDuration,
-          broadcastDurationMs: (performance.now() - broadcastStart).toFixed(2)
-        },
-        'poller.perf: [4/4] Root TF candle open scan completed successfully'
-      );
-
-      return detectedNewCandles;
-    } catch (err) {
-      logger.error({ err }, 'poller.runRootTfCandleOpenOnce: fatal error');
-      return false;
-    }
-  },
-
-  getLoop2ProcessedCandleKey(symbol, tf) {
-    return `poller.loop2.processedCandle.${symbol}.${tf}`;
-  },
-
-  startCacheCleanupLoop() {
-    setImmediate(() => {
-      this.runCacheCleanupLoop()
-        .catch((err) => {
-          logger.error(
-            { err },
-            'poller: cache cleanup loop crashed'
-          );
-        });
-    });
-  },
-
-  async runCacheCleanupLoop() {
-    const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
-
-    while (isRunning) {
-      await sleep(CLEANUP_INTERVAL_MS);
-
-      if (!isRunning) {
-        break;
-      }
-
-      try {
-        clearExpiredProcessedSignalKeys(60 * 60 * 1000);
-
-        logger.debug(
-          {
-            processedEventKeysSize: processedEventKeys.size,
-            mtfAlignmentStatesSize: mtfAlignmentStates.size,
-            rootTfBoundaryStatesSize: rootTfBoundaryStates.size,
-            startupBatchSignalKeysSize: startupBatchSignalKeys.size,
-            restFallbackCooldownsSize: restFallbackCooldowns.size,
-            inMemoryStateCacheSize: inMemoryStateCache.size,
-            macdFlipTrackerSize: macdFlipTracker.size
-          },
-          'poller: cache cleanup cycle completed'
-        );
-      } catch (err) {
-        logger.error({ err }, 'poller: cache cleanup failed');
-      }
-    }
-  },
-
-  stop() {
-    isRunning = false;
-    logger.info('poller: stopping loops');
-  }
-};
+          mtfScore: (signal.meta
