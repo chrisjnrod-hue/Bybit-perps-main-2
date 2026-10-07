@@ -28,7 +28,8 @@ let boundaryScanInProgress = false;
 const processedEventKeys = new Map();
 
 // Tracks startup-batch signals
-const startupBatchSignalKeys = new Set();
+// Map<signalKey, { firedAt }>
+const startupBatchSignalKeys = new Map();
 
 // Cooldown cache for REST fallbacks during WS gaps
 const restFallbackCooldowns = new Map();
@@ -42,7 +43,12 @@ const mtfAlignmentStates = new Map();
 
 // In-memory fallback state cache when DB is temporarily unavailable
 // Key: same as DB state keys
+// Value: { value, cachedAt }
 const inMemoryStateCache = new Map();
+
+// MACD flip dedupe tracker
+// Key: ${symbol}|${tf}|${candleOpenTime}
+const macdFlipTracker = new Map();
 
 // ============================================================================
 // DATABASE SAFETY GUARDS
@@ -99,7 +105,10 @@ function safeGetState(key) {
       const value = dbModule.getState(key);
       if (value !== undefined && value !== null) {
         // Update in-memory cache on successful DB read
-        inMemoryStateCache.set(key, value);
+        inMemoryStateCache.set(key, {
+          value,
+          cachedAt: Date.now()
+        });
         return value;
       }
     } catch (err) {
@@ -108,10 +117,10 @@ function safeGetState(key) {
   }
 
   // Fall back to in-memory cache
-  const cachedValue = inMemoryStateCache.get(key);
-  if (cachedValue !== undefined && cachedValue !== null) {
+  const cached = inMemoryStateCache.get(key);
+  if (cached && cached.value !== undefined && cached.value !== null) {
     logger.debug({ key, source: 'memory_cache' }, 'poller: retrieved state from in-memory cache');
-    return cachedValue;
+    return cached.value;
   }
 
   return null;
@@ -152,7 +161,10 @@ function safeSetState(key, value) {
   }
 
   // Always update in-memory cache as fallback
-  inMemoryStateCache.set(key, value);
+  inMemoryStateCache.set(key, {
+    value,
+    cachedAt: Date.now()
+  });
 
   // Return true if either DB or memory succeeded
   return dbSuccess || true;
@@ -412,6 +424,93 @@ function trackRootTfBoundaryState(symbol, tf, candleOpenTime) {
   });
 }
 
+function cleanupExpiredMtfAlignmentStates(ttlMs = 24 * 60 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, value] of mtfAlignmentStates.entries()) {
+    if (now - value.lastFlipTime > ttlMs) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    mtfAlignmentStates.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
+function cleanupExpiredRootTfBoundaryStates(ttlMs = 7 * 24 * 60 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, value] of rootTfBoundaryStates.entries()) {
+    if (now - value.lastProcessedTime > ttlMs) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    rootTfBoundaryStates.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
+function cleanupExpiredStartupBatchSignals(ttlMs = 12 * 60 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, info] of startupBatchSignalKeys.entries()) {
+    if (now - info.firedAt > ttlMs) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    startupBatchSignalKeys.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
+function cleanupRestFallbackCooldowns(maxAgeMs = 10 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, ts] of restFallbackCooldowns.entries()) {
+    if (now - ts > maxAgeMs) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    restFallbackCooldowns.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
+function cleanupInMemoryStateCache(ttlMs = 2 * 60 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, value] of inMemoryStateCache.entries()) {
+    if (value && typeof value === 'object' && value.cachedAt) {
+      if (now - value.cachedAt > ttlMs) {
+        keysToDelete.push(key);
+      }
+    }
+  }
+
+  for (const key of keysToDelete) {
+    inMemoryStateCache.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
 function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   const now = Date.now();
 
@@ -420,17 +519,48 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
       processedEventKeys.delete(key);
     }
   }
+
+  const mtfPurged = cleanupExpiredMtfAlignmentStates(24 * 60 * 60 * 1000);
+  const rootTfPurged = cleanupExpiredRootTfBoundaryStates(7 * 24 * 60 * 60 * 1000);
+  const startupPurged = cleanupExpiredStartupBatchSignals(12 * 60 * 60 * 1000);
+  const cooldownPurged = cleanupRestFallbackCooldowns(10 * 60 * 1000);
+  const stateCachePurged = cleanupInMemoryStateCache(2 * 60 * 60 * 1000);
+
+  if (
+    mtfPurged > 0 ||
+    rootTfPurged > 0 ||
+    startupPurged > 0 ||
+    cooldownPurged > 0 ||
+    stateCachePurged > 0
+  ) {
+    logger.debug(
+      {
+        processedEventKeysSize: processedEventKeys.size,
+        mtfAlignmentStatesSize: mtfAlignmentStates.size,
+        rootTfBoundaryStatesSize: rootTfBoundaryStates.size,
+        startupBatchSignalKeysSize: startupBatchSignalKeys.size,
+        restFallbackCooldownsSize: restFallbackCooldowns.size,
+        inMemoryStateCacheSize: inMemoryStateCache.size,
+        mtfPurged,
+        rootTfPurged,
+        startupPurged,
+        cooldownPurged,
+        stateCachePurged
+      },
+      'poller: cache cleanup cycle completed'
+    );
+  }
 }
 
 function registerStartupBatchSignal(signal, family = 'generic') {
   const baseKey = startupBatchKeyFromSignal(signal);
   if (baseKey) {
-    startupBatchSignalKeys.add(baseKey);
+    startupBatchSignalKeys.set(baseKey, { firedAt: Date.now() });
   }
 
   const key = dedupKeyFromSignal(signal, family);
   if (key) {
-    startupBatchSignalKeys.add(key);
+    startupBatchSignalKeys.set(key, { firedAt: Date.now() });
     processedEventKeys.set(key, Date.now());
   }
 
@@ -454,6 +584,10 @@ function registerStartupBatchSignal(signal, family = 'generic') {
       'mtf_alignment'
     ];
     for (const fam of families) {
+      startupBatchSignalKeys.set(
+        `${symbol}|${rootTf}|${effectiveCandle}|${fam}`,
+        { firedAt: Date.now() }
+      );
       processedEventKeys.set(`${symbol}|${rootTf}|${effectiveCandle}|${fam}`, Date.now());
     }
   }
@@ -708,6 +842,8 @@ module.exports = {
         logger.warn({ err }, 'poller.start: failed to initialize WS stream');
       }
     }
+
+    this.startCacheCleanupLoop();
 
     this.startBoundaryScanLoop();
     logger.info(
@@ -1292,11 +1428,7 @@ module.exports = {
       }
     }
 
-    for (const [key, ts] of restFallbackCooldowns.entries()) {
-      if (now - ts > COOLDOWN_MS * 2) {
-        restFallbackCooldowns.delete(key);
-      }
-    }
+    cleanupRestFallbackCooldowns(10 * 60 * 1000);
 
     logger.info(
       {
@@ -1733,8 +1865,8 @@ module.exports = {
               ) || 0
             );
 
-            // CRITICAL: Only check MTF alignment when we have an active signal for this symbol/tf
-            if (latestOpen <= processedOpen) {
+            // FIX: Only process fresh candle data; stale data should not trigger MTF checks
+            if (latestOpen > processedOpen) {
               const activeSignals = latestSignals.filter((signal) => {
                 return (
                   signal.symbol === symbol &&
@@ -2126,9 +2258,20 @@ module.exports = {
         const { symbol, tf, latestOpen, processedStateKey } = candidate;
 
         try {
+          const flipKey = `${symbol}|${tf}|${latestOpen}`;
+          if (macdFlipTracker.has(flipKey)) {
+            logger.debug(
+              { symbol, tf, latestOpen, flipKey },
+              'poller: skipping already-processed MACD flip'
+            );
+            return null;
+          }
+
           const flip = await macdUtil.isMacdFlip(symbol, tf);
 
           if (flip) {
+            macdFlipTracker.set(flipKey, { firedAt: Date.now() });
+
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
             const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
 
@@ -2365,6 +2508,49 @@ module.exports = {
 
   getLoop2ProcessedCandleKey(symbol, tf) {
     return `poller.loop2.processedCandle.${symbol}.${tf}`;
+  },
+
+  startCacheCleanupLoop() {
+    setImmediate(() => {
+      this.runCacheCleanupLoop()
+        .catch((err) => {
+          logger.error(
+            { err },
+            'poller: cache cleanup loop crashed'
+          );
+        });
+    });
+  },
+
+  async runCacheCleanupLoop() {
+    const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+
+    while (isRunning) {
+      await sleep(CLEANUP_INTERVAL_MS);
+
+      if (!isRunning) {
+        break;
+      }
+
+      try {
+        clearExpiredProcessedSignalKeys(60 * 60 * 1000);
+
+        logger.debug(
+          {
+            processedEventKeysSize: processedEventKeys.size,
+            mtfAlignmentStatesSize: mtfAlignmentStates.size,
+            rootTfBoundaryStatesSize: rootTfBoundaryStates.size,
+            startupBatchSignalKeysSize: startupBatchSignalKeys.size,
+            restFallbackCooldownsSize: restFallbackCooldowns.size,
+            inMemoryStateCacheSize: inMemoryStateCache.size,
+            macdFlipTrackerSize: macdFlipTracker.size
+          },
+          'poller: cache cleanup cycle completed'
+        );
+      } catch (err) {
+        logger.error({ err }, 'poller: cache cleanup failed');
+      }
+    }
   },
 
   stop() {
