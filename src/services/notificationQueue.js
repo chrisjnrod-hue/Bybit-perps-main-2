@@ -1,4 +1,4 @@
-// notificationQueue.js
+// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION)
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -458,7 +458,8 @@ class NotificationQueue {
     ) {
       logger.info(
         {
-          tf
+          tf,
+          inputCount: signals.length
         },
         'NotificationQueue: root candle summary already in progress, skipping duplicate root-open batch'
       );
@@ -528,11 +529,12 @@ class NotificationQueue {
     if (
       uniqueSignals.length === 0
     ) {
-      logger.info(
+      logger.warn(
         {
-          tf
+          tf,
+          inputCount: signals.length
         },
-        'NotificationQueue: root TF candle-open batch contained no new signals'
+        'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch contained NO NEW SIGNALS (all were duplicates or invalid)'
       );
       return false;
     }
@@ -560,7 +562,7 @@ class NotificationQueue {
         unique: uniqueSignals.length,
         queueLength: this.queue.length
       },
-      'NotificationQueue: root TF candle-open batch enqueued'
+      'NotificationQueue: root TF candle-open batch enqueued successfully'
     );
 
     this.startProcessing();
@@ -886,7 +888,7 @@ class NotificationQueue {
           tf,
           count: signals.length
         },
-        'NotificationQueue: missing telegram.sendRootCandleOpenSummary; aborting root TF candle-open dispatch'
+        'NotificationQueue: ⚠️  CRITICAL - missing telegram.sendRootCandleOpenSummary; aborting root TF candle-open dispatch'
       );
 
       throw new Error(
@@ -906,7 +908,7 @@ class NotificationQueue {
           tf,
           count: signals.length
         },
-        'NotificationQueue: root TF candle-open batch flow failed'
+        'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch flow failed'
       );
       throw err;
     }
@@ -916,7 +918,7 @@ class NotificationQueue {
         tf,
         count: signals.length
       },
-      'NotificationQueue: root TF candle-open batch flow completed'
+      'NotificationQueue: root TF candle-open batch flow completed successfully'
     );
   }
 
