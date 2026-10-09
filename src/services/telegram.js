@@ -1,4 +1,4 @@
-// telegram.js (FULLY UPDATED WITH SIGNAL VALIDATION)
+// telegram.js
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config');
 const logger = require('pino')();
@@ -350,25 +350,13 @@ module.exports = {
     return lines.join('\n');
   },
 
-  /**
-   * ENHANCED: Validate signal structure before building message
-   */
   buildSignalMessage(signal) {
-    // CRITICAL FIX: Validate signal shape
-    if (!signal || !signal.symbol || !signal.root_tf) {
-      logger.error(
-        { signal },
-        'Telegram: ⚠️  CRITICAL - signal missing required fields (symbol, root_tf); cannot build message'
-      );
-      throw new Error('Incomplete signal object: missing symbol or root_tf');
-    }
-
     const {
       symbol,
       root_tf,
       detected_at,
       meta = {}
-    } = signal;
+    } = signal || {};
 
     const timeStr =
       detected_at
@@ -499,8 +487,600 @@ module.exports = {
       );
     }
 
-    // ENHANCED: Validate before sending
-    if (!normalizedSignal.symbol || !normalizedSignal.root_tf) {
+    const message =
+      this.buildSignalMessage(
+        normalizedSignal
+      );
+
+    await this._sendMessage(
+      message,
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        notificationType:
+          normalizedSignal.notificationType ||
+          null,
+        eventId:
+          normalizedSignal.eventId ||
+          null
+      }
+    );
+
+    logger.debug(
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        eventId:
+          normalizedSignal.eventId ||
+          null,
+        notificationType:
+          normalizedSignal.notificationType ||
+          null
+      },
+      'Telegram: signal detail block sent'
+    );
+
+    return true;
+  },
+
+  async sendMidCandleUpdateBlock(signal) {
+    if (!signal) {
+      throw new Error(
+        'Telegram: cannot send an empty mid-candle signal'
+      );
+    }
+
+    const normalizedSignal = {
+      ...signal,
+      notificationType:
+        'midcandle_update',
+      signalType:
+        signal.signalType ||
+        'midcandle_update'
+    };
+
+    const message =
+      this.buildSignalMessage(
+        normalizedSignal
+      );
+
+    await this._sendMessage(
+      message,
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        notificationType:
+          'midcandle_update',
+        eventId:
+          normalizedSignal.eventId ||
+          null
+      }
+    );
+
+    logger.info(
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        eventId:
+          normalizedSignal.eventId ||
+          null
+      },
+      'Telegram: mid-candle update sent'
+    );
+
+    return true;
+  },
+
+  async sendMtfAlignmentAlert(signal) {
+    if (!signal) {
+      throw new Error(
+        'Telegram: cannot send an empty MTF alignment alert'
+      );
+    }
+
+    this.ensureInitialized();
+
+    const normalizedSignal = {
+      ...signal,
+      notificationType:
+        'mtf_alignment',
+      signalType:
+        signal.signalType ||
+        'mtf_alignment'
+    };
+
+    const message =
+      this.buildSignalMessage(
+        normalizedSignal
+      );
+
+    await this._sendMessage(
+      message,
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        notificationType:
+          'mtf_alignment',
+        eventId:
+          normalizedSignal.eventId ||
+          null
+      }
+    );
+
+    logger.info(
+      {
+        symbol:
+          normalizedSignal.symbol,
+        root_tf:
+          normalizedSignal.root_tf,
+        eventId:
+          normalizedSignal.eventId ||
+          null
+      },
+      'Telegram: MTF alignment alert sent'
+    );
+
+    return true;
+  },
+
+  async sendSummaryBlock({
+    snapshot = [],
+    title = '📊 Startup Summary',
+    signalType = null,
+    timeframeFilter = null
+  } = {}) {
+    this.ensureInitialized();
+
+    try {
+      let signals =
+        Array.isArray(snapshot)
+          ? snapshot
+          : [];
+
+      if (timeframeFilter) {
+        const targetTf =
+          String(timeframeFilter);
+
+        signals =
+          signals.filter((signal) => {
+            return String(
+              signal.root_tf || ''
+            ) === targetTf;
+          });
+      }
+
+      if (signals.length === 0) {
+        logger.warn(
+          {
+            title,
+            timeframeFilter
+          },
+          'Telegram: no signals provided to summary block'
+        );
+        return false;
+      }
+
+      const delayMs = Math.max(
+        500,
+        Number(
+          config.TELEGRAM_SEND_DELAY_MS
+        ) || 1000
+      );
+
+      const tfCounts = {};
+      const symbolSet = new Set();
+
+      for (const signal of signals) {
+        const tf =
+          String(
+            signal.root_tf || 'unknown'
+          );
+
+        tfCounts[tf] =
+          (tfCounts[tf] || 0) + 1;
+
+        if (signal.symbol) {
+          symbolSet.add(
+            signal.symbol
+          );
+        }
+      }
+
+      const configuredRootTfs =
+        Array.isArray(config.ROOT_TFS) &&
+        config.ROOT_TFS.length > 0
+          ? config.ROOT_TFS.map(String)
+          : [];
+
+      let orderedRootTfs =
+        configuredRootTfs.length > 0
+          ? [...configuredRootTfs]
+          : Object.keys(tfCounts);
+
+      if (timeframeFilter) {
+        const targetTf =
+          String(timeframeFilter);
+
+        orderedRootTfs = [
+          targetTf
+        ];
+      } else {
+        for (
+          const tf of Object.keys(tfCounts)
+        ) {
+          if (
+            !orderedRootTfs.includes(tf)
+          ) {
+            orderedRootTfs.push(tf);
+          }
+        }
+      }
+
+      const summaryParts =
+        orderedRootTfs.map((tf) => {
+          return `${tf}: ${tfCounts[tf] || 0}`;
+        });
+
+      const allSymbols =
+        Array.from(symbolSet).sort(
+          (a, b) => {
+            return a.localeCompare(
+              b,
+              undefined,
+              {
+                sensitivity: 'base'
+              }
+            );
+          }
+        );
+
+      const symbolLines =
+        allSymbols.length > 0
+          ? allSymbols.join('\n')
+          : 'n/a';
+
+      const header =
+        `${title} (${signals.length} signals):\n` +
+        `${summaryParts.join(' • ')}\n\n` +
+        symbolLines;
+
+      await this._sendMessage(
+        header
+      );
+
+      logger.info(
+        {
+          title,
+          count: signals.length,
+          timeframeFilter
+        },
+        'Telegram: summary header sent'
+      );
+
+      await this._sleep(delayMs);
+
+      const sortedSignals =
+        [...signals].sort((a, b) => {
+          const symbolOrder =
+            String(a.symbol || '').localeCompare(
+              String(b.symbol || ''),
+              undefined,
+              {
+                sensitivity: 'base'
+              }
+            );
+
+          if (symbolOrder !== 0) {
+            return symbolOrder;
+          }
+
+          return String(
+            a.root_tf || ''
+          ).localeCompare(
+            String(b.root_tf || ''),
+            undefined,
+            {
+              numeric: true
+            }
+          );
+        });
+
+      for (
+        let i = 0;
+        i < sortedSignals.length;
+        i += 1
+      ) {
+        const signal =
+          sortedSignals[i];
+
+        await this.sendNewSignalSingleBlock(
+          signal,
+          signalType
+        );
+
+        logger.debug(
+          {
+            symbol: signal.symbol,
+            root_tf: signal.root_tf,
+            eventId: signal.eventId || null,
+            index: i + 1,
+            total: sortedSignals.length
+          },
+          'Telegram: summary signal block sent'
+        );
+
+        await this._sleep(delayMs);
+      }
+
+      let openCount = 0;
+
+      try {
+        const row =
+          dbModule
+            .get()
+            .prepare(
+              `
+                SELECT COUNT(*) AS cnt
+                FROM trades
+                WHERE status = 'open'
+              `
+            )
+            .get();
+
+        openCount =
+          row
+            ? Number(row.cnt || 0)
+            : 0;
+      } catch (err) {
+        logger.debug(
+          { err },
+          'Telegram: failed to read open trades count'
+        );
+
+        openCount = 0;
+      }
+
+      const maxOpenTrades =
+        Number(
+          config.MAX_OPEN_TRADES
+        ) || 0;
+
+      const maxSlots =
+        Math.max(
+          0,
+          maxOpenTrades - openCount
+        );
+
+      const recommendedHeader =
+        `📈 Recommended to Open (${maxSlots} slots available):`;
+
+      await this._sendMessage(
+        recommendedHeader
+      );
+
+      await this._sleep(delayMs);
+
+      const candidates =
+        signals
+          .map((signal) => {
+            return {
+              symbol:
+                signal.symbol,
+              root_tf:
+                signal.root_tf,
+              tvScore:
+                Number(
+                  signal.meta?.tvScore || 0
+                ),
+              mtfScore:
+                Number(
+                  signal.meta?.mtfScore || 0
+                ),
+              acceptDecision:
+                signal.meta?.decision ||
+                'monitor',
+              reason:
+                signal.meta?.acceptReason ||
+                'n/a'
+            };
+          })
+          .filter((candidate) => {
+            return (
+              candidate.acceptDecision ===
+              'accept'
+            );
+          })
+          .sort((a, b) => {
+            if (
+              b.tvScore !== a.tvScore
+            ) {
+              return b.tvScore - a.tvScore;
+            }
+
+            return b.mtfScore - a.mtfScore;
+          });
+
+      const recommended =
+        candidates.slice(
+          0,
+          Math.max(0, maxSlots)
+        );
+
+      if (recommended.length === 0) {
+        await this._sendMessage(
+          'No recommended signals (all rejections or filtered)'
+        );
+      } else {
+        for (
+          let i = 0;
+          i < recommended.length;
+          i += 1
+        ) {
+          const recommendation =
+            recommended[i];
+
+          const label =
+            this.getLabel(i, {
+              lowercase: true
+            });
+
+          const tvPercent =
+            Math.round(
+              (recommendation.tvScore || 0) *
+              100
+            );
+
+          const mtfPercent =
+            Math.round(
+              (recommendation.mtfScore || 0) *
+              100
+            );
+
+          const simulatedNote =
+            config.OPENTRADE
+              ? ''
+              : ' [SIMULATED]';
+
+          const line =
+            `${label}) ` +
+            `${recommendation.symbol} ` +
+            `${recommendation.root_tf} - ` +
+            `TV:${tvPercent}% ` +
+            `MTF:${mtfPercent}% - ` +
+            `${recommendation.reason}` +
+            simulatedNote;
+
+          await this._sendMessage(
+            line
+          );
+
+          logger.debug(
+            {
+              symbol:
+                recommendation.symbol,
+              root_tf:
+                recommendation.root_tf,
+              index: i + 1,
+              total: recommended.length
+            },
+            'Telegram: recommended block sent'
+          );
+
+          await this._sleep(delayMs);
+        }
+      }
+
+      logger.info(
+        {
+          title,
+          count: signals.length,
+          timeframeFilter
+        },
+        'Telegram: summary flow completed'
+      );
+
+      return true;
+    } catch (err) {
       logger.error(
-        { normalizedSignal },
-        'Telegram
+        {
+          err,
+          title,
+          timeframeFilter
+        },
+        'Telegram: summary flow failed'
+      );
+      throw err;
+    }
+  },
+
+  async sendStartupSummary({
+    snapshot = []
+  } = {}) {
+    await this.sendSummaryBlock({
+      snapshot,
+      title:
+        SUMMARY_TITLE_MAP.startup,
+      signalType: null
+    });
+
+    return true;
+  },
+
+  async sendRootCandleSummary({
+    snapshot = [],
+    tf = null
+  } = {}) {
+    const filtered =
+      Array.isArray(snapshot)
+        ? (
+            tf
+              ? snapshot.filter((signal) => {
+                  return String(
+                    signal.root_tf || ''
+                  ) === String(tf);
+                })
+              : snapshot
+          )
+        : [];
+
+    const title =
+      tf
+        ? `🕔 New Root Candle Open (${tf})`
+        : SUMMARY_TITLE_MAP.new_root_candle;
+
+    await this.sendSummaryBlock({
+      snapshot: filtered,
+      title,
+      signalType:
+        'new_root_candle',
+      timeframeFilter:
+        tf || null
+    });
+
+    return true;
+  },
+
+  async sendRootCandleOpenSummary({
+    snapshot = [],
+    tf = null
+  } = {}) {
+    if (!Array.isArray(snapshot)) {
+      logger.warn(
+        { tf },
+        'Telegram: sendRootCandleOpenSummary received invalid snapshot'
+      );
+      return false;
+    }
+
+    const filtered =
+      tf
+        ? snapshot.filter((signal) => {
+            return String(signal.root_tf || '') === String(tf);
+          })
+        : snapshot;
+
+    const title =
+      tf
+        ? `🕔 New Root Candle Open (${tf})`
+        : SUMMARY_TITLE_MAP.new_root_candle;
+
+    await this.sendSummaryBlock({
+      snapshot: filtered,
+      title,
+      signalType: 'new_root_candle',
+      timeframeFilter: tf || null
+    });
+
+    return true;
+  }
+};
