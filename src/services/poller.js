@@ -1,4 +1,4 @@
-// poller.js (FULL UPDATED VERSION)
+// poller.js (FULLY UPDATED WITH DB RESILIENCE FIXES)
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -52,8 +52,12 @@ const inMemoryStateCache = new Map();
 // Key: ${symbol}|${tf}|${candleOpenTime}
 const macdFlipTracker = new Map();
 
+// DB connectivity tracker for health monitoring
+let lastDbConnectivityCheck = Date.now();
+let dbIsHealthy = true;
+
 // ============================================================================
-// DATABASE SAFETY GUARDS
+// DATABASE SAFETY GUARDS & RECOVERY
 // ============================================================================
 
 function isDbReady() {
@@ -93,9 +97,63 @@ function safeGetDb() {
 }
 
 /**
- * CRITICAL FIX: Enhanced state getter with in-memory fallback and retry logic
+ * ENHANCED: Attempt to reconnect to DB with exponential backoff
+ * Waits for DB to become available before proceeding
  */
-function safeGetState(key) {
+async function ensureDbReady(maxRetries = 3, backoffMs = 500) {
+  let db = safeGetDb();
+
+  if (db) {
+    dbIsHealthy = true;
+    return db;
+  }
+
+  logger.info(
+    { maxRetries, initialBackoffMs: backoffMs },
+    'poller: database not ready; initiating reconnection sequence'
+  );
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const waitMs = backoffMs * attempt;
+
+    logger.warn(
+      { attempt, maxRetries, waitMs },
+      'poller: waiting before DB reconnection attempt'
+    );
+
+    await sleep(waitMs);
+
+    db = safeGetDb();
+
+    if (db) {
+      logger.info(
+        { attempt },
+        'poller: database reconnected successfully'
+      );
+      dbIsHealthy = true;
+      return db;
+    }
+
+    if (attempt < maxRetries) {
+      logger.warn(
+        { attempt, nextAttempt: attempt + 1 },
+        'poller: DB reconnection attempt failed; will retry'
+      );
+    }
+  }
+
+  logger.error(
+    { maxRetries },
+    'poller: database connection failed after all reconnection attempts'
+  );
+  dbIsHealthy = false;
+  return null;
+}
+
+/**
+ * CRITICAL FIX: Enhanced state getter with in-memory fallback, age validation, and retry logic
+ */
+function safeGetState(key, maxAgeMs = 5 * 60 * 1000) {
   if (!key) {
     logger.debug('poller: getState called with empty key');
     return null;
@@ -118,10 +176,21 @@ function safeGetState(key) {
     }
   }
 
-  // Fall back to in-memory cache
+  // Fall back to in-memory cache with age validation
   const cached = inMemoryStateCache.get(key);
   if (cached && cached.value !== undefined && cached.value !== null) {
-    logger.debug({ key, source: 'memory_cache' }, 'poller: retrieved state from in-memory cache');
+    const age = Date.now() - cached.cachedAt;
+
+    if (age > maxAgeMs) {
+      logger.warn(
+        { key, ageMs: age, maxAgeMs },
+        'poller: in-memory cache entry too stale; discarding and returning null'
+      );
+      inMemoryStateCache.delete(key);
+      return null;
+    }
+
+    logger.debug({ key, ageMs: age }, 'poller: retrieved state from in-memory cache');
     return cached.value;
   }
 
@@ -129,7 +198,7 @@ function safeGetState(key) {
 }
 
 /**
- * CRITICAL FIX: Enhanced state setter with in-memory cache + retry logic
+ * CRITICAL FIX: Enhanced state setter with in-memory cache + improved retry logic
  */
 function safeSetState(key, value) {
   if (!key || value === undefined) {
@@ -139,9 +208,11 @@ function safeSetState(key, value) {
 
   let dbSuccess = false;
 
-  // Attempt DB write with retry
+  // Attempt DB write with improved retry logic
   if (dbModule && typeof dbModule.setState === 'function') {
-    let retries = 2;
+    let retries = 3;
+    let retryDelayMs = 50;
+
     while (retries > 0) {
       try {
         dbModule.setState(key, value);
@@ -151,12 +222,19 @@ function safeSetState(key, value) {
       } catch (err) {
         retries--;
         if (retries > 0) {
-          logger.debug({ err, key, retryCount: 2 - retries }, 'poller: setState DB attempt failed; retrying');
-          // Brief pause before retry
+          logger.debug(
+            { err, key, retryCount: 3 - retries, nextDelayMs: retryDelayMs * 2 },
+            'poller: setState DB attempt failed; retrying with backoff'
+          );
+          // Brief pause before retry (increase delay each time)
           const start = Date.now();
-          while (Date.now() - start < 10) {} // Busy-wait ~10ms
+          while (Date.now() - start < retryDelayMs) {}
+          retryDelayMs *= 2;
         } else {
-          logger.warn({ err, key, value }, 'poller: setState DB failed after retries; relying on in-memory cache');
+          logger.warn(
+            { err, key, value },
+            'poller: setState DB failed after retries; relying on in-memory cache only'
+          );
         }
       }
     }
@@ -517,6 +595,23 @@ function cleanupInMemoryStateCache(ttlMs = 2 * 60 * 60 * 1000) {
   return keysToDelete.length;
 }
 
+function cleanupMacdFlipTracker(ttlMs = 60 * 60 * 1000) {
+  const now = Date.now();
+  const keysToDelete = [];
+
+  for (const [key, value] of macdFlipTracker.entries()) {
+    if (value && value.firedAt && now - value.firedAt > ttlMs) {
+      keysToDelete.push(key);
+    }
+  }
+
+  for (const key of keysToDelete) {
+    macdFlipTracker.delete(key);
+  }
+
+  return keysToDelete.length;
+}
+
 function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   const now = Date.now();
 
@@ -531,13 +626,15 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   const startupPurged = cleanupExpiredStartupBatchSignals(5 * 60 * 1000);
   const cooldownPurged = cleanupRestFallbackCooldowns(10 * 60 * 1000);
   const stateCachePurged = cleanupInMemoryStateCache(2 * 60 * 60 * 1000);
+  const macdPurged = cleanupMacdFlipTracker(60 * 60 * 1000);
 
   if (
     mtfPurged > 0 ||
     rootTfPurged > 0 ||
     startupPurged > 0 ||
     cooldownPurged > 0 ||
-    stateCachePurged > 0
+    stateCachePurged > 0 ||
+    macdPurged > 0
   ) {
     logger.debug(
       {
@@ -547,11 +644,13 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
         startupBatchSignalKeysSize: startupBatchSignalKeys.size,
         restFallbackCooldownsSize: restFallbackCooldowns.size,
         inMemoryStateCacheSize: inMemoryStateCache.size,
+        macdFlipTrackerSize: macdFlipTracker.size,
         mtfPurged,
         rootTfPurged,
         startupPurged,
         cooldownPurged,
-        stateCachePurged
+        stateCachePurged,
+        macdPurged
       },
       'poller: cache cleanup cycle completed'
     );
@@ -791,6 +890,51 @@ function registerBybitWsListeners() {
 }
 
 // ============================================================================
+// DB HEALTH CHECK LOOP (NEW)
+// ============================================================================
+
+function startDbHealthCheckLoop() {
+  setImmediate(() => {
+    this.runDbHealthCheckLoop()
+      .catch((err) => {
+        logger.error(
+          { err },
+          'poller: DB health check loop crashed'
+        );
+      });
+  });
+}
+
+async function runDbHealthCheckLoop() {
+  const HEALTH_CHECK_INTERVAL_MS = 10 * 1000; // 10 seconds
+
+  while (isRunning) {
+    await sleep(HEALTH_CHECK_INTERVAL_MS);
+
+    if (!isRunning) {
+      break;
+    }
+
+    const wasHealthy = dbIsHealthy;
+    const isCurrentlyHealthy = isDbReady();
+
+    if (!isCurrentlyHealthy && wasHealthy) {
+      logger.error(
+        'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
+      );
+      dbIsHealthy = false;
+    } else if (isCurrentlyHealthy && !wasHealthy) {
+      logger.info(
+        'poller: ✅ DATABASE CONNECTION RESTORED'
+      );
+      dbIsHealthy = true;
+    }
+
+    lastDbConnectivityCheck = Date.now();
+  }
+}
+
+// ============================================================================
 // MODULE EXPORTS
 // ============================================================================
 
@@ -842,6 +986,11 @@ module.exports = {
     }
 
     this.startCacheCleanupLoop();
+
+    this.startDbHealthCheckLoop();
+    logger.info(
+      'poller.start: database health check loop started'
+    );
 
     this.startBoundaryScanLoop();
     logger.info(
@@ -927,9 +1076,9 @@ module.exports = {
       return [];
     }
 
-    const db = safeGetDb();
+    const db = await ensureDbReady(3, 500);
     if (!db) {
-      logger.error('poller.initialScan: database not available');
+      logger.error('poller.initialScan: database not available after reconnection attempts');
       return [];
     }
 
@@ -1450,9 +1599,9 @@ module.exports = {
     );
 
     try {
-      const db = safeGetDb();
+      const db = await ensureDbReady(3, 500);
       if (!db) {
-        logger.error('scanAllForStartup: database not available');
+        logger.error('scanAllForStartup: database not available after reconnection attempts');
         return [];
       }
 
@@ -2094,9 +2243,12 @@ module.exports = {
       'poller: root TF candle open boundary scan started'
     );
 
-    const db = safeGetDb();
+    // CRITICAL FIX: Ensure DB is ready before proceeding
+    const db = await ensureDbReady(3, 500);
     if (!db) {
-      logger.warn('poller: database not available; skipping root TF candle open scan');
+      logger.error(
+        'poller: ⚠️  DATABASE CONNECTION UNAVAILABLE - aborting candle open scan to prevent signal loss'
+      );
       return false;
     }
 
@@ -2406,7 +2558,7 @@ module.exports = {
                   tf,
                   signalCount: tfSignals.length
                 },
-                'poller: FAILED to enqueue root TF candle-open batch for timeframe'
+                'poller: ⚠️  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
               );
             }
           }
@@ -2558,7 +2710,8 @@ module.exports = {
             startupBatchSignalKeysSize: startupBatchSignalKeys.size,
             restFallbackCooldownsSize: restFallbackCooldowns.size,
             inMemoryStateCacheSize: inMemoryStateCache.size,
-            macdFlipTrackerSize: macdFlipTracker.size
+            macdFlipTrackerSize: macdFlipTracker.size,
+            dbIsHealthy
           },
           'poller: cache cleanup cycle completed'
         );
@@ -2567,6 +2720,9 @@ module.exports = {
       }
     }
   },
+
+  startDbHealthCheckLoop,
+  runDbHealthCheckLoop,
 
   stop() {
     isRunning = false;
