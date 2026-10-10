@@ -9,8 +9,8 @@ const QUEUE_STATE = {
 };
 
 const SIGNAL_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const ITEM_TIMEOUT_MS = 45 * 1000;
-const PROCESSOR_WATCHDOG_MS = 60 * 1000;
+const ITEM_TIMEOUT_MS = 120 * 1000;
+const PROCESSOR_WATCHDOG_MS = 180 * 1000;
 
 function getNotificationType(signal) {
   if (!signal) {
