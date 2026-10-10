@@ -1,4 +1,4 @@
-// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION + PROCESSOR WATCHDOG + ITEM TIMEOUTS)
+// notificationQueue.js
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -147,7 +147,6 @@ class NotificationQueue {
     this.startupSummaryInProgress = false;
     this.rootCandleSummaryInProgress = false;
 
-    // Deferred root-candle-open batches
     this.pendingRootCandleOpenBatches = [];
 
     this.sentSignalIds = new Set();
@@ -407,6 +406,7 @@ class NotificationQueue {
 
       const signalId = getSignalId(signalWithType);
 
+      // FIX: Only dedupe within this batch, not globally across batches
       if (!signalId || reservedIds.has(signalId)) {
         logger.debug({
           signalId,
@@ -644,7 +644,6 @@ class NotificationQueue {
       this.rootCandleSummaryInProgress = false;
       this.state = QUEUE_STATE.IDLE;
 
-      // Retry deferred root-candle-open batches after a current batch ends
       if (Array.isArray(this.pendingRootCandleOpenBatches) && this.pendingRootCandleOpenBatches.length > 0) {
         const pending = [...this.pendingRootCandleOpenBatches];
         this.pendingRootCandleOpenBatches = [];
@@ -658,10 +657,7 @@ class NotificationQueue {
           try {
             this.enqueueRootCandleOpenBatch(batch.signals, batch.tf, batch.isStartupPhase);
           } catch (err) {
-            logger.error(
-              { err, batch },
-              'NotificationQueue: failed to flush deferred root candle open batch'
-            );
+            logger.error({ err, batch }, 'NotificationQueue: failed to flush deferred root candle open batch');
           }
         }
       }
