@@ -1,4 +1,4 @@
-// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION)
+// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION + FIX #1: PENDING ROOT CANDLE BATCH RETRY)
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -156,6 +156,9 @@ class NotificationQueue {
 
     this.startupSummaryInProgress = false;
     this.rootCandleSummaryInProgress = false;
+
+    // FIX #1: queue root-candle-open batches that arrive while a summary is already processing
+    this.pendingRootCandleOpenBatches = [];
 
     this.sentSignalIds = new Set();
     this.pendingSignalIds = new Set();
@@ -453,6 +456,7 @@ class NotificationQueue {
       return false;
     }
 
+    // FIX #1: do not silently drop signals when a batch is already being processed
     if (
       this.rootCandleSummaryInProgress
     ) {
@@ -461,9 +465,17 @@ class NotificationQueue {
           tf,
           inputCount: signals.length
         },
-        'NotificationQueue: root candle summary already in progress, skipping duplicate root-open batch'
+        'NotificationQueue: root candle summary already in progress; queueing batch for retry'
       );
-      return false;
+
+      this.pendingRootCandleOpenBatches.push({
+        signals: [...signals],
+        tf,
+        isStartupPhase,
+        timestamp: Date.now()
+      });
+
+      return true;
     }
 
     const uniqueSignals = [];
@@ -796,6 +808,40 @@ class NotificationQueue {
       this.rootCandleSummaryInProgress = false;
       this.state = QUEUE_STATE.IDLE;
 
+      // FIX #1: flush pending root candle batches after current batch clears
+      if (
+        Array.isArray(this.pendingRootCandleOpenBatches) &&
+        this.pendingRootCandleOpenBatches.length > 0
+      ) {
+        const pending = [...this.pendingRootCandleOpenBatches];
+        this.pendingRootCandleOpenBatches = [];
+
+        logger.info(
+          {
+            count: pending.length
+          },
+          'NotificationQueue: flushing deferred root candle open batches'
+        );
+
+        for (const batch of pending) {
+          try {
+            this.enqueueRootCandleOpenBatch(
+              batch.signals,
+              batch.tf,
+              batch.isStartupPhase
+            );
+          } catch (err) {
+            logger.error(
+              {
+                err,
+                batch
+              },
+              'NotificationQueue: failed to flush deferred root candle open batch'
+            );
+          }
+        }
+      }
+
       if (this.queue.length > 0) {
         this.startProcessing();
       }
@@ -1033,6 +1079,8 @@ class NotificationQueue {
         this.startupSummaryInProgress,
       rootCandleInProgress:
         this.rootCandleSummaryInProgress,
+      pendingRootCandleOpenBatches:
+        this.pendingRootCandleOpenBatches.length,
       sentSignalCount:
         this.sentSignalIds.size,
       pendingSignalCount:
