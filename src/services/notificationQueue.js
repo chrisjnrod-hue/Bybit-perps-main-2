@@ -1,4 +1,4 @@
-// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION + FIX #1: PENDING ROOT CANDLE BATCH RETRY)
+// notificationQueue.js (FULLY UPDATED WITH SIGNAL LOSS DETECTION + FIX #1 + FIX #2)
 const logger = require('pino')();
 
 const QUEUE_STATE = {
@@ -157,7 +157,7 @@ class NotificationQueue {
     this.startupSummaryInProgress = false;
     this.rootCandleSummaryInProgress = false;
 
-    // FIX #1: queue root-candle-open batches that arrive while a summary is already processing
+    // FIX #1: retry-deferred root candle open batches
     this.pendingRootCandleOpenBatches = [];
 
     this.sentSignalIds = new Set();
@@ -165,20 +165,11 @@ class NotificationQueue {
     this.sentSignalTimestamps = new Map();
   }
 
-  clearExpiredSignalCache(
-    ttlMs = SIGNAL_CACHE_TTL_MS
-  ) {
+  clearExpiredSignalCache(ttlMs = SIGNAL_CACHE_TTL_MS) {
     const now = Date.now();
 
-    for (
-      const [
-        signalId,
-        sentAt
-      ] of this.sentSignalTimestamps.entries()
-    ) {
-      if (
-        now - sentAt > ttlMs
-      ) {
+    for (const [signalId, sentAt] of this.sentSignalTimestamps.entries()) {
+      if (now - sentAt > ttlMs) {
         this.sentSignalIds.delete(signalId);
         this.sentSignalTimestamps.delete(signalId);
       }
@@ -188,8 +179,7 @@ class NotificationQueue {
   isKnownSignal(signal) {
     this.clearExpiredSignalCache();
 
-    const signalId =
-      getSignalId(signal);
+    const signalId = getSignalId(signal);
 
     if (!signalId) {
       return true;
@@ -202,8 +192,7 @@ class NotificationQueue {
   }
 
   reserveSignal(signal) {
-    const signalId =
-      getSignalId(signal);
+    const signalId = getSignalId(signal);
 
     if (signalId) {
       this.pendingSignalIds.add(signalId);
@@ -219,10 +208,7 @@ class NotificationQueue {
 
     this.pendingSignalIds.delete(signalId);
     this.sentSignalIds.add(signalId);
-    this.sentSignalTimestamps.set(
-      signalId,
-      Date.now()
-    );
+    this.sentSignalTimestamps.set(signalId, Date.now());
   }
 
   releaseSignal(signalId) {
@@ -233,21 +219,12 @@ class NotificationQueue {
     this.pendingSignalIds.delete(signalId);
   }
 
-  normalizeSignal(
-    signal,
-    fallbackType = null
-  ) {
-    if (
-      !signal ||
-      !signal.symbol ||
-      !signal.root_tf
-    ) {
+  normalizeSignal(signal, fallbackType = null) {
+    if (!signal || !signal.symbol || !signal.root_tf) {
       return null;
     }
 
-    const nextSignal = {
-      ...signal
-    };
+    const nextSignal = { ...signal };
 
     const resolvedType =
       signal.notificationType ||
@@ -255,75 +232,44 @@ class NotificationQueue {
       fallbackType ||
       getNotificationType(signal);
 
-    nextSignal.notificationType =
-      resolvedType;
+    nextSignal.notificationType = resolvedType;
 
-    if (
-      signal.signalType === undefined &&
-      resolvedType
-    ) {
-      nextSignal.signalType =
-        resolvedType;
+    if (signal.signalType === undefined && resolvedType) {
+      nextSignal.signalType = resolvedType;
     }
 
-    if (
-      signal.eventId !== undefined &&
-      signal.eventId !== null
-    ) {
-      nextSignal.eventId =
-        String(signal.eventId);
+    if (signal.eventId !== undefined && signal.eventId !== null) {
+      nextSignal.eventId = String(signal.eventId);
     }
 
-    if (
-      signal.candle_open_time !== undefined &&
-      signal.candle_open_time !== null
-    ) {
-      const candleOpenTime =
-        Number(signal.candle_open_time);
+    if (signal.candle_open_time !== undefined && signal.candle_open_time !== null) {
+      const candleOpenTime = Number(signal.candle_open_time);
 
       if (Number.isFinite(candleOpenTime)) {
-        nextSignal.candle_open_time =
-          candleOpenTime;
+        nextSignal.candle_open_time = candleOpenTime;
       }
     }
 
     return nextSignal;
   }
 
-  enqueueSignal(
-    signal,
-    type = 'realtime'
-  ) {
-    if (
-      !signal ||
-      !signal.symbol ||
-      !signal.root_tf
-    ) {
-      logger.warn(
-        { signal },
-        'NotificationQueue: invalid signal, skipping'
-      );
+  enqueueSignal(signal, type = 'realtime') {
+    if (!signal || !signal.symbol || !signal.root_tf) {
+      logger.warn({ signal }, 'NotificationQueue: invalid signal, skipping');
       return false;
     }
 
-    const normalized =
-      this.normalizeSignal(
-        signal,
-        type === 'realtime'
-          ? null
-          : type
-      );
+    const normalized = this.normalizeSignal(
+      signal,
+      type === 'realtime' ? null : type
+    );
 
     if (!normalized) {
-      logger.warn(
-        { signal, type },
-        'NotificationQueue: signal normalization failed'
-      );
+      logger.warn({ signal, type }, 'NotificationQueue: signal normalization failed');
       return false;
     }
 
-    const signalId =
-      getSignalId(normalized);
+    const signalId = getSignalId(normalized);
 
     if (!signalId) {
       logger.warn(
@@ -337,17 +283,14 @@ class NotificationQueue {
       return false;
     }
 
-    if (
-      this.isKnownSignal(normalized)
-    ) {
+    if (this.isKnownSignal(normalized)) {
       logger.debug(
         {
           signalId,
           symbol: normalized.symbol,
           root_tf: normalized.root_tf,
           type,
-          notificationType:
-            normalized.notificationType
+          notificationType: normalized.notificationType
         },
         'NotificationQueue: duplicate signal, skipping'
       );
@@ -356,11 +299,7 @@ class NotificationQueue {
 
     this.reserveSignal(normalized);
 
-    const queueType =
-      resolveQueueItemType(
-        type,
-        normalized
-      );
+    const queueType = resolveQueueItemType(type, normalized);
 
     this.queue.push({
       type: queueType,
@@ -374,32 +313,24 @@ class NotificationQueue {
         signalId,
         type,
         queueType,
-        notificationType:
-          normalized.notificationType,
+        notificationType: normalized.notificationType,
         queueLength: this.queue.length
       },
       'NotificationQueue: signal enqueued'
     );
 
     this.startProcessing();
-
     return true;
   }
 
   enqueueStartupBatch(signals) {
     if (!Array.isArray(signals)) {
-      logger.warn(
-        'NotificationQueue: invalid startup batch'
-      );
+      logger.warn('NotificationQueue: invalid startup batch');
       return false;
     }
 
-    if (
-      this.startupSummaryInProgress
-    ) {
-      logger.info(
-        'NotificationQueue: startup summary already in progress, skipping duplicate batch'
-      );
+    if (this.startupSummaryInProgress) {
+      logger.info('NotificationQueue: startup summary already in progress, skipping duplicate batch');
       return false;
     }
 
@@ -407,28 +338,20 @@ class NotificationQueue {
       signals,
       batchType: 'startup_batch',
       fallbackType: 'startup',
-      summaryState:
-        QUEUE_STATE.STARTUP_SUMMARY,
-      summaryFlag:
-        'startupSummaryInProgress',
+      summaryState: QUEUE_STATE.STARTUP_SUMMARY,
+      summaryFlag: 'startupSummaryInProgress',
       logLabel: 'startup'
     });
   }
 
   enqueueRootCandleBatch(signals) {
     if (!Array.isArray(signals)) {
-      logger.warn(
-        'NotificationQueue: invalid root candle batch'
-      );
+      logger.warn('NotificationQueue: invalid root candle batch');
       return false;
     }
 
-    if (
-      this.rootCandleSummaryInProgress
-    ) {
-      logger.info(
-        'NotificationQueue: root candle summary already in progress, skipping duplicate batch'
-      );
+    if (this.rootCandleSummaryInProgress) {
+      logger.info('NotificationQueue: root candle summary already in progress, skipping duplicate batch');
       return false;
     }
 
@@ -436,35 +359,22 @@ class NotificationQueue {
       signals,
       batchType: 'root_candle_batch',
       fallbackType: 'new_root_candle',
-      summaryState:
-        QUEUE_STATE.ROOT_CANDLE_SUMMARY,
-      summaryFlag:
-        'rootCandleSummaryInProgress',
+      summaryState: QUEUE_STATE.ROOT_CANDLE_SUMMARY,
+      summaryFlag: 'rootCandleSummaryInProgress',
       logLabel: 'root_candle'
     });
   }
 
-  enqueueRootCandleOpenBatch(
-    signals,
-    tf = null,
-    isStartupPhase = false
-  ) {
+  enqueueRootCandleOpenBatch(signals, tf = null, isStartupPhase = false) {
     if (!Array.isArray(signals)) {
-      logger.warn(
-        'NotificationQueue: invalid root candle open batch'
-      );
+      logger.warn('NotificationQueue: invalid root candle open batch');
       return false;
     }
 
-    // FIX #1: do not silently drop signals when a batch is already being processed
-    if (
-      this.rootCandleSummaryInProgress
-    ) {
+    // FIX #1: do not drop root-candle-open batches when one is already processing
+    if (this.rootCandleSummaryInProgress) {
       logger.info(
-        {
-          tf,
-          inputCount: signals.length
-        },
+        { tf, inputCount: signals.length },
         'NotificationQueue: root candle summary already in progress; queueing batch for retry'
       );
 
@@ -482,11 +392,7 @@ class NotificationQueue {
     const reservedIds = new Set();
 
     for (const signal of signals) {
-      const normalized =
-        this.normalizeSignal(
-          signal,
-          'new_root_candle'
-        );
+      const normalized = this.normalizeSignal(signal, 'new_root_candle');
 
       if (!normalized) {
         continue;
@@ -494,75 +400,50 @@ class NotificationQueue {
 
       const signalWithType = {
         ...normalized,
-        notificationType:
-          'new_root_candle',
-        signalType:
-          normalized.signalType ||
-          'new_root_candle'
+        notificationType: 'new_root_candle',
+        signalType: normalized.signalType || 'new_root_candle'
       };
 
-      const signalId =
-        getSignalId(signalWithType);
+      const signalId = getSignalId(signalWithType);
 
-      if (
-        !signalId ||
-        reservedIds.has(signalId)
-      ) {
+      if (!signalId || reservedIds.has(signalId)) {
         logger.debug(
           {
             signalId,
             tf,
-            notificationType:
-              signalWithType.notificationType
+            notificationType: signalWithType.notificationType
           },
-          'NotificationQueue: filtering duplicate within batch'
+          'NotificationQueue: filtering duplicate within root-candle batch'
         );
         continue;
       }
 
-      if (isStartupPhase && this.isKnownSignal(signalWithType)) {
-        logger.debug(
-          {
-            signalId,
-            tf,
-            notificationType:
-              signalWithType.notificationType
-          },
-          'NotificationQueue: filtering startup-phase duplicate'
-        );
-        continue;
-      }
-
+      // FIX #2: do not global-blacklist this signal across retries
+      // Only suppress duplicate signals within this same batch.
+      // If the signal is retried later, it must still be allowed through.
       reservedIds.add(signalId);
       this.reserveSignal(signalWithType);
       uniqueSignals.push(signalWithType);
     }
 
-    if (
-      uniqueSignals.length === 0
-    ) {
+    if (uniqueSignals.length === 0) {
       logger.warn(
         {
           tf,
           inputCount: signals.length
         },
-        'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch contained NO NEW SIGNALS (all were duplicates or invalid)'
+        'NotificationQueue: root TF candle-open batch contained no new signals'
       );
       return false;
     }
 
-    this.rootCandleSummaryInProgress =
-      true;
-
-    this.state =
-      QUEUE_STATE.ROOT_CANDLE_SUMMARY;
+    this.rootCandleSummaryInProgress = true;
+    this.state = QUEUE_STATE.ROOT_CANDLE_SUMMARY;
 
     this.queue.push({
       type: 'root_candle_open_batch',
       signals: uniqueSignals,
-      signalIds: uniqueSignals.map(
-        (signal) => getSignalId(signal)
-      ),
+      signalIds: uniqueSignals.map((signal) => getSignalId(signal)),
       tf,
       timestamp: Date.now()
     });
@@ -578,7 +459,6 @@ class NotificationQueue {
     );
 
     this.startProcessing();
-
     return true;
   }
 
@@ -591,13 +471,7 @@ class NotificationQueue {
     logLabel
   }) {
     if (!Array.isArray(signals)) {
-      logger.warn(
-        {
-          batchType,
-          logLabel
-        },
-        'NotificationQueue: invalid summary signals'
-      );
+      logger.warn({ batchType, logLabel }, 'NotificationQueue: invalid summary signals');
       return false;
     }
 
@@ -605,29 +479,19 @@ class NotificationQueue {
     const reservedIds = new Set();
 
     for (const signal of signals) {
-      const normalized =
-        this.normalizeSignal(
-          signal,
-          fallbackType
-        );
+      const normalized = this.normalizeSignal(signal, fallbackType);
 
       if (!normalized) {
         continue;
       }
 
-      const signalId =
-        getSignalId(normalized);
+      const signalId = getSignalId(normalized);
 
-      if (
-        !signalId ||
-        reservedIds.has(signalId) ||
-        this.isKnownSignal(normalized)
-      ) {
+      if (!signalId || reservedIds.has(signalId) || this.isKnownSignal(normalized)) {
         logger.debug(
           {
             signalId,
-            notificationType:
-              normalized.notificationType
+            notificationType: normalized.notificationType
           },
           `NotificationQueue: filtering duplicate ${logLabel} signal`
         );
@@ -639,15 +503,8 @@ class NotificationQueue {
       uniqueSignals.push(normalized);
     }
 
-    if (
-      uniqueSignals.length === 0
-    ) {
-      logger.info(
-        {
-          batchType
-        },
-        `NotificationQueue: ${logLabel} batch contained no new signals`
-      );
+    if (uniqueSignals.length === 0) {
+      logger.info({ batchType }, `NotificationQueue: ${logLabel} batch contained no new signals`);
       return false;
     }
 
@@ -657,9 +514,7 @@ class NotificationQueue {
     this.queue.push({
       type: batchType,
       signals: uniqueSignals,
-      signalIds: uniqueSignals.map(
-        (signal) => getSignalId(signal)
-      ),
+      signalIds: uniqueSignals.map((signal) => getSignalId(signal)),
       timestamp: Date.now()
     });
 
@@ -673,7 +528,6 @@ class NotificationQueue {
     );
 
     this.startProcessing();
-
     return true;
   }
 
@@ -695,88 +549,42 @@ class NotificationQueue {
 
     try {
       while (this.queue.length > 0) {
-        const item =
-          this.queue.shift();
-
-        const queueType =
-          resolveQueueItemType(
-            item.type,
-            item.signal
-          );
+        const item = this.queue.shift();
+        const queueType = resolveQueueItemType(item.type, item.signal);
 
         logger.debug(
           {
             originalType: item.type,
             resolvedType: queueType,
-            queueRemaining:
-              this.queue.length
+            queueRemaining: this.queue.length
           },
           'NotificationQueue: processing item'
         );
 
         try {
-          if (
-            queueType === 'startup_batch'
-          ) {
-            await this._processStartupBatch(
-              item.signals
-            );
+          if (queueType === 'startup_batch') {
+            await this._processStartupBatch(item.signals);
             this.markBatchSent(item);
-          } else if (
-            queueType === 'root_candle_batch'
-          ) {
-            await this._processRootCandleBatch(
-              item.signals
-            );
+          } else if (queueType === 'root_candle_batch') {
+            await this._processRootCandleBatch(item.signals);
             this.markBatchSent(item);
-          } else if (
-            queueType === 'root_candle_open_batch'
-          ) {
-            await this._processRootCandleOpenBatch(
-              item.signals,
-              item.tf
-            );
+          } else if (queueType === 'root_candle_open_batch') {
+            await this._processRootCandleOpenBatch(item.signals, item.tf);
             this.markBatchSent(item);
-          } else if (
-            queueType === 'realtime'
-          ) {
-            await this._processRealtimeSignal(
-              item.signal
-            );
-            this.markSignalSent(
-              item.signalId
-            );
-          } else if (
-            queueType === 'mtf_alignment'
-          ) {
-            await this._processMtfAlignment(
-              item.signal
-            );
-            this.markSignalSent(
-              item.signalId
-            );
-          } else if (
-            queueType === 'midcandle_update'
-          ) {
-            await this._processMidCandleUpdate(
-              item.signal
-            );
-            this.markSignalSent(
-              item.signalId
-            );
-          } else if (
-            queueType === 'candle_update'
-          ) {
-            await this._processCandleUpdate(
-              item.signal
-            );
-            this.markSignalSent(
-              item.signalId
-            );
+          } else if (queueType === 'realtime') {
+            await this._processRealtimeSignal(item.signal);
+            this.markSignalSent(item.signalId);
+          } else if (queueType === 'mtf_alignment') {
+            await this._processMtfAlignment(item.signal);
+            this.markSignalSent(item.signalId);
+          } else if (queueType === 'midcandle_update') {
+            await this._processMidCandleUpdate(item.signal);
+            this.markSignalSent(item.signalId);
+          } else if (queueType === 'candle_update') {
+            await this._processCandleUpdate(item.signal);
+            this.markSignalSent(item.signalId);
           } else {
-            throw new Error(
-              `Unsupported notification queue item type: ${queueType}`
-            );
+            throw new Error(`Unsupported notification queue item type: ${queueType}`);
           }
         } catch (err) {
           this.releaseItem(item);
@@ -793,43 +601,28 @@ class NotificationQueue {
       }
 
       this.state = QUEUE_STATE.IDLE;
-
-      logger.info(
-        'NotificationQueue: queue processing completed'
-      );
+      logger.info('NotificationQueue: queue processing completed');
     } catch (err) {
-      logger.error(
-        { err },
-        'NotificationQueue: fatal processing error'
-      );
+      logger.error({ err }, 'NotificationQueue: fatal processing error');
     } finally {
       this.processing = false;
       this.startupSummaryInProgress = false;
       this.rootCandleSummaryInProgress = false;
       this.state = QUEUE_STATE.IDLE;
 
-      // FIX #1: flush pending root candle batches after current batch clears
-      if (
-        Array.isArray(this.pendingRootCandleOpenBatches) &&
-        this.pendingRootCandleOpenBatches.length > 0
-      ) {
+      // FIX #1: flush deferred root-candle batches after current batch ends
+      if (Array.isArray(this.pendingRootCandleOpenBatches) && this.pendingRootCandleOpenBatches.length > 0) {
         const pending = [...this.pendingRootCandleOpenBatches];
         this.pendingRootCandleOpenBatches = [];
 
         logger.info(
-          {
-            count: pending.length
-          },
+          { count: pending.length },
           'NotificationQueue: flushing deferred root candle open batches'
         );
 
         for (const batch of pending) {
           try {
-            this.enqueueRootCandleOpenBatch(
-              batch.signals,
-              batch.tf,
-              batch.isStartupPhase
-            );
+            this.enqueueRootCandleOpenBatch(batch.signals, batch.tf, batch.isStartupPhase);
           } catch (err) {
             logger.error(
               {
@@ -849,17 +642,13 @@ class NotificationQueue {
   }
 
   markBatchSent(item) {
-    for (
-      const signalId of item.signalIds || []
-    ) {
+    for (const signalId of item.signalIds || []) {
       this.markSignalSent(signalId);
     }
   }
 
   releaseItem(item) {
-    for (
-      const signalId of item.signalIds || []
-    ) {
+    for (const signalId of item.signalIds || []) {
       this.releaseSignal(signalId);
     }
 
@@ -874,19 +663,13 @@ class NotificationQueue {
     telegram.init();
 
     logger.info(
-      {
-        count: signals.length
-      },
+      { count: signals.length },
       'NotificationQueue: starting startup batch flow'
     );
 
-    await telegram.sendStartupSummary({
-      snapshot: signals
-    });
+    await telegram.sendStartupSummary({ snapshot: signals });
 
-    logger.info(
-      'NotificationQueue: startup batch flow completed'
-    );
+    logger.info('NotificationQueue: startup batch flow completed');
   }
 
   async _processRootCandleBatch(signals) {
@@ -895,25 +678,16 @@ class NotificationQueue {
     telegram.init();
 
     logger.info(
-      {
-        count: signals.length
-      },
+      { count: signals.length },
       'NotificationQueue: starting root candle batch flow'
     );
 
-    await telegram.sendRootCandleSummary({
-      snapshot: signals
-    });
+    await telegram.sendRootCandleSummary({ snapshot: signals });
 
-    logger.info(
-      'NotificationQueue: root candle batch flow completed'
-    );
+    logger.info('NotificationQueue: root candle batch flow completed');
   }
 
-  async _processRootCandleOpenBatch(
-    signals,
-    tf = null
-  ) {
+  async _processRootCandleOpenBatch(signals, tf = null) {
     const telegram = require('./telegram');
 
     telegram.init();
@@ -926,9 +700,7 @@ class NotificationQueue {
       'NotificationQueue: starting root TF candle-open batch flow'
     );
 
-    if (
-      typeof telegram.sendRootCandleOpenSummary !== 'function'
-    ) {
+    if (typeof telegram.sendRootCandleOpenSummary !== 'function') {
       logger.error(
         {
           tf,
@@ -937,9 +709,7 @@ class NotificationQueue {
         'NotificationQueue: ⚠️  CRITICAL - missing telegram.sendRootCandleOpenSummary; aborting root TF candle-open dispatch'
       );
 
-      throw new Error(
-        'telegram.sendRootCandleOpenSummary is not available'
-      );
+      throw new Error('telegram.sendRootCandleOpenSummary is not available');
     }
 
     try {
@@ -977,22 +747,18 @@ class NotificationQueue {
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: sending realtime signal block'
     );
 
-    await telegram.sendNewSignalSingleBlock(
-      signal
-    );
+    await telegram.sendNewSignalSingleBlock(signal);
 
     logger.info(
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: realtime signal block sent'
     );
@@ -1008,23 +774,19 @@ class NotificationQueue {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
         eventId: signal.eventId,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: sending MTF alignment alert'
     );
 
-    await telegram.sendMtfAlignmentAlert(
-      signal
-    );
+    await telegram.sendMtfAlignmentAlert(signal);
 
     logger.info(
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
         eventId: signal.eventId,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: MTF alignment alert sent'
     );
@@ -1039,22 +801,18 @@ class NotificationQueue {
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: sending mid-candle update block'
     );
 
-    await telegram.sendMidCandleUpdateBlock(
-      signal
-    );
+    await telegram.sendMidCandleUpdateBlock(signal);
 
     logger.info(
       {
         symbol: signal.symbol,
         root_tf: signal.root_tf,
-        notificationType:
-          signal.notificationType
+        notificationType: signal.notificationType
       },
       'NotificationQueue: mid-candle update block sent'
     );
@@ -1075,16 +833,11 @@ class NotificationQueue {
       state: this.state,
       processing: this.processing,
       queueLength: this.queue.length,
-      startupInProgress:
-        this.startupSummaryInProgress,
-      rootCandleInProgress:
-        this.rootCandleSummaryInProgress,
-      pendingRootCandleOpenBatches:
-        this.pendingRootCandleOpenBatches.length,
-      sentSignalCount:
-        this.sentSignalIds.size,
-      pendingSignalCount:
-        this.pendingSignalIds.size
+      startupInProgress: this.startupSummaryInProgress,
+      rootCandleInProgress: this.rootCandleSummaryInProgress,
+      pendingRootCandleOpenBatches: this.pendingRootCandleOpenBatches.length,
+      sentSignalCount: this.sentSignalIds.size,
+      pendingSignalCount: this.pendingSignalIds.size
     };
   }
 
@@ -1093,9 +846,7 @@ class NotificationQueue {
     this.pendingSignalIds.clear();
     this.sentSignalTimestamps.clear();
 
-    logger.info(
-      'NotificationQueue: signal caches cleared'
-    );
+    logger.info('NotificationQueue: signal caches cleared');
   }
 }
 
