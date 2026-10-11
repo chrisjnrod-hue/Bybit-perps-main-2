@@ -2317,6 +2317,34 @@ module.exports = {
           await this.processMissingDataQueueSafe(missingDataQueue);
         });
       }
+      logger.info(
+  {
+    readyCandidatesAfterSync: readyCandidates.length,
+    missingDataQueueLength: missingDataQueue.length,
+    eligibleSlowPathLength: eligibleSlowPath?.length || 0
+  },
+  'DEBUG: readyCandidates state after sync slow-path processing'
+);
+
+// Re-debug the DB state for the first few symbols
+const debugSymbols = validRows.slice(0, 3);
+for (const row of debugSymbols) {
+  for (const tf of tfsToProcess) {
+    const latestOpen = getLatestOpenTime(db, row.symbol, tf);
+    const processedStateKey = this.getLoop2ProcessedCandleKey(row.symbol, tf);
+    const processedOpen = Number(safeGetState(processedStateKey) || 0);
+    
+    logger.info({
+      symbol: row.symbol,
+      tf,
+      latestOpenFromDB: latestOpen,
+      processedOpen,
+      isNewer: latestOpen > processedOpen,
+      latestOpenDate: latestOpen ? new Date(latestOpen).toISOString() : 'null',
+      processedOpenDate: processedOpen > 0 ? new Date(processedOpen).toISOString() : 'never'
+    }, 'DEBUG: post-sync DB state for symbol/tf');
+  }
+}
 
       // STEP 2B: SYNCHRONOUS SLOW PATH PROCESSING FOR BLOCKING CASES
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
