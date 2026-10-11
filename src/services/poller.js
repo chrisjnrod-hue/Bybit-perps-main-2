@@ -2388,13 +2388,18 @@ module.exports = {
       }
 
       if (readyCandidates.length === 0) {
-        logger.info(
-          { durationMs: (performance.now() - scanStartTime).toFixed(2) },
-          'poller: no new WebSocket candle data present in DB yet; fast path complete'
-        );
-        return false;
+  logger.info(
+    { durationMs: (performance.now() - scanStartTime).toFixed(2) },
+    'poller: no new WebSocket candle data present in DB yet; fast path complete'
+  );
+  
+  // Only return false if sync slow-path didn't find anything
+  // If readyCandidates was populated by sync fetch above, continue processing
+  if (readyCandidates.length === 0) {
+    return false;
+  }
       }
-
+      
       // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
       const computeStart = performance.now();
       const allBoundarySignals = [];
