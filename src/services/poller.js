@@ -855,6 +855,14 @@ function registerBybitWsListeners() {
               notifyImmediately: false
             });
 
+            if (!signal) {
+              // NEW: log when handleRootSignal returns no signal
+              logger.debug(
+                { symbol, tf, openTime, rootEventId, mtfScore: mtfValidation.mtfScore },
+                'poller.ws: signalManager returned no signal (handleRootSignal returned null/undefined)'
+              );
+            }
+
             if (signal) {
               const rootSignal = {
                 ...signal,
@@ -863,17 +871,35 @@ function registerBybitWsListeners() {
                 signalType: 'rootcandle_update'
               };
 
-              notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  openTime,
-                  rootEventId,
-                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                },
-                'poller.ws: ws-triggered root candle signal enqueued'
-              );
+              // NEW: await enqueue and inspect result (handles both sync boolean or Promise)
+              try {
+                const res = notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
+                const queued = res instanceof Promise ? await res : res;
+
+                logger.info(
+                  {
+                    symbol,
+                    tf,
+                    openTime,
+                    rootEventId,
+                    queued,
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
+                  },
+                  'poller.ws: ws-triggered root candle signal enqueued (or enqueued result returned)'
+                );
+
+                if (!queued) {
+                  logger.error(
+                    { symbol, tf, rootEventId },
+                    'poller.ws: notificationQueue.enqueueSignal returned falsy (message not queued)'
+                  );
+                }
+              } catch (err) {
+                logger.error(
+                  { err, symbol, tf, rootEventId },
+                  'poller.ws: notificationQueue.enqueueSignal threw an error'
+                );
+              }
             }
           }
         }
@@ -2243,6 +2269,7 @@ module.exports = {
       'poller: root TF candle open boundary scan started'
     );
 
+    // CRITICAL FIX: Ensure DB is ready before proceeding
     const db = await ensureDbReady(3, 500);
     if (!db) {
       logger.error(
@@ -2268,6 +2295,7 @@ module.exports = {
       const missingDataQueue = [];
       let detectedNewCandles = false;
 
+      // STEP 1: FAST PATH VS. SLOW PATH SEPARATION
       const dbCheckStart = performance.now();
 
       for (const row of validRows) {
@@ -2304,6 +2332,7 @@ module.exports = {
         'poller.perf: [1/4] Fast path DB classification completed'
       );
 
+      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP
       if (missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
@@ -2315,27 +2344,22 @@ module.exports = {
         });
       }
 
+      // STEP 2B: SYNCHRONOUS SLOW PATH PROCESSING FOR BLOCKING CASES
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
+        logger.info(
+          { missingCount: missingDataQueue.length },
+          'poller: no fast-path candidates; attempting synchronous lightweight fetch for slow-path items'
+        );
+
         const syncStart = performance.now();
         const COOLDOWN_MS = 5 * 60 * 1000;
         const now = Date.now();
 
-        const eligibleSlowPath = missingDataQueue
-          .filter((item) => {
-            const key = `${item.symbol}|${item.tf}`;
-            const lastAttempt = restFallbackCooldowns.get(key) || 0;
-            return now - lastAttempt > COOLDOWN_MS;
-          })
-          .slice(0, 20);
-
-        logger.info(
-          {
-            readyCandidatesAfterSync: readyCandidates.length,
-            missingDataQueueLength: missingDataQueue.length,
-            eligibleSlowPathLength: eligibleSlowPath.length
-          },
-          'DEBUG: readyCandidates state after sync slow-path processing'
-        );
+        const eligibleSlowPath = missingDataQueue.filter((item) => {
+          const key = `${item.symbol}|${item.tf}`;
+          const lastAttempt = restFallbackCooldowns.get(key) || 0;
+          return now - lastAttempt > COOLDOWN_MS;
+        }).slice(0, 20);
 
         if (eligibleSlowPath.length > 0) {
           logger.info(
@@ -2390,15 +2414,19 @@ module.exports = {
       }
 
       if (readyCandidates.length === 0) {
-        logger.info(
-          {
-            durationMs: (performance.now() - scanStartTime).toFixed(2)
-          },
-          'poller: no new WebSocket candle data present in DB yet; fast path complete'
-        );
-        return false;
+  logger.info(
+    { durationMs: (performance.now() - scanStartTime).toFixed(2) },
+    'poller: no new WebSocket candle data present in DB yet; fast path complete'
+  );
+  
+  // Only return false if sync slow-path didn't find anything
+  // If readyCandidates was populated by sync fetch above, continue processing
+  if (readyCandidates.length === 0) {
+    return false;
+  }
       }
-
+      
+      // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
       const computeStart = performance.now();
       const allBoundarySignals = [];
 
@@ -2440,10 +2468,16 @@ module.exports = {
               );
               safeSetState(processedStateKey, latestOpen);
               return null;
-            }
-
-            if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+            } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
               const signal = await signalManager.handleRootSignal(rootCandidate);
+
+              if (!signal) {
+                // NEW: log when handleRootSignal returns no signal
+                logger.debug(
+                  { symbol, tf, latestOpen, eventId, mtfScore: mtfValidation.mtfScore },
+                  'poller: signalManager.handleRootSignal returned no signal'
+                );
+              }
 
               if (signal) {
                 const acceptThreshold = 0.7;
@@ -2504,7 +2538,6 @@ module.exports = {
       });
 
       const evaluatedResults = await Promise.all(candidatePromises);
-
       for (const res of evaluatedResults) {
         if (res) {
           allBoundarySignals.push(res);
@@ -2521,6 +2554,7 @@ module.exports = {
         'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
       );
 
+      // STEP 4: BATCH ENQUEUE - FIXED TO USE PROPER NOTIFICATION FLOW
       const broadcastStart = performance.now();
 
       if (allBoundarySignals.length > 0) {
@@ -2532,41 +2566,53 @@ module.exports = {
           'poller: enqueueing root TF candle open batch notifications'
         );
 
+        // FIXED: Use proper batch enqueue instead of individual signals
+        // Group signals by timeframe and enqueue each group
         for (const tf of tfsToProcess) {
           const tfSignals = allBoundarySignals.filter(
-            (s) => normalizeRootTf(s.root_tf) === tf
+            s => normalizeRootTf(s.root_tf) === tf
           );
 
           if (tfSignals.length > 0) {
-            const queued = notificationQueue.enqueueRootCandleOpenBatch(
-              tfSignals,
-              tf,
-              false
-            );
-
-            logger.info(
-              {
+            // NEW: await and inspect enqueue result (supports promise or boolean)
+            try {
+              const res = notificationQueue.enqueueRootCandleOpenBatch(
+                tfSignals,
                 tf,
-                signalCount: tfSignals.length,
-                queued,
-                batchType: 'root_candle_open_batch'
-              },
-              'poller: root TF candle-open batch enqueued for timeframe'
-            );
+                false // isStartupPhase = false for live trading
+              );
+              const queued = res instanceof Promise ? await res : res;
 
-            if (!queued) {
-              logger.error(
+              logger.info(
                 {
                   tf,
-                  signalCount: tfSignals.length
+                  signalCount: tfSignals.length,
+                  queued,
+                  batchType: 'root_candle_open_batch'
                 },
-                'poller: ⚠️  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
+                'poller: root TF candle-open batch enqueued for timeframe (enqueue result)'
+              );
+
+              if (!queued) {
+                logger.error(
+                  {
+                    tf,
+                    signalCount: tfSignals.length
+                  },
+                  'poller: ⚠️  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
+                );
+              }
+            } catch (err) {
+              logger.error(
+                { err, tf },
+                'poller: notificationQueue.enqueueRootCandleOpenBatch threw an error'
               );
             }
           }
         }
       }
 
+      // SUMMARY BLOCK
       const summaryBlock = {
         timestamp: new Date(nowMs).toISOString(),
         scanType: 'root_tf_candle_open',
@@ -2576,29 +2622,26 @@ module.exports = {
         slowPathQueued: missingDataQueue.length,
         newCandlesDetected: detectedNewCandles,
         signalsGenerated: allBoundarySignals.length,
-        acceptSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'accept').length,
-        monitorSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'monitor').length,
+        acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
+        monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
         avgMtfScore: allBoundarySignals.length > 0
-          ? (
-              (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) /
-                allBoundarySignals.length) *
-              100
-            ).toFixed(1) + '%'
+          ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
           : 'N/A',
         totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
-        detailedBreakdown: tfsToProcess.map((tf) => {
-          const tfSignals = allBoundarySignals.filter((s) => normalizeRootTf(s.root_tf) === tf);
+        detailedBreakdown: tfsToProcess.map(tf => {
+          const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
           return {
             timeframe: tf,
             signalCount: tfSignals.length,
-            acceptCount: tfSignals.filter((s) => s.meta?.decision === 'accept').length,
-            monitorCount: tfSignals.filter((s) => s.meta?.decision === 'monitor').length
+            acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
+            monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
           };
         })
       };
 
       logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
 
+      // SIGNAL PER BLOCK
       for (const signal of allBoundarySignals) {
         const signalBlock = {
           symbol: signal.symbol,
@@ -2616,21 +2659,20 @@ module.exports = {
         logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
       }
 
-      const acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
-      const monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
+      // RECOMMENDED BLOCKS
+      const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
+      const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
 
       if (acceptedSignals.length > 0) {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
           reason: 'MTF alignment high-confidence (≥ 70%)',
-          signals: acceptedSignals.map((s) => ({
+          signals: acceptedSignals.map(s => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
             mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment
-              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
-              : 0
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
           })),
           recommendation: 'Process these signals for potential trade entry'
         };
@@ -2643,13 +2685,11 @@ module.exports = {
           actionType: 'MONITOR',
           count: monitorSignals.length,
           reason: 'MTF alignment below high-confidence threshold (< 70%)',
-          signals: monitorSignals.map((s) => ({
+          signals: monitorSignals.map(s => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
             mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment
-              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
-              : 0
+            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
           })),
           recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
         };
