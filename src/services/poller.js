@@ -1,4 +1,4 @@
-// poller.js (FULLY UPDATED WITH DB RESILIENCE FIXES + UNDEFINED VARIABLE CORRECTIONS)
+// poller.js (FULLY UPDATED WITH DB RESILIENCE FIXES)
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -2306,7 +2306,7 @@ module.exports = {
         'poller.perf: [1/4] Fast path DB classification completed'
       );
 
-      // STEP 2: OFFLOAD MISSING TO BACKGROUND (NON-BLOCKING)
+      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP
       if (missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
@@ -2317,6 +2317,34 @@ module.exports = {
           await this.processMissingDataQueueSafe(missingDataQueue);
         });
       }
+      logger.info(
+  {
+    readyCandidatesAfterSync: readyCandidates.length,
+    missingDataQueueLength: missingDataQueue.length,
+    eligibleSlowPathLength: eligibleSlowPath?.length || 0
+  },
+  'DEBUG: readyCandidates state after sync slow-path processing'
+);
+
+// Re-debug the DB state for the first few symbols
+const debugSymbols = validRows.slice(0, 3);
+for (const row of debugSymbols) {
+  for (const tf of tfsToProcess) {
+    const latestOpen = getLatestOpenTime(db, row.symbol, tf);
+    const processedStateKey = this.getLoop2ProcessedCandleKey(row.symbol, tf);
+    const processedOpen = Number(safeGetState(processedStateKey) || 0);
+    
+    logger.info({
+      symbol: row.symbol,
+      tf,
+      latestOpenFromDB: latestOpen,
+      processedOpen,
+      isNewer: latestOpen > processedOpen,
+      latestOpenDate: latestOpen ? new Date(latestOpen).toISOString() : 'null',
+      processedOpenDate: processedOpen > 0 ? new Date(processedOpen).toISOString() : 'never'
+    }, 'DEBUG: post-sync DB state for symbol/tf');
+  }
+}
 
       // STEP 2B: SYNCHRONOUS SLOW PATH PROCESSING FOR BLOCKING CASES
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
@@ -2380,8 +2408,7 @@ module.exports = {
           logger.info(
             {
               syncFetchDurationMs: (performance.now() - syncStart).toFixed(2),
-              newCandidatesFound: readyCandidates.length,
-              eligibleSlowPathLength: eligibleSlowPath.length
+              newCandidatesFound: readyCandidates.length
             },
             'poller.perf: synchronous slow-path fetch completed'
           );
@@ -2389,13 +2416,18 @@ module.exports = {
       }
 
       if (readyCandidates.length === 0) {
-        logger.info(
-          { durationMs: (performance.now() - scanStartTime).toFixed(2) },
-          'poller: no new WebSocket candle data present in DB yet; fast path complete'
-        );
-        return false;
+  logger.info(
+    { durationMs: (performance.now() - scanStartTime).toFixed(2) },
+    'poller: no new WebSocket candle data present in DB yet; fast path complete'
+  );
+  
+  // Only return false if sync slow-path didn't find anything
+  // If readyCandidates was populated by sync fetch above, continue processing
+  if (readyCandidates.length === 0) {
+    return false;
+  }
       }
-
+      
       // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
       const computeStart = performance.now();
       const allBoundarySignals = [];
