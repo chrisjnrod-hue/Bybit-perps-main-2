@@ -2243,7 +2243,6 @@ module.exports = {
       'poller: root TF candle open boundary scan started'
     );
 
-    // CRITICAL FIX: Ensure DB is ready before proceeding
     const db = await ensureDbReady(3, 500);
     if (!db) {
       logger.error(
@@ -2269,7 +2268,6 @@ module.exports = {
       const missingDataQueue = [];
       let detectedNewCandles = false;
 
-      // STEP 1: FAST PATH VS. SLOW PATH SEPARATION
       const dbCheckStart = performance.now();
 
       for (const row of validRows) {
@@ -2306,7 +2304,6 @@ module.exports = {
         'poller.perf: [1/4] Fast path DB classification completed'
       );
 
-      // STEP 2: SLOW PATH - RATE-CONTROLLED LIGHTWEIGHT CATCH-UP
       if (missingDataQueue.length > 0) {
         logger.info(
           { missingCount: missingDataQueue.length },
@@ -2317,51 +2314,28 @@ module.exports = {
           await this.processMissingDataQueueSafe(missingDataQueue);
         });
       }
-      logger.info(
-  {
-    readyCandidatesAfterSync: readyCandidates.length,
-    missingDataQueueLength: missingDataQueue.length,
-    eligibleSlowPathLength: eligibleSlowPath?.length || 0
-  },
-  'DEBUG: readyCandidates state after sync slow-path processing'
-);
 
-// Re-debug the DB state for the first few symbols
-const debugSymbols = validRows.slice(0, 3);
-for (const row of debugSymbols) {
-  for (const tf of tfsToProcess) {
-    const latestOpen = getLatestOpenTime(db, row.symbol, tf);
-    const processedStateKey = this.getLoop2ProcessedCandleKey(row.symbol, tf);
-    const processedOpen = Number(safeGetState(processedStateKey) || 0);
-    
-    logger.info({
-      symbol: row.symbol,
-      tf,
-      latestOpenFromDB: latestOpen,
-      processedOpen,
-      isNewer: latestOpen > processedOpen,
-      latestOpenDate: latestOpen ? new Date(latestOpen).toISOString() : 'null',
-      processedOpenDate: processedOpen > 0 ? new Date(processedOpen).toISOString() : 'never'
-    }, 'DEBUG: post-sync DB state for symbol/tf');
-  }
-}
-
-      // STEP 2B: SYNCHRONOUS SLOW PATH PROCESSING FOR BLOCKING CASES
       if (readyCandidates.length === 0 && missingDataQueue.length > 0) {
-        logger.info(
-          { missingCount: missingDataQueue.length },
-          'poller: no fast-path candidates; attempting synchronous lightweight fetch for slow-path items'
-        );
-
         const syncStart = performance.now();
         const COOLDOWN_MS = 5 * 60 * 1000;
         const now = Date.now();
 
-        const eligibleSlowPath = missingDataQueue.filter((item) => {
-          const key = `${item.symbol}|${item.tf}`;
-          const lastAttempt = restFallbackCooldowns.get(key) || 0;
-          return now - lastAttempt > COOLDOWN_MS;
-        }).slice(0, 20);
+        const eligibleSlowPath = missingDataQueue
+          .filter((item) => {
+            const key = `${item.symbol}|${item.tf}`;
+            const lastAttempt = restFallbackCooldowns.get(key) || 0;
+            return now - lastAttempt > COOLDOWN_MS;
+          })
+          .slice(0, 20);
+
+        logger.info(
+          {
+            readyCandidatesAfterSync: readyCandidates.length,
+            missingDataQueueLength: missingDataQueue.length,
+            eligibleSlowPathLength: eligibleSlowPath.length
+          },
+          'DEBUG: readyCandidates state after sync slow-path processing'
+        );
 
         if (eligibleSlowPath.length > 0) {
           logger.info(
@@ -2416,19 +2390,15 @@ for (const row of debugSymbols) {
       }
 
       if (readyCandidates.length === 0) {
-  logger.info(
-    { durationMs: (performance.now() - scanStartTime).toFixed(2) },
-    'poller: no new WebSocket candle data present in DB yet; fast path complete'
-  );
-  
-  // Only return false if sync slow-path didn't find anything
-  // If readyCandidates was populated by sync fetch above, continue processing
-  if (readyCandidates.length === 0) {
-    return false;
-  }
+        logger.info(
+          {
+            durationMs: (performance.now() - scanStartTime).toFixed(2)
+          },
+          'poller: no new WebSocket candle data present in DB yet; fast path complete'
+        );
+        return false;
       }
-      
-      // STEP 3: CONCURRENT COMPUTATION ON FAST PATH CANDIDATES
+
       const computeStart = performance.now();
       const allBoundarySignals = [];
 
@@ -2470,7 +2440,9 @@ for (const row of debugSymbols) {
               );
               safeSetState(processedStateKey, latestOpen);
               return null;
-            } else if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+            }
+
+            if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
               const signal = await signalManager.handleRootSignal(rootCandidate);
 
               if (signal) {
@@ -2532,6 +2504,7 @@ for (const row of debugSymbols) {
       });
 
       const evaluatedResults = await Promise.all(candidatePromises);
+
       for (const res of evaluatedResults) {
         if (res) {
           allBoundarySignals.push(res);
@@ -2548,7 +2521,6 @@ for (const row of debugSymbols) {
         'poller.perf: [2/4] Concurrent MACD and MTF evaluation completed'
       );
 
-      // STEP 4: BATCH ENQUEUE - FIXED TO USE PROPER NOTIFICATION FLOW
       const broadcastStart = performance.now();
 
       if (allBoundarySignals.length > 0) {
@@ -2560,19 +2532,16 @@ for (const row of debugSymbols) {
           'poller: enqueueing root TF candle open batch notifications'
         );
 
-        // FIXED: Use proper batch enqueue instead of individual signals
-        // Group signals by timeframe and enqueue each group
         for (const tf of tfsToProcess) {
           const tfSignals = allBoundarySignals.filter(
-            s => normalizeRootTf(s.root_tf) === tf
+            (s) => normalizeRootTf(s.root_tf) === tf
           );
 
           if (tfSignals.length > 0) {
-            // Pass isStartupPhase=false to allow post-startup signals
             const queued = notificationQueue.enqueueRootCandleOpenBatch(
               tfSignals,
               tf,
-              false // isStartupPhase = false for live trading
+              false
             );
 
             logger.info(
@@ -2598,7 +2567,6 @@ for (const row of debugSymbols) {
         }
       }
 
-      // SUMMARY BLOCK
       const summaryBlock = {
         timestamp: new Date(nowMs).toISOString(),
         scanType: 'root_tf_candle_open',
@@ -2608,26 +2576,29 @@ for (const row of debugSymbols) {
         slowPathQueued: missingDataQueue.length,
         newCandlesDetected: detectedNewCandles,
         signalsGenerated: allBoundarySignals.length,
-        acceptSignals: allBoundarySignals.filter(s => s.meta?.decision === 'accept').length,
-        monitorSignals: allBoundarySignals.filter(s => s.meta?.decision === 'monitor').length,
+        acceptSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'accept').length,
+        monitorSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'monitor').length,
         avgMtfScore: allBoundarySignals.length > 0
-          ? (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) / allBoundarySignals.length * 100).toFixed(1) + '%'
+          ? (
+              (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) /
+                allBoundarySignals.length) *
+              100
+            ).toFixed(1) + '%'
           : 'N/A',
         totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
-        detailedBreakdown: tfsToProcess.map(tf => {
-          const tfSignals = allBoundarySignals.filter(s => normalizeRootTf(s.root_tf) === tf);
+        detailedBreakdown: tfsToProcess.map((tf) => {
+          const tfSignals = allBoundarySignals.filter((s) => normalizeRootTf(s.root_tf) === tf);
           return {
             timeframe: tf,
             signalCount: tfSignals.length,
-            acceptCount: tfSignals.filter(s => s.meta?.decision === 'accept').length,
-            monitorCount: tfSignals.filter(s => s.meta?.decision === 'monitor').length
+            acceptCount: tfSignals.filter((s) => s.meta?.decision === 'accept').length,
+            monitorCount: tfSignals.filter((s) => s.meta?.decision === 'monitor').length
           };
         })
       };
 
       logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
 
-      // SIGNAL PER BLOCK
       for (const signal of allBoundarySignals) {
         const signalBlock = {
           symbol: signal.symbol,
@@ -2645,20 +2616,21 @@ for (const row of debugSymbols) {
         logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
       }
 
-      // RECOMMENDED BLOCKS
-      const acceptedSignals = allBoundarySignals.filter(s => s.meta?.decision === 'accept');
-      const monitorSignals = allBoundarySignals.filter(s => s.meta?.decision === 'monitor');
+      const acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
+      const monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
 
       if (acceptedSignals.length > 0) {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
           reason: 'MTF alignment high-confidence (≥ 70%)',
-          signals: acceptedSignals.map(s => ({
+          signals: acceptedSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
             mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+            positiveCount: s.meta?.alignment
+              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
+              : 0
           })),
           recommendation: 'Process these signals for potential trade entry'
         };
@@ -2671,11 +2643,13 @@ for (const row of debugSymbols) {
           actionType: 'MONITOR',
           count: monitorSignals.length,
           reason: 'MTF alignment below high-confidence threshold (< 70%)',
-          signals: monitorSignals.map(s => ({
+          signals: monitorSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
             mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment ? Object.values(s.meta.alignment).filter(a => a?.positive).length : 0
+            positiveCount: s.meta?.alignment
+              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
+              : 0
           })),
           recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
         };
