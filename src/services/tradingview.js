@@ -8,6 +8,20 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+/**
+ * fetchTvRatingForSymbol with retry logic and better timeout handling
+ *
+ * Returns:
+ *  {
+ *    source,         // 'tradingview' | 'fallback' | 'error'
+ *    score,          // normalized 0..1 float
+ *    score_pct,      // integer 0..100
+ *    scorePct,       // camelCase alias for score_pct
+ *    tvScore,        // alias used by consumers (integer 0..100)
+ *    raw,            // raw row.d from TV
+ *    exchange        // exchange attempted
+ *  }
+ */
 async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
   if (!symbol) {
     logger.warn('fetchTvRatingForSymbol: symbol is empty');
@@ -65,6 +79,7 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
             score = Math.max(0, Math.min(1, (recommend - 1) / 4));
           }
 
+          // Keep raw 0..1 score and add explicit percent for consumers
           const scorePct = Math.round(score * 100);
 
           logger.info({ symbol, ticker, recommend, score, scorePct, attempt, exchange: ex }, '✅ TV rating fetched successfully');
@@ -78,8 +93,6 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
             raw: row.d,
             exchange: ex
           };
-        } else {
-          logger.debug({ symbol, exchange: ex, body: json }, 'TV API returned no data for ticker');
         }
       } catch (err) {
         const errorType = err.name === 'AbortError' ? 'timeout' : 'network';
@@ -100,6 +113,15 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
   return { source: 'fallback', score: 0, score_pct: 0, scorePct: 0, tvScore: 0, raw: null };
 }
 
+/**
+ * getOrFetchTvRatingCached(symbol)
+ * - Checks DB cache (valid for 1 hour)
+ * - If fresh cache exists, returns it immediately (with aliases)
+ * - Otherwise fetches fresh from TV API and caches result
+ * - Graceful fallback if DB unavailable
+ *
+ * Returns object with { score (0..1), score_pct (0..100), scorePct, tvScore, source, exchange, cached }
+ */
 async function getOrFetchTvRatingCached(symbol) {
   if (!symbol) return { source: 'error', score: 0, score_pct: 0, scorePct: 0, tvScore: 0 };
 
@@ -107,6 +129,7 @@ async function getOrFetchTvRatingCached(symbol) {
     const db = dbModule.get();
     if (!db) throw new Error('DB not available');
 
+    // Ensure table exists (no-op if already present)
     try {
       db.prepare(`
         CREATE TABLE IF NOT EXISTS tv_ratings (
@@ -144,16 +167,16 @@ async function getOrFetchTvRatingCached(symbol) {
         exchange: cached.exchange || null,
         cached: true
       };
-    } else {
-      logger.debug({ symbol }, 'TV rating cache miss or entry stale');
     }
   } catch (err) {
     logger.debug({ err: err && err.message, symbol }, 'Cache check failed (will fetch fresh)');
   }
 
+  // Fetch fresh from TV API
   logger.debug({ symbol }, 'Fetching fresh TV rating from API');
   const fresh = await fetchTvRatingForSymbol(symbol);
 
+  // Try to cache result (store raw 0..1 score)
   try {
     const db = dbModule.get();
     if (db) {
@@ -168,10 +191,9 @@ async function getOrFetchTvRatingCached(symbol) {
     logger.debug({ err: err && err.message, symbol }, 'Failed to cache TV rating (continuing)');
   }
 
+  // Ensure returned object always has score_pct, aliases, and exchange
   const normalizedScore = typeof fresh.score === 'number' ? fresh.score : 0;
   const normalizedPct = typeof fresh.score_pct === 'number' ? fresh.score_pct : Math.round(normalizedScore * 100);
-
-  logger.debug({ symbol, fresh, normalizedScore, normalizedPct }, 'TV rating final result');
 
   return {
     source: fresh.source || 'unknown',
@@ -184,6 +206,12 @@ async function getOrFetchTvRatingCached(symbol) {
   };
 }
 
+/**
+ * fallbackScore(macdPositiveFraction, volChangePct)
+ * Calculates a score based on MACD and volume metrics when TV data unavailable
+ * - 60% weight on MACD positive fraction
+ * - 40% weight on volume change normalization
+ */
 function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) {
   try {
     const volNorm = Math.max(0, Math.min(1, (volChangePct + 100) / 200));
@@ -196,6 +224,9 @@ function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) 
   }
 }
 
+/**
+ * clearOldTvRatingCache(olderThanHours)
+ */
 function clearOldTvRatingCache(olderThanHours = 24) {
   try {
     const db = dbModule.get();
@@ -213,6 +244,9 @@ function clearOldTvRatingCache(olderThanHours = 24) {
   }
 }
 
+/**
+ * testTvApi(symbol)
+ */
 async function testTvApi(symbol = 'BTCUSDT') {
   logger.info({ symbol }, '🧪 Testing TV API connectivity...');
 
