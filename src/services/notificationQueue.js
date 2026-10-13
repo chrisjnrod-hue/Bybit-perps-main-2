@@ -346,26 +346,89 @@ class NotificationQueue {
     });
   }
 
-  enqueueRootCandleBatch(signals) {
+    enqueueRootCandleOpenBatch(signals, tf = null, isStartupPhase = false) {
     if (!Array.isArray(signals)) {
-      logger.warn('NotificationQueue: invalid root candle batch');
+      logger.warn('NotificationQueue: invalid root candle open batch');
       return false;
     }
 
     if (this.rootCandleSummaryInProgress) {
-      logger.info('NotificationQueue: root candle summary already in progress, skipping duplicate batch');
+      logger.info(
+        { tf, inputCount: signals.length },
+        'NotificationQueue: root candle summary already in progress; queueing batch for retry'
+      );
+
+      this.pendingRootCandleOpenBatches.push({
+        signals: [...signals],
+        tf,
+        isStartupPhase,
+        timestamp: Date.now()
+      });
+
+      return true;
+    }
+
+    const uniqueSignals = [];
+    const reservedIds = new Set();
+
+    for (const signal of signals) {
+      const normalized = this.normalizeSignal(signal, 'new_root_candle');
+
+      if (!normalized) {
+        continue;
+      }
+
+      const signalWithType = {
+        ...normalized,
+        notificationType: 'new_root_candle',
+        signalType: normalized.signalType || 'new_root_candle'
+      };
+
+      const signalId = getSignalId(signalWithType);
+
+      if (!signalId || reservedIds.has(signalId)) {
+        logger.debug({
+          signalId,
+          tf,
+          notificationType: signalWithType.notificationType
+        }, 'NotificationQueue: filtering duplicate within root-candle batch');
+        continue;
+      }
+
+      reservedIds.add(signalId);
+      this.reserveSignal(signalWithType);
+      uniqueSignals.push(signalWithType);
+    }
+
+    if (uniqueSignals.length === 0) {
+      logger.warn(
+        { tf, inputCount: signals.length },
+        'NotificationQueue: root TF candle-open batch contained no new signals'
+      );
       return false;
     }
 
-    return this.enqueueSummaryBatch({
-      signals,
-      batchType: 'root_candle_batch',
-      fallbackType: 'new_root_candle',
-      summaryState: QUEUE_STATE.ROOT_CANDLE_SUMMARY,
-      summaryFlag: 'rootCandleSummaryInProgress',
-      logLabel: 'root_candle'
+    this.rootCandleSummaryInProgress = true;
+    this.state = QUEUE_STATE.ROOT_CANDLE_SUMMARY;
+
+    this.queue.push({
+      type: 'root_candle_open_batch',
+      signals: uniqueSignals,
+      signalIds: uniqueSignals.map((signal) => getSignalId(signal)),
+      tf,
+      timestamp: Date.now()
     });
-  }
+
+    logger.info({
+      tf,
+      total: signals.length,
+      unique: uniqueSignals.length,
+      queueLength: this.queue.length
+    }, 'NotificationQueue: root TF candle-open batch enqueued successfully');
+
+    this.startProcessing();
+    return true;
+    }
 
   enqueueRootCandleOpenBatch(signals, tf = null, isStartupPhase = false) {
     if (!Array.isArray(signals)) {
