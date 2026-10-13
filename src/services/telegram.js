@@ -368,14 +368,22 @@ module.exports = {
     const alignment =
       meta.alignment || {};
 
-    const tvScore =
-      typeof meta.tvScore === 'number'
-        ? meta.tvScore
-        : (
-            meta.tvScore
-              ? Number(meta.tvScore)
-              : 0
-          );
+    const tvRaw =
+      Number(
+        meta.tvScore ??
+        meta.score_pct ??
+        meta.scorePct ??
+        meta.tvScoreNormalized ??
+        0
+      );
+
+    const tvPercent = Number.isFinite(tvRaw)
+      ? (
+          tvRaw > 1
+            ? Math.min(100, Math.max(0, tvRaw))
+            : Math.round((tvRaw || 0) * 100)
+        )
+      : 0;
 
     const tvSource =
       meta.tvSource || 'error';
@@ -404,11 +412,6 @@ module.exports = {
       mtfScore !== null
         ? mtfScore
         : computedMtfScore;
-
-    const tvPercent =
-      Math.round(
-        (tvScore || 0) * 100
-      );
 
     const mtfPercent =
       Math.round(
