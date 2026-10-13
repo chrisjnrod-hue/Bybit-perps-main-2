@@ -20,6 +20,7 @@ const wsManager = require('../services/bybitWs');
 const poller = require('../services/poller');
 const config = require('../config');
 const bybitRest = require('../services/bybitRest');
+const marketData = require('../services/marketData'); // <- added for admin seeding/inspection
 
 let manualIntervalId = null;
 
@@ -42,6 +43,18 @@ function msToNext5m() {
   next.setUTCSeconds(0);
   next.setUTCMilliseconds(0);
   return Math.max(0, next - d);
+}
+
+// Admin guard for the new endpoints
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+
+// simple admin guard (checks header X-ADMIN-TOKEN or query admin_token)
+function requireAdmin(req, res, next) {
+  const token = req.header('X-ADMIN-TOKEN') || req.query.admin_token || '';
+  if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
+    return res.status(403).json({ ok: false, error: 'forbidden - invalid admin token' });
+  }
+  return next();
 }
 
 // Health
@@ -358,5 +371,83 @@ router.get('/bybit/db-info', (req, res) => {
     res.status(500).json({ ok: false, error: String(err) });
   }
 });
+
+/*
+ * --- ADMIN: seeding and market-data inspection endpoints ---
+ *
+ * GET/POST /debug/admin/seedMarketData?admin_token=...  (sequential, browser-friendly)
+ * GET     /debug/admin/marketdata?symbol=SYMBOL&admin_token=...
+ *
+ * Protect with ADMIN_TOKEN env var. These endpoints are intentionally sequential and conservative
+ * (MARKET_SEED_DELAY_MS controls ms between per-symbol update calls).
+ */
+
+router.all('/admin/seedMarketData', requireAdmin, async (req, res) => {
+  try {
+    const db = getDbOrThrow();
+
+    const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+    if (!rows || rows.length === 0) {
+      return res.json({ ok: true, message: 'no symbols in DB' });
+    }
+
+    const delayMs = Number(process.env.MARKET_SEED_DELAY_MS || 500);
+    const results = [];
+
+    // run sequentially to avoid DB/HTTP rate-limits
+    for (const r of rows) {
+      const symbol = String(r.symbol || '').trim();
+      if (!symbol) continue;
+
+      try {
+        const out = await marketData.updateSymbolMarketData(symbol);
+        results.push({ symbol, ok: true, fetched: !!out });
+      } catch (err) {
+        results.push({ symbol, ok: false, error: String(err && err.message) });
+      }
+
+      if (delayMs > 0) {
+        // small sleep
+        await new Promise((rs) => setTimeout(rs, delayMs));
+      }
+    }
+
+    return res.json({
+      ok: true,
+      count: results.length,
+      sample: results.slice(0, 50), // limit output
+      note: 'Seeding ran sequentially. Check logs for detailed info.'
+    });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'admin/seedMarketData failed');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+// Inspect market_data + recent history for one symbol
+router.get('/admin/marketdata', requireAdmin, (req, res) => {
+  try {
+    const db = getDbOrThrow();
+    const symbol = String(req.query.symbol || '').trim();
+    if (!symbol) return res.status(400).json({ ok: false, error: 'symbol query parameter required' });
+
+    const current = db.prepare(
+      'SELECT symbol, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data WHERE symbol = ?'
+    ).get(symbol);
+
+    const history = db.prepare(
+      'SELECT id, price, volume_24h_usdt, volume_change_pct, market_cap, updated_at FROM market_data_history WHERE symbol = ? ORDER BY updated_at DESC LIMIT 10'
+    ).all(symbol);
+
+    return res.json({ ok: true, symbol, current: current || null, history: history || [] });
+  } catch (err) {
+    if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
+    logger.error({ err }, 'admin/marketdata failed');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+/* end admin endpoints */
 
 module.exports = router;
