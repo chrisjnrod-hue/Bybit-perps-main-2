@@ -195,9 +195,13 @@ module.exports = {
 
       /*
        * Fetch the cached or fresh TradingView rating.
+       * Preserve both normalized score and percent value.
        */
       let tv = {
         score: 0,
+        score_pct: 0,
+        scorePct: 0,
+        tvScore: 0,
         source: 'error'
       };
 
@@ -212,12 +216,32 @@ module.exports = {
             symbol
           );
 
-        if (
-          tvRes &&
-          typeof tvRes.score === 'number'
-        ) {
+        if (tvRes) {
+          const normalizedScore =
+            typeof tvRes.score === 'number'
+              ? tvRes.score
+              : 0;
+
+          const rawPercent = Number(
+            tvRes.tvScore ??
+            tvRes.score_pct ??
+            tvRes.scorePct ??
+            (
+              typeof normalizedScore === 'number'
+                ? Math.round(normalizedScore * 100)
+                : 0
+            )
+          );
+
+          const safePercent = Number.isFinite(rawPercent)
+            ? Math.min(100, Math.max(0, rawPercent))
+            : 0;
+
           tv = {
-            score: tvRes.score,
+            score: normalizedScore,
+            score_pct: safePercent,
+            scorePct: safePercent,
+            tvScore: safePercent,
             source: tvRes.source || 'unknown'
           };
 
@@ -225,6 +249,8 @@ module.exports = {
             {
               symbol,
               score: tv.score,
+              score_pct: tv.score_pct,
+              tvScore: tv.tvScore,
               source: tv.source
             },
             'TV rating acquired'
@@ -260,7 +286,27 @@ module.exports = {
         await this.applyDecision(alignment);
 
       const meta = {
-        tvScore: tv.score || 0,
+        tvScore: Number(
+          tv.tvScore ??
+          tv.score_pct ??
+          tv.scorePct ??
+          0
+        ),
+        score_pct: Number(
+          tv.score_pct ??
+          tv.tvScore ??
+          tv.scorePct ??
+          0
+        ),
+        scorePct: Number(
+          tv.scorePct ??
+          tv.score_pct ??
+          tv.tvScore ??
+          0
+        ),
+        tvScoreNormalized: Number(
+          tv.score ?? 0
+        ),
         tvSource: tv.source || 'error',
         mtfScore,
         alignment,
