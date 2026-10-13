@@ -832,17 +832,48 @@ function registerBybitWsListeners() {
         detected_at: Date.now()
       };
 
-      // FIXED: Use unified state key (poller.loop2.processedCandle)
       const processedStateKey = `poller.loop2.processedCandle.${symbol}.${tf}`;
       const processedOpen = Number(safeGetState(processedStateKey) || 0);
+
+      logger.debug(
+        {
+          symbol,
+          tf,
+          openTime,
+          processedOpen,
+          processedStateKey,
+          isNewer: openTime > processedOpen
+        },
+        'poller.ws: root candle candidate gate'
+      );
 
       if (openTime > processedOpen) {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
 
-        if (flip && !alreadyProcessedSignal(wsSignal, 'ws_rootcandle')) {
+        if (flip) {
+          logger.info(
+            { symbol, tf, openTime },
+            'poller.ws: MACD flip detected'
+          );
+
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-          if (mtfValidation.isAligned) {
+          if (!mtfValidation.isAligned) {
+            logger.info(
+              {
+                symbol,
+                tf,
+                openTime,
+                mtfScore: mtfValidation.mtfScore,
+                positiveCount: mtfValidation.positiveCount,
+                totalCount: mtfValidation.totalCount,
+                reason: mtfValidation.reason
+              },
+              'poller.ws: MACD flip detected but MTF alignment not met — still proceeding'
+            );
+          }
+
+          if (!alreadyProcessedSignal(wsSignal, 'ws_rootcandle')) {
             const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
 
             const signal = await signalManager.handleRootSignal({
@@ -856,54 +887,47 @@ function registerBybitWsListeners() {
             });
 
             if (!signal) {
-              // NEW: log when handleRootSignal returns no signal
-              logger.debug(
-                { symbol, tf, openTime, rootEventId, mtfScore: mtfValidation.mtfScore },
-                'poller.ws: signalManager returned no signal (handleRootSignal returned null/undefined)'
+              logger.info(
+                { symbol, tf, openTime, rootEventId },
+                'poller.ws: handleRootSignal returned null after MACD flip'
               );
-            }
-
-            if (signal) {
+            } else {
               const rootSignal = {
                 ...signal,
                 eventId: rootEventId,
                 notificationType: 'new_root_candle',
-                signalType: 'rootcandle_update'
+                signalType: 'rootcandle_update',
+                meta: {
+                  ...(signal.meta || {}),
+                  mtfScore: mtfValidation.mtfScore,
+                  mtfAligned: mtfValidation.isAligned,
+                  alignment: mtfValidation.alignment || {},
+                  mtfAlignment: mtfValidation.alignment || {}
+                }
               };
 
-              // NEW: await enqueue and inspect result (handles both sync boolean or Promise)
-              try {
-                const res = notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
-                const queued = res instanceof Promise ? await res : res;
+              const queued = notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
 
-                logger.info(
-                  {
-                    symbol,
-                    tf,
-                    openTime,
-                    rootEventId,
-                    queued,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%'
-                  },
-                  'poller.ws: ws-triggered root candle signal enqueued (or enqueued result returned)'
-                );
-
-                if (!queued) {
-                  logger.error(
-                    { symbol, tf, rootEventId },
-                    'poller.ws: notificationQueue.enqueueSignal returned falsy (message not queued)'
-                  );
-                }
-              } catch (err) {
-                logger.error(
-                  { err, symbol, tf, rootEventId },
-                  'poller.ws: notificationQueue.enqueueSignal threw an error'
-                );
-              }
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  openTime,
+                  rootEventId,
+                  queued,
+                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                  mtfAligned: mtfValidation.isAligned
+                },
+                'poller.ws: ws-triggered root candle signal enqueue result'
+              );
             }
+          } else {
+            logger.info(
+              { symbol, tf, openTime },
+              'poller.ws: ws_rootcandle already processed; skipping enqueue'
+            );
           }
         }
-
         safeSetState(processedStateKey, openTime);
       }
     } catch (err) {
