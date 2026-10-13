@@ -2091,8 +2091,8 @@ module.exports = {
                       alignment: mtfValidation.alignment || {},
                       decision: 'accept',
                       acceptReason: 'mtf_alignment_alert_100_percent',
-                      tvScore: 0,
-                      tvSource: 'loop2',
+                      tvScore: Number(activeSignal?.meta?.tvScore ?? activeSignal?.tvScore ?? 0),
+                      tvSource: activeSignal?.meta?.tvSource || 'tradingview',
                       mtfScore: mtfValidation.mtfScore,
                       positiveCount: mtfValidation.positiveCount,
                       totalCount: mtfValidation.totalCount
@@ -2539,8 +2539,8 @@ module.exports = {
                     acceptReason: isHighConfidence
                       ? 'mtf_high_confidence'
                       : 'mtf_monitor_required',
-                    tvScore: 0,
-                    tvSource: 'loop3'
+                    tvScore: Number(signal?.meta?.tvScore ?? signal?.tvScore ?? 0),
+                    tvSource: signal?.meta?.tvSource || 'tradingview'
                   }
                 };
 
@@ -2615,7 +2615,7 @@ module.exports = {
             const queued = notificationQueue.enqueueRootCandleOpenBatch(
               tfSignals,
               tf,
-              true
+              false
             );
 
             logger.info(
