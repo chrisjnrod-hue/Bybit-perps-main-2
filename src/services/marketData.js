@@ -7,6 +7,64 @@ const logger = require('pino')();
 const BYBIT_REST_BASE = config.BYBIT_REST_BASE || 'https://api.bybit.com';
 const COINGECKO_API_BASE = 'https://api.coingecko.com/api/v3';
 
+const coinIdCache = new Map();
+
+async function findCoinIdFromCoinGecko(base) {
+  if (!base) {
+    return null;
+  }
+
+  const key = String(base).trim().toUpperCase();
+
+  if (!key) {
+    return null;
+  }
+
+  const cached = coinIdCache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  try {
+    const searchUrl = `${COINGECKO_API_BASE}/search?query=${encodeURIComponent(key)}`;
+    const res = await fetch(searchUrl, { timeout: 5000 });
+
+    if (!res.ok) {
+      logger.debug({ base: key, status: res.status }, 'CoinGecko /search non-ok');
+      return null;
+    }
+
+    const json = await res.json().catch(() => null);
+
+    if (!json || !Array.isArray(json.coins) || json.coins.length === 0) {
+      logger.debug({ base: key, body: json }, 'CoinGecko /search no results');
+      return null;
+    }
+
+    const baseLower = key.toLowerCase();
+
+    const found =
+      json.coins.find((c) => String(c.symbol || '').toLowerCase() === baseLower) ||
+      json.coins.find((c) =>
+        String(c.id || '').toLowerCase().includes(baseLower) ||
+        String(c.name || '').toLowerCase().includes(baseLower)
+      ) ||
+      json.coins[0];
+
+    const coinId = found && found.id ? String(found.id) : null;
+
+    if (coinId) {
+      coinIdCache.set(key, coinId);
+      logger.debug({ base: key, coinId }, 'CoinGecko mapping discovered via /search');
+    }
+
+    return coinId;
+  } catch (err) {
+    logger.debug({ err: err && err.message, base: key }, 'findCoinIdFromCoinGecko error');
+    return null;
+  }
+}
+
 module.exports = {
   /**
    * updateSymbolMarketData(symbol)
@@ -85,6 +143,12 @@ module.exports = {
       if (config.COINGECKO_ENABLED) {
         try {
           coinId = this.extractCoinIdFromSymbol(symbol);
+
+          if (!coinId) {
+            const base = symbol.replace(/USDT[Pp]?$/i, '').toUpperCase();
+            coinId = await findCoinIdFromCoinGecko(base);
+          }
+
           if (coinId) {
             // simple/price first (cheap)
             const simpleUrl = `${COINGECKO_API_BASE}/simple/price?ids=${encodeURIComponent(coinId)}&vs_currencies=usd&include_market_cap=true&include_24hr_vol=true&include_24hr_change=true`;
@@ -98,13 +162,14 @@ module.exports = {
                 }
                 if (typeof data.usd_24h_vol !== 'undefined' && data.usd_24h_vol !== null) {
                   cgTotalVolume = Number(data.usd_24h_vol) || null;
+
                   // if Bybit didn't return volume, use CG's volume
                   if ((!volume24hUsdt || volume24hUsdt === 0) && cgTotalVolume) {
                     volume24hUsdt = cgTotalVolume;
                   }
                 }
-                if (typeof data.usd_24h_change !== 'undefined' && data.usd_24h_change !== null) {
-                  cgPriceChange24h = Number(data.usd_24h_change) || null;
+                if (typeof data.usd_24hr_change !== 'undefined' && data.usd_24hr_change !== null) {
+                  cgPriceChange24h = Number(data.usd_24hr_change) || null;
                 }
                 logger.debug({ symbol, coinId, marketCapFromCg, cgTotalVolume }, 'CoinGecko simple/price fetched');
               } else {
