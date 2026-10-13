@@ -263,7 +263,7 @@ class NotificationQueue {
     return nextSignal;
   }
 
-  enqueueSignal(signal, type = 'realtime') {
+    enqueueSignal(signal, type = 'realtime') {
     if (!signal || !signal.symbol || !signal.root_tf) {
       logger.warn({ signal }, 'NotificationQueue: invalid signal, skipping');
       return false;
@@ -285,19 +285,20 @@ class NotificationQueue {
       logger.warn({
         symbol: normalized.symbol,
         root_tf: normalized.root_tf,
-        type
+        type,
+        notificationType: normalized.notificationType
       }, 'NotificationQueue: signal has no stable ID, skipping');
       return false;
     }
 
     if (this.isKnownSignal(normalized)) {
-      logger.debug({
+      logger.info({
         signalId,
         symbol: normalized.symbol,
         root_tf: normalized.root_tf,
         type,
         notificationType: normalized.notificationType
-      }, 'NotificationQueue: duplicate signal, skipping');
+      }, 'NotificationQueue: duplicate or pending signal skipped');
       return false;
     }
 
@@ -322,7 +323,7 @@ class NotificationQueue {
 
     this.startProcessing();
     return true;
-  }
+        }
 
   enqueueStartupBatch(signals) {
     if (!Array.isArray(signals)) {
