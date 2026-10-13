@@ -285,6 +285,58 @@ module.exports = {
       const decision =
         await this.applyDecision(alignment);
 
+      /*
+       * If TradingView failed or returned nothing, compute a fallback score
+       * using MTF-positive fraction and available volume change.
+       * This prevents a force-zero TV score on symbols that are unsupported
+       * by TradingView but still have enough MTF/volume information.
+       */
+      if (
+        (!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) &&
+        typeof tradingview.fallbackScore === 'function'
+      ) {
+        try {
+          const fallback = tradingview.fallbackScore({
+            macdPositiveFraction: typeof mtfScore === 'number' ? mtfScore : 0,
+            volChangePct: Number.isFinite(Number(mdata?.volume_change_pct))
+              ? Number(mdata.volume_change_pct)
+              : 0
+          });
+
+          if (
+            fallback &&
+            Number.isFinite(Number(fallback.score_pct))
+          ) {
+            tv = {
+              score: Number(fallback.score) || 0,
+              score_pct: Number(fallback.score_pct) || 0,
+              scorePct: Number(fallback.scorePct) || Number(fallback.score_pct) || 0,
+              tvScore: Number(fallback.tvScore) || Number(fallback.score_pct) || 0,
+              source: 'computed_fallback',
+              raw: null
+            };
+
+            logger.info(
+              {
+                symbol,
+                mtfScore,
+                volume_change_pct: mdata?.volume_change_pct,
+                fallbackScore: tv.score_pct
+              },
+              'handleRootSignal: computed fallback TV score'
+            );
+          }
+        } catch (err) {
+          logger.debug(
+            {
+              err,
+              symbol
+            },
+            'handleRootSignal: fallback TV score generation failed'
+          );
+        }
+      }
+
       const meta = {
         tvScore: Number(
           tv.tvScore ??
