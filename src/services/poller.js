@@ -2615,7 +2615,7 @@ module.exports = {
             const queued = notificationQueue.enqueueRootCandleOpenBatch(
               tfSignals,
               tf,
-              false
+              true
             );
 
             logger.info(
