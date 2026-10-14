@@ -1,4 +1,4 @@
-// poller.js (FULLY UPDATED WITH DB RESILIENCE FIXES)
+// poller.js
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -55,6 +55,12 @@ const macdFlipTracker = new Map();
 // DB connectivity tracker for health monitoring
 let lastDbConnectivityCheck = Date.now();
 let dbIsHealthy = true;
+
+// NEW: 1D root signal count tracking
+const consecutive1dTradeCounts = new Map(); // symbol -> { count, lastAcceptedAt }
+
+// NEW: keepalive ping handle
+let keepaliveIntervalHandle = null;
 
 // ============================================================================
 // DATABASE SAFETY GUARDS & RECOVERY
@@ -159,12 +165,10 @@ function safeGetState(key, maxAgeMs = 5 * 60 * 1000) {
     return null;
   }
 
-  // Try DB first
   if (dbModule && typeof dbModule.getState === 'function') {
     try {
       const value = dbModule.getState(key);
       if (value !== undefined && value !== null) {
-        // Update in-memory cache on successful DB read
         inMemoryStateCache.set(key, {
           value,
           cachedAt: Date.now()
@@ -176,7 +180,6 @@ function safeGetState(key, maxAgeMs = 5 * 60 * 1000) {
     }
   }
 
-  // Fall back to in-memory cache with age validation
   const cached = inMemoryStateCache.get(key);
   if (cached && cached.value !== undefined && cached.value !== null) {
     const age = Date.now() - cached.cachedAt;
@@ -208,7 +211,6 @@ function safeSetState(key, value) {
 
   let dbSuccess = false;
 
-  // Attempt DB write with improved retry logic
   if (dbModule && typeof dbModule.setState === 'function') {
     let retries = 3;
     let retryDelayMs = 50;
@@ -226,7 +228,6 @@ function safeSetState(key, value) {
             { err, key, retryCount: 3 - retries, nextDelayMs: retryDelayMs * 2 },
             'poller: setState DB attempt failed; retrying with backoff'
           );
-          // Brief pause before retry (increase delay each time)
           const start = Date.now();
           while (Date.now() - start < retryDelayMs) {}
           retryDelayMs *= 2;
@@ -240,13 +241,11 @@ function safeSetState(key, value) {
     }
   }
 
-  // Always update in-memory cache as fallback
   inMemoryStateCache.set(key, {
     value,
     cachedAt: Date.now()
   });
 
-  // Return true if either DB or memory succeeded
   return dbSuccess || true;
 }
 
@@ -324,6 +323,52 @@ function buildRootTfs() {
   return output.length > 0
     ? output
     : ['60', '240', 'D'];
+}
+
+// NEW: root TF trade order priority
+function buildRootTfTradePriorityOrder() {
+  const raw = Array.isArray(config.ROOT_TF_TRADE_PRIORITY)
+    ? config.ROOT_TF_TRADE_PRIORITY
+    : ['240', 'D', '60'];
+
+  const seen = new Set();
+  const out = [];
+
+  for (const tf of raw) {
+    const normalized = normalizeRootTf(tf);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+
+  // ensure all root TFs exist
+  for (const tf of buildRootTfs()) {
+    if (!seen.has(tf)) {
+      out.push(tf);
+    }
+  }
+
+  return out;
+}
+
+function sortByRootTfPriority(signals) {
+  const priority = buildRootTfTradePriorityOrder();
+
+  return [...signals].sort((a, b) => {
+    const aTf = normalizeRootTf(a?.root_tf);
+    const bTf = normalizeRootTf(b?.root_tf);
+
+    const aIndex = priority.indexOf(aTf);
+    const bIndex = priority.indexOf(bTf);
+
+    const ai = aIndex >= 0 ? aIndex : Number.MAX_SAFE_INTEGER;
+    const bi = bIndex >= 0 ? bIndex : Number.MAX_SAFE_INTEGER;
+
+    if (ai !== bi) return ai - bi;
+    return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
+  });
 }
 
 function isUsdtSymbol(symbol) {
@@ -712,6 +757,102 @@ function isStartupBatchSignal(signal, family = 'generic') {
   return false;
 }
 
+// NEW: consecutive 1D count utilities
+function resetStaleConsecutive1dCounts(maxAgeMs = 48 * 60 * 60 * 1000) {
+  const now = Date.now();
+
+  for (const [symbol, info] of consecutive1dTradeCounts.entries()) {
+    if (now - (info.lastAcceptedAt || 0) > maxAgeMs) {
+      consecutive1dTradeCounts.delete(symbol);
+    }
+  }
+}
+
+function incrementConsecutive1dCount(symbol) {
+  const now = Date.now();
+  const info = consecutive1dTradeCounts.get(symbol) || { count: 0, lastAcceptedAt: 0 };
+
+  info.count = (info.count || 0) + 1;
+  info.lastAcceptedAt = now;
+  consecutive1dTradeCounts.set(symbol, info);
+}
+
+function getConsecutive1dCount(symbol) {
+  const info = consecutive1dTradeCounts.get(symbol);
+  return info ? info.count || 0 : 0;
+}
+
+// NEW: keepalive ping loop
+function startKeepAliveLoop() {
+  if (!config.ENABLE_KEEPALIVE_PING || !config.KEEPALIVE_URL) {
+    return;
+  }
+
+  const url = String(config.KEEPALIVE_URL).trim();
+  if (!url) {
+    return;
+  }
+
+  const intervalMs = Number(config.KEEPALIVE_INTERVAL_MS || 5 * 60 * 1000);
+  const http = url.startsWith('https') ? require('https') : require('http');
+
+  if (keepaliveIntervalHandle) {
+    clearInterval(keepaliveIntervalHandle);
+  }
+
+  keepaliveIntervalHandle = setInterval(() => {
+    try {
+      const req = http.get(url, (res) => {
+        res.on('data', () => {});
+        res.on('end', () => {});
+      });
+
+      req.on('error', (err) => {
+        logger.debug({ err, url }, 'poller.keepalive: ping failed');
+      });
+
+      req.setTimeout(5000, () => {
+        req.abort();
+      });
+    } catch (err) {
+      logger.debug({ err, url }, 'poller.keepalive: unexpected ping error');
+    }
+  }, Math.max(1000, intervalMs));
+
+  logger.info({ url, intervalMs }, 'poller.keepalive: started');
+}
+
+// NEW: realtime liquidity gate
+async function checkRealtimeLiquidity(symbol) {
+  if (!config.LIQUIDITY_CHECK_ENABLED) {
+    return { ok: true, depthUsdt: Infinity };
+  }
+
+  if (bybit && typeof bybit.fetchOrderBook === 'function') {
+    try {
+      const book = await bybit.fetchOrderBook(symbol, 50);
+      const bids = Array.isArray(book?.bids) ? book.bids : [];
+      let depthUsdt = 0;
+
+      for (const bid of bids.slice(0, 10)) {
+        const price = Number(bid?.[0] ?? 0);
+        const qty = Number(bid?.[1] ?? 0);
+        if (Number.isFinite(price) && Number.isFinite(qty)) {
+          depthUsdt += price * qty;
+        }
+      }
+
+      const minDepth = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 0);
+      return { ok: depthUsdt >= minDepth, depthUsdt };
+    } catch (err) {
+      logger.debug({ err, symbol }, 'poller: realtime liquidity check failed; allowing by default');
+      return { ok: true, depthUsdt: 0 };
+    }
+  }
+
+  return { ok: true, depthUsdt: 0 };
+}
+
 async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
 
@@ -902,7 +1043,8 @@ function registerBybitWsListeners() {
                   mtfScore: mtfValidation.mtfScore,
                   mtfAligned: mtfValidation.isAligned,
                   alignment: mtfValidation.alignment || {},
-                  mtfAlignment: mtfValidation.alignment || {}
+                  mtfAlignment: mtfValidation.alignment || {},
+                  suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
                 }
               };
 
@@ -956,7 +1098,7 @@ function startDbHealthCheckLoop() {
 }
 
 async function runDbHealthCheckLoop() {
-  const HEALTH_CHECK_INTERVAL_MS = 10 * 1000; // 10 seconds
+  const HEALTH_CHECK_INTERVAL_MS = 10 * 1000;
 
   while (isRunning) {
     await sleep(HEALTH_CHECK_INTERVAL_MS);
@@ -1036,7 +1178,6 @@ module.exports = {
     }
 
     this.startCacheCleanupLoop();
-
     this.startDbHealthCheckLoop();
     logger.info(
       'poller.start: database health check loop started'
@@ -1051,6 +1192,13 @@ module.exports = {
     logger.info(
       'poller.start: root TF candle open loop started'
     );
+
+    // NEW: keepalive ping
+    try {
+      startKeepAliveLoop();
+    } catch (err) {
+      logger.debug({ err }, 'poller.start: failed to start keepalive loop');
+    }
   },
 
   async initialScan(options = {}) {
@@ -2095,7 +2243,8 @@ module.exports = {
                       tvSource: activeSignal?.meta?.tvSource || 'tradingview',
                       mtfScore: mtfValidation.mtfScore,
                       positiveCount: mtfValidation.positiveCount,
-                      totalCount: mtfValidation.totalCount
+                      totalCount: mtfValidation.totalCount,
+                      suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
                     }
                   });
 
@@ -2521,8 +2670,93 @@ module.exports = {
 
               if (signal) {
                 const acceptThreshold = 0.7;
-                const isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
-                const decision = isHighConfidence ? 'accept' : 'monitor';
+                let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
+                let decision = isHighConfidence ? 'accept' : 'monitor';
+
+                // NEW: 1D MA structural filter
+                try {
+                  const normalizedTf = normalizeRootTf(tf);
+                  if (normalizedTf === 'D') {
+                    if (typeof macdUtil.is1dMaStructure === 'function') {
+                      const passed1dStructure = await macdUtil.is1dMaStructure(symbol);
+
+                      if (!passed1dStructure) {
+                        logger.info(
+                          { symbol, tf, latestOpen },
+                          'poller: 1d MA structure check failed; downgrading to monitor'
+                        );
+                        decision = 'monitor';
+                        isHighConfidence = false;
+                      }
+                    } else {
+                      logger.warn(
+                        { symbol, tf },
+                        'poller: macdUtil.is1dMaStructure missing; treating as failed and downgrading to monitor'
+                      );
+                      decision = 'monitor';
+                      isHighConfidence = false;
+                    }
+                  }
+                } catch (err) {
+                  logger.debug({ err, symbol, tf }, 'poller: 1d MA structure check threw; downgrading to monitor');
+                  decision = 'monitor';
+                  isHighConfidence = false;
+                }
+
+                // NEW: liquidity gate
+                if (decision === 'accept') {
+                  try {
+                    const liq = await checkRealtimeLiquidity(symbol);
+                    if (!liq.ok) {
+                      logger.info(
+                        { symbol, depthUsdt: liq.depthUsdt },
+                        'poller: liquidity gate blocked accept; downgrading to monitor'
+                      );
+                      decision = 'monitor';
+                      isHighConfidence = false;
+                    }
+                    if (!signal.meta) signal.meta = {};
+                    signal.meta.liquidityDepthUsdt = liq.depthUsdt;
+                  } catch (err) {
+                    logger.debug({ err, symbol }, 'poller: realtime liquidity check failed unexpectedly');
+                  }
+                }
+
+                // NEW: 1D consecutive root signal limit - max 2 accept signals
+                try {
+                  const normalizedTf = normalizeRootTf(tf);
+                  if (decision === 'accept' && normalizedTf === 'D') {
+                    resetStaleConsecutive1dCounts();
+
+                    const current = getConsecutive1dCount(symbol);
+                    const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
+
+                    if (current >= maxAllowed) {
+                      logger.info(
+                        { symbol, current, maxAllowed },
+                        'poller: 1d consecutive accept limit reached; downgrading to monitor'
+                      );
+                      decision = 'monitor';
+                      isHighConfidence = false;
+                    } else {
+                      incrementConsecutive1dCount(symbol);
+                    }
+                  }
+                } catch (err) {
+                  logger.debug({ err, symbol }, 'poller: consecutive 1d count check failed');
+                }
+
+                // NEW: internal technical rating if configured
+                if (!signal.meta) signal.meta = {};
+                if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
+                  try {
+                    const rating = await macdUtil.computeTechnicalRating(symbol, tf);
+                    signal.meta.technicalRating = rating;
+                  } catch (err) {
+                    logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
+                    signal.meta.technicalRating = null;
+                  }
+                }
 
                 const finalSignal = {
                   ...signal,
@@ -2540,7 +2774,8 @@ module.exports = {
                       ? 'mtf_high_confidence'
                       : 'mtf_monitor_required',
                     tvScore: Number(signal?.meta?.tvScore ?? signal?.tvScore ?? 0),
-                    tvSource: signal?.meta?.tvSource || 'tradingview'
+                    tvSource: signal?.meta?.tvSource || 'tradingview',
+                    suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
                   }
                 };
 
@@ -2612,6 +2847,11 @@ module.exports = {
           );
 
           if (tfSignals.length > 0) {
+            for (const s of tfSignals) {
+              if (!s.meta) s.meta = {};
+              s.meta.suppressDetailedTelegram = !config.TELEGRAM_PUSH_FULL;
+            }
+
             const queued = notificationQueue.enqueueRootCandleOpenBatch(
               tfSignals,
               tf,
@@ -2690,14 +2930,17 @@ module.exports = {
         logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
       }
 
-      const acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
-      const monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
+      let acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
+      let monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
+
+      acceptedSignals = sortByRootTfPriority(acceptedSignals);
+      monitorSignals = sortByRootTfPriority(monitorSignals);
 
       if (acceptedSignals.length > 0) {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
-          reason: 'MTF alignment high-confidence (≥ 70%)',
+          reason: 'MTF alignment high-confidence (≥ 70%) + 1D structure/liquidity gates passed',
           signals: acceptedSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
@@ -2716,7 +2959,7 @@ module.exports = {
         const monitorBlock = {
           actionType: 'MONITOR',
           count: monitorSignals.length,
-          reason: 'MTF alignment below high-confidence threshold (< 70%)',
+          reason: 'MTF alignment below high-confidence threshold or gate checks failed',
           signals: monitorSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
@@ -2782,6 +3025,7 @@ module.exports = {
 
       try {
         clearExpiredProcessedSignalKeys(60 * 60 * 1000);
+        resetStaleConsecutive1dCounts();
 
         logger.debug(
           {
@@ -2792,7 +3036,8 @@ module.exports = {
             restFallbackCooldownsSize: restFallbackCooldowns.size,
             inMemoryStateCacheSize: inMemoryStateCache.size,
             macdFlipTrackerSize: macdFlipTracker.size,
-            dbIsHealthy
+            dbIsHealthy,
+            consecutive1dTradeCountsSize: consecutive1dTradeCounts.size
           },
           'poller: cache cleanup cycle completed'
         );
@@ -2807,6 +3052,12 @@ module.exports = {
 
   stop() {
     isRunning = false;
+
+    if (keepaliveIntervalHandle) {
+      clearInterval(keepaliveIntervalHandle);
+      keepaliveIntervalHandle = null;
+    }
+
     logger.info('poller: stopping loops');
   }
 };
