@@ -35,6 +35,48 @@ module.exports = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
 
+  // NEW: root signal trade-open guard
+  MAX_CONSECUTIVE_ROOT_SIGNALS_1D: Number(
+    process.env.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2
+  ),
+
+  // NEW: root TF trade priority for signal ordering / accept recommendation
+  ROOT_TF_TRADE_PRIORITY: parseList(
+    process.env.ROOT_TF_TRADE_PRIORITY || '240,D,60'
+  ),
+
+  // NEW: keepalive ping for free tier / idle termination prevention
+  ENABLE_KEEPALIVE_PING: envBool(
+    'ENABLE_KEEPALIVE_PING',
+    false
+  ),
+  KEEPALIVE_URL: process.env.KEEPALIVE_URL || '',
+  KEEPALIVE_INTERVAL_MS: Number(
+    process.env.KEEPALIVE_INTERVAL_MS || 5 * 60 * 1000
+  ),
+
+  // NEW: Telegram push behaviour
+  // If false: summary + recommended + MTF blocks still emit; detailed signal per item is suppressed.
+  TELEGRAM_PUSH_FULL: envBool(
+    'TELEGRAM_PUSH_FULL',
+    true
+  ),
+
+  // NEW: prefer internal technical rating instead of external TV rating
+  USE_INTERNAL_TECHNICAL_RATING: envBool(
+    'USE_INTERNAL_TECHNICAL_RATING',
+    true
+  ),
+
+  // NEW: single real-time liquidity gate before trade-open accept
+  LIQUIDITY_CHECK_ENABLED: envBool(
+    'LIQUIDITY_CHECK_ENABLED',
+    false
+  ),
+  LIQUIDITY_MIN_USDT_DEPTH: Number(
+    process.env.LIQUIDITY_MIN_USDT_DEPTH || 5000
+  ),
+
   ROOT_TFS: parseList(process.env.ROOT_TFS || '60,240,D'),
   MTF_TFS: parseList(process.env.MTF_TFS || '5,15,60,240,D'),
 
