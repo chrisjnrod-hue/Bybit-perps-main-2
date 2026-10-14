@@ -20,7 +20,7 @@ const wsManager = require('../services/bybitWs');
 const poller = require('../services/poller');
 const config = require('../config');
 const bybitRest = require('../services/bybitRest');
-const marketData = require('../services/marketData'); // <- added for admin seeding/inspection
+const marketData = require('../services/marketData'); // <- used by admin seeding/inspection
 
 let manualIntervalId = null;
 
@@ -45,7 +45,7 @@ function msToNext5m() {
   return Math.max(0, next - d);
 }
 
-// Admin guard for the new endpoints
+// Admin guard for the admin endpoints
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 // simple admin guard (checks header X-ADMIN-TOKEN or query admin_token)
@@ -166,7 +166,11 @@ router.post('/scan', (req, res) => {
     setImmediate(async () => {
       try {
         logger.info('Manual background scan started');
-        await poller.scanOnce();
+        if (typeof poller.scanOnce === 'function') {
+          await poller.scanOnce();
+        } else {
+          logger.warn('poller.scanOnce not available');
+        }
         logger.info('Manual background scan completed');
       } catch (err) {
         logger.error({ err }, 'Manual background scan failed');
@@ -232,7 +236,7 @@ router.post('/scan/stopInterval', (req, res) => {
   }
 });
 
-// Seed specific symbols
+// Seed specific symbols (existing handler)
 router.post('/seed', async (req, res) => {
   try {
     getDbOrThrow();
@@ -373,54 +377,90 @@ router.get('/bybit/db-info', (req, res) => {
 });
 
 /*
- * --- ADMIN: seeding and market-data inspection endpoints ---
+ * --- ADMIN: background seeding + market-data inspection endpoints ---
  *
- * GET/POST /debug/admin/seedMarketData?admin_token=...  (sequential, browser-friendly)
- * GET     /debug/admin/marketdata?symbol=SYMBOL&admin_token=...
+ * POST/GET /debug/admin/seedMarketData?admin_token=...  (starts background job; returns jobId)
+ * GET     /debug/admin/seedStatus?jobId=...&admin_token=...  (poll job status)
+ * GET     /debug/admin/marketdata?symbol=SYMBOL&admin_token=...  (inspect results)
  *
- * Protect with ADMIN_TOKEN env var. These endpoints are intentionally sequential and conservative
- * (MARKET_SEED_DELAY_MS controls ms between per-symbol update calls).
+ * Protect with ADMIN_TOKEN env var. The background seed is sequential and conservative by default.
  */
+
+// in-memory job registry (kept for 1 hour by default)
+const seedJobs = new Map(); // jobId -> { startedAt, status, processed, total, errors, limit }
 
 router.all('/admin/seedMarketData', requireAdmin, async (req, res) => {
   try {
     const db = getDbOrThrow();
-
-    const rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
+    let rows = db.prepare('SELECT symbol FROM symbols ORDER BY symbol COLLATE NOCASE ASC').all();
     if (!rows || rows.length === 0) {
       return res.json({ ok: true, message: 'no symbols in DB' });
     }
 
-    const delayMs = Number(process.env.MARKET_SEED_DELAY_MS || 500);
-    const results = [];
-
-    // run sequentially to avoid DB/HTTP rate-limits
-    for (const r of rows) {
-      const symbol = String(r.symbol || '').trim();
-      if (!symbol) continue;
-
-      try {
-        const out = await marketData.updateSymbolMarketData(symbol);
-        results.push({ symbol, ok: true, fetched: !!out });
-      } catch (err) {
-        results.push({ symbol, ok: false, error: String(err && err.message) });
-      }
-
-      if (delayMs > 0) {
-        // small sleep
-        await new Promise((rs) => setTimeout(rs, delayMs));
-      }
+    // optional ?limit=N to process only first N symbols (handy for testing)
+    const limitParam = req.query.limit || (req.body && req.body.limit) || null;
+    const limit = limitParam ? Math.max(1, Number(limitParam)) : null;
+    if (limit) {
+      rows = rows.slice(0, limit);
     }
 
-    return res.json({
-      ok: true,
-      count: results.length,
-      sample: results.slice(0, 50), // limit output
-      note: 'Seeding ran sequentially. Check logs for detailed info.'
+    const total = rows.length;
+    const jobId = `seed_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+    seedJobs.set(jobId, { startedAt: Date.now(), status: 'queued', processed: 0, total, errors: [], limit: limit || null });
+
+    // background worker
+    setImmediate(async () => {
+      const job = seedJobs.get(jobId);
+      if (!job) return;
+      job.status = 'running';
+      const delayMs = Number(process.env.MARKET_SEED_DELAY_MS || 500);
+
+      for (const r of rows) {
+        const symbol = String(r.symbol || '').trim();
+        if (!symbol) continue;
+
+        try {
+          await marketData.updateSymbolMarketData(symbol);
+          job.processed += 1;
+        } catch (err) {
+          job.processed += 1;
+          job.errors.push({ symbol, error: String(err && err.message) });
+          logger.debug({ err, symbol }, 'admin: marketData.updateSymbolMarketData failed for symbol (continuing)');
+        }
+
+        // respect configured delay between calls to be friendly to APIs
+        if (delayMs > 0) {
+          await new Promise((rs) => setTimeout(rs, delayMs));
+        }
+      }
+
+      job.status = 'completed';
+      job.completedAt = Date.now();
+
+      // auto-cleanup after 1 hour
+      setTimeout(() => {
+        seedJobs.delete(jobId);
+      }, 1000 * 60 * 60);
     });
+
+    return res.json({ ok: true, jobId, total, message: 'seeding started in background; poll /debug/admin/seedStatus?jobId=...' });
   } catch (err) {
     if (err.code === 'DB_NOT_READY') return res.status(503).json({ ok: false, error: err.message });
-    logger.error({ err }, 'admin/seedMarketData failed');
+    logger.error({ err }, 'admin/seedMarketData failed to start');
+    return res.status(500).json({ ok: false, error: String(err && err.message) });
+  }
+});
+
+// pollable status endpoint
+router.get('/admin/seedStatus', requireAdmin, (req, res) => {
+  try {
+    const jobId = String(req.query.jobId || '').trim();
+    if (!jobId) return res.status(400).json({ ok: false, error: 'jobId query param required' });
+    const job = seedJobs.get(jobId);
+    if (!job) return res.status(404).json({ ok: false, error: 'job not found or expired' });
+    return res.json({ ok: true, jobId, status: job });
+  } catch (err) {
+    logger.error({ err }, 'admin/seedStatus failed');
     return res.status(500).json({ ok: false, error: String(err && err.message) });
   }
 });
