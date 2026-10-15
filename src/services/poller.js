@@ -2673,32 +2673,29 @@ module.exports = {
                 let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
                 let decision = isHighConfidence ? 'accept' : 'monitor';
 
-                // NEW: 1D MA structural filter
+                // NEW: 1D structural criteria applied to all root TFs (60, 240, D)
                 try {
-                  const normalizedTf = normalizeRootTf(tf);
-                  if (normalizedTf === 'D') {
-                    if (typeof macdUtil.is1dMaStructure === 'function') {
-                      const passed1dStructure = await macdUtil.is1dMaStructure(symbol);
+                  if (typeof macdUtil.is1dMaStructure === 'function') {
+                    const passed1dStructure = await macdUtil.is1dMaStructure(symbol);
 
-                      if (!passed1dStructure) {
-                        logger.info(
-                          { symbol, tf, latestOpen },
-                          'poller: 1d MA structure check failed; downgrading to monitor'
-                        );
-                        decision = 'monitor';
-                        isHighConfidence = false;
-                      }
-                    } else {
-                      logger.warn(
-                        { symbol, tf },
-                        'poller: macdUtil.is1dMaStructure missing; treating as failed and downgrading to monitor'
+                    if (!passed1dStructure) {
+                      logger.info(
+                        { symbol, tf, latestOpen },
+                        'poller: 1d structural criteria failed; downgrading to monitor'
                       );
                       decision = 'monitor';
                       isHighConfidence = false;
                     }
+                  } else {
+                    logger.warn(
+                      { symbol, tf },
+                      'poller: macdUtil.is1dMaStructure missing; treating as failed and downgrading to monitor'
+                    );
+                    decision = 'monitor';
+                    isHighConfidence = false;
                   }
                 } catch (err) {
-                  logger.debug({ err, symbol, tf }, 'poller: 1d MA structure check threw; downgrading to monitor');
+                  logger.debug({ err, symbol, tf }, 'poller: 1d structural check threw; downgrading to monitor');
                   decision = 'monitor';
                   isHighConfidence = false;
                 }
