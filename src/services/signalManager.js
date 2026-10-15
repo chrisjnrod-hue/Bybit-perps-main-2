@@ -91,12 +91,46 @@ function calculateMtfScore(alignment) {
   return positiveCount / values.length;
 }
 
+// NEW: small helper to provide account equity (USD) to other modules
+async function getAccountEquityUsd() {
+  try {
+    if (tradeManager && typeof tradeManager.getAccountInfo === 'function') {
+      const info = await tradeManager.getAccountInfo();
+      if (info) {
+        // adapt to multiple possible shapes returned by tradeManager
+        const equityCandidates = [
+          info.equityUsd,
+          info.equity,
+          info.totalEquityUsd,
+          info.balanceUsd,
+          info.balance,
+          info.usdBalance
+        ];
+        for (const cand of equityCandidates) {
+          if (cand !== undefined && cand !== null && Number.isFinite(Number(cand))) {
+            const val = Number(cand);
+            if (val > 0) return val;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logger.debug({ err }, 'signalManager.getAccountEquityUsd: tradeManager.getAccountInfo failed');
+  }
+
+  const fallback = Number(config.DEFAULT_ACCOUNT_EQUITY_USD || 10000);
+  return fallback;
+}
+
 module.exports = {
   start() {
     logger.info('SignalManager started');
   },
 
   setOpenTradesAllowed,
+
+  // expose helper for account equity
+  getAccountEquityUsd,
 
   /**
    * Process a root, root-open, or mid-candle signal.
