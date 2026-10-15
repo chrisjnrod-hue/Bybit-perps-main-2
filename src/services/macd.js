@@ -1,24 +1,15 @@
-const { MACD, SMA } = require('technicalindicators');
+const { MACD } = require('technicalindicators');
 const dbModule = require('../db');
 const logger = require('pino')();
 const tradingview = require('./tradingview');
 const marketData = require('./marketData');
 
-const macdOptions = {
-  fastPeriod: 12,
-  slowPeriod: 26,
-  signalPeriod: 9,
-  SimpleMAOscillator: false,
-  SimpleMASignal: false
-};
+const macdOptions = { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false };
 
 module.exports = {
   async getKlineSeries(symbol, timeframe, limit = 500) {
     const db = dbModule.get();
-    const rows = db.prepare(
-      'SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?'
-    ).all(symbol, timeframe, limit);
-
+    const rows = db.prepare('SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?').all(symbol, timeframe, limit);
     return rows.map(r => ({ time: r.open_time, close: r.close }));
   },
 
@@ -27,10 +18,8 @@ module.exports = {
       const series = await this.getKlineSeries(symbol, timeframe, 500);
       const closes = series.map(s => s.close);
       if (closes.length < 35) return null;
-
       const macdInput = { values: closes, ...macdOptions };
       const out = MACD.calculate(macdInput);
-
       const offset = closes.length - out.length;
       const withTime = out.map((o, idx) => ({
         time: series[offset + idx].time,
@@ -38,7 +27,6 @@ module.exports = {
         signal: o.signal,
         histogram: o.histogram
       }));
-
       return withTime;
     } catch (err) {
       logger.debug({ err, symbol, timeframe }, 'computeMacdHistogram error');
@@ -48,6 +36,7 @@ module.exports = {
 
   /**
    * FIXED: isMacdFlip - Only detect FIRST candle flips (negative->positive)
+   * 
    * Prevents false positives from 2nd+ candle behavior.
    * Returns true ONLY if:
    *   - Previous candle histogram was negative (< 0)
@@ -59,9 +48,11 @@ module.exports = {
       const hist = await this.computeMacdHistogram(symbol, timeframe);
       if (!hist || hist.length < 2) return false;
 
-      const last = hist[hist.length - 1];
-      const prev = hist[hist.length - 2];
+      const last = hist[hist.length - 1];      // Current candle (most recent)
+      const prev = hist[hist.length - 2];      // Previous candle
 
+      // STRICT: negative -> positive (first candle flip only)
+      // Prevents 2nd candle noise from triggering signals
       if (prev.histogram < 0 && last.histogram > 0) {
         logger.info(
           { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
@@ -157,137 +148,59 @@ module.exports = {
   },
 
   /**
-   * NEW: is1dMaStructure
+   * NEW: Check 7/14/28 simple moving averages on daily series and return true
+   * if any point in the fetched history shows sma7 > sma14 > sma28.
    *
-   * This is the list of 1D criteria to be used for signal acceptance.
-   * It is applied to all root TFs, not just 1D.
-   *
-   * Returns true if ANY of these are true:
-   *  - Positive MACD histogram
-   *  - Negative but rising MACD histogram
-   *  - Current candle MACD flip (negative->positive)
-   *  - Structural MA order: SMA(7) > SMA(14) > SMA(28), anywhere in history or latest
-   *
-   * This means "old+new" crossings count; it does not require the crossing to be recent only.
+   * "new+old is fine" — so we search across the history provided by getKlineSeries.
    */
   async is1dMaStructure(symbol) {
     try {
-      // MACD checks first
-      const hist = await this.computeMacdHistogram(symbol, 'D');
-      if (hist && hist.length >= 1) {
-        const last = hist[hist.length - 1];
-        const prev = hist.length >= 2 ? hist[hist.length - 2] : null;
+      // fetch daily series; keep a reasonable lookback (200 daily candles)
+      const series = await this.getKlineSeries(symbol, 'D', 200);
+      if (!series || series.length < 28) return false;
 
-        // Positive histogram passes
-        if (typeof last.histogram === 'number' && last.histogram > 0) {
-          logger.debug({ symbol }, 'is1dMaStructure: positive MACD histogram detected');
-          return true;
-        }
+      const closes = series.map(s => Number(s.close)).filter(c => Number.isFinite(c));
+      const len = closes.length;
+      if (len < 28) return false;
 
-        // Negative but rising passes
-        if (prev && typeof prev.histogram === 'number' && typeof last.histogram === 'number') {
-          if (last.histogram < 0 && last.histogram > prev.histogram) {
-            logger.debug({ symbol }, 'is1dMaStructure: negative-but-rising MACD histogram detected');
-            return true;
+      // helper to compute SMA array for a given period
+      function computeSMAArray(values, period) {
+        const result = new Array(values.length).fill(null);
+        let sum = 0;
+        for (let i = 0; i < values.length; i++) {
+          sum += values[i];
+          if (i >= period) {
+            sum -= values[i - period];
+          }
+          if (i >= period - 1) {
+            result[i] = sum / period;
           }
         }
-
-        // MACD flip passes
-        try {
-          const flip = await this.isMacdFlip(symbol, 'D');
-          if (flip) {
-            logger.debug({ symbol }, 'is1dMaStructure: MACD flip detected');
-            return true;
-          }
-        } catch (e) {
-          logger.debug({ e, symbol }, 'is1dMaStructure: isMacdFlip threw error');
-        }
+        return result;
       }
 
-      // SMA structural check against daily closes
-      const series = await this.getKlineSeries(symbol, 'D', 400);
-      const closes = series.map(s => s.close);
+      const sma7 = computeSMAArray(closes, 7);
+      const sma14 = computeSMAArray(closes, 14);
+      const sma28 = computeSMAArray(closes, 28);
 
-      if (!closes || closes.length < 28) {
-        logger.debug({ symbol, length: closes.length }, 'is1dMaStructure: not enough candles for SMA check');
-        return false;
-      }
-
-      const sma7 = SMA.calculate({ period: 7, values: closes });
-      const sma14 = SMA.calculate({ period: 14, values: closes });
-      const sma28 = SMA.calculate({ period: 28, values: closes });
-
-      if (!sma28 || sma28.length === 0) {
-        return false;
-      }
-
-      const offset7 = sma7.length - sma28.length;
-      const offset14 = sma14.length - sma28.length;
-
-      // Check any historical or latest aligned index
-      for (let i = 0; i < sma28.length; i++) {
-        const a7 = sma7[offset7 + i];
-        const a14 = sma14[offset14 + i];
-        const a28 = sma28[i];
-
-        if (typeof a7 === 'number' && typeof a14 === 'number' && typeof a28 === 'number') {
-          if (a7 > a14 && a14 > a28) {
-            logger.debug({ symbol, idx: i }, 'is1dMaStructure: SMA7 > SMA14 > SMA28 detected');
+      // scan history - if any index satisfies sma7 > sma14 > sma28, return true
+      for (let i = 27; i < len; i++) {
+        const s7 = sma7[i];
+        const s14 = sma14[i];
+        const s28 = sma28[i];
+        if (typeof s7 === 'number' && typeof s14 === 'number' && typeof s28 === 'number') {
+          if (s7 > s14 && s14 > s28) {
+            logger.debug({ symbol, index: i, sma7: s7, sma14: s14, sma28: s28 }, 'is1dMaStructure: upward 7/14/28 observed in history');
             return true;
           }
         }
       }
 
-      const latest7 = sma7[sma7.length - 1];
-      const latest14 = sma14[sma14.length - 1];
-      const latest28 = sma28[sma28.length - 1];
-
-      if (
-        typeof latest7 === 'number' &&
-        typeof latest14 === 'number' &&
-        typeof latest28 === 'number'
-      ) {
-        if (latest7 > latest14 && latest14 > latest28) {
-          logger.debug({ symbol }, 'is1dMaStructure: latest SMA7 > SMA14 > SMA28 detected');
-          return true;
-        }
-      }
-
+      // no upward 7/14/28 crossing observed
       return false;
     } catch (err) {
       logger.debug({ err, symbol }, 'is1dMaStructure error');
       return false;
-    }
-  },
-
-  /**
-   * Basic internal technical rating aggregator.
-   * Returns numeric 0-100.
-   */
-  async computeTechnicalRating(symbol, timeframe) {
-    try {
-      const metrics = await this.getSignalMetrics(symbol, timeframe, []);
-      let score = 0;
-
-      const tv = Number(metrics.tv_score || 0);
-      score += Math.max(0, Math.min(100, tv)) * 0.4;
-
-      const rootMacd = metrics.root_macd;
-      if (rootMacd && typeof rootMacd.histogram === 'number') {
-        score += (rootMacd.histogram > 0 ? 20 : 0);
-      }
-
-      const mtf = metrics.mtf_status || {};
-      const total = Object.keys(mtf).length || 0;
-      if (total > 0) {
-        const pos = Object.values(mtf).filter(v => v === 'POSITIVE').length;
-        score += (pos / total) * 40;
-      }
-
-      return Math.round(Math.max(0, Math.min(100, score)));
-    } catch (err) {
-      logger.debug({ err, symbol, timeframe }, 'computeTechnicalRating error');
-      return 0;
     }
   }
 };
