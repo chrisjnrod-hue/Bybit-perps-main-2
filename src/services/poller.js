@@ -9,6 +9,7 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
+const marketData = require('./marketData'); // NEW: used by composite gate
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -822,19 +823,22 @@ function startKeepAliveLoop() {
   logger.info({ url, intervalMs }, 'poller.keepalive: started');
 }
 
-// NEW: realtime liquidity gate
-async function checkRealtimeLiquidity(symbol) {
+// NEW: realtime liquidity gate (EXTENDED)
+//
+// NOTE: updated to accept options and return computed thresholds for diagnostics.
+async function checkRealtimeLiquidity(symbol, options = {}) {
   if (!config.LIQUIDITY_CHECK_ENABLED) {
-    return { ok: true, depthUsdt: Infinity };
+    return { ok: true, depthUsdt: Infinity, computedMinDepth: 0 };
   }
 
   if (bybit && typeof bybit.fetchOrderBook === 'function') {
     try {
-      const book = await bybit.fetchOrderBook(symbol, 50);
+      const topLevels = Number(config.LIQUIDITY_CHECK_TOP_LEVELS || 10);
+      const book = await bybit.fetchOrderBook(symbol, Math.max(10, topLevels));
       const bids = Array.isArray(book?.bids) ? book.bids : [];
       let depthUsdt = 0;
 
-      for (const bid of bids.slice(0, 10)) {
+      for (const bid of bids.slice(0, topLevels)) {
         const price = Number(bid?.[0] ?? 0);
         const qty = Number(bid?.[1] ?? 0);
         if (Number.isFinite(price) && Number.isFinite(qty)) {
@@ -842,15 +846,94 @@ async function checkRealtimeLiquidity(symbol) {
         }
       }
 
-      const minDepth = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 0);
-      return { ok: depthUsdt >= minDepth, depthUsdt };
+      // Determine dynamic threshold if provided by caller options
+      const accountEquityUsd = Number(options.accountEquityUsd || 0);
+      const targetPositionFrac = Number(config.TARGET_POSITION_FRAC || 0.01);
+      const baseTargetPositionUsd = Math.max(1, accountEquityUsd * targetPositionFrac);
+      const depthMultiplier = Number(options.depthMultiplierOverride || config.LIQUIDITY_DEPTH_MULTIPLIER || 3);
+      const minDepthAbsolute = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 1000);
+      const computedMinDepth = Math.max(minDepthAbsolute, Math.round(baseTargetPositionUsd * depthMultiplier));
+
+      const ok = depthUsdt >= computedMinDepth;
+
+      return { ok, depthUsdt, computedMinDepth };
     } catch (err) {
       logger.debug({ err, symbol }, 'poller: realtime liquidity check failed; allowing by default');
-      return { ok: true, depthUsdt: 0 };
+      return { ok: true, depthUsdt: 0, computedMinDepth: 0 };
     }
   }
 
-  return { ok: true, depthUsdt: 0 };
+  return { ok: true, depthUsdt: 0, computedMinDepth: 0 };
+}
+
+// NEW: compute dynamic thresholds for depth and 24h volume based on account equity
+function computeLiquidityAndVolumeThresholds({
+  accountEquityUsd = 0,
+  targetPositionFrac = Number(config.TARGET_POSITION_FRAC || 0.01),
+  depthMultiplier = Number(config.LIQUIDITY_DEPTH_MULTIPLIER || 3),
+  minDepthAbsolute = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 1000),
+  volumeMultiplier = Number(config.MIN_24H_VOLUME_MULTIPLIER || 5),
+  min24hVolumeAbsolute = Number(config.MIN_24H_VOLUME_ABSOLUTE || 5000)
+} = {}) {
+  const targetPositionUsd = Math.max(1, accountEquityUsd * targetPositionFrac);
+  const minDepth = Math.max(minDepthAbsolute, Math.round(targetPositionUsd * depthMultiplier));
+  const min24hVolume = Math.max(min24hVolumeAbsolute, Math.round(targetPositionUsd * volumeMultiplier));
+  return { targetPositionUsd, minDepth, min24hVolume };
+}
+
+// NEW: composite gate - checks both realtime depth and 24h volume and optional volume-change
+async function passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd = 0 } = {}) {
+  try {
+    // Gather market metrics (24h volume, volume_change_pct)
+    let mdata = null;
+    try {
+      if (marketData && typeof marketData.updateSymbolMarketData === 'function') {
+        mdata = await marketData.updateSymbolMarketData(symbol);
+      }
+    } catch (err) {
+      logger.debug({ err, symbol }, 'poller: marketData.updateSymbolMarketData failed for composite gate');
+      mdata = null;
+    }
+
+    const { targetPositionUsd, minDepth, min24hVolume } = computeLiquidityAndVolumeThresholds({
+      accountEquityUsd
+    });
+
+    // Realtime depth
+    const liqRes = await checkRealtimeLiquidity(symbol, { accountEquityUsd, depthMultiplierOverride: undefined });
+
+    const passDepth = typeof liqRes.ok === 'boolean' ? liqRes.ok : false;
+
+    const vol24h = Number(mdata?.volume_24h_usdt || 0);
+    const pass24h = vol24h >= min24hVolume;
+
+    // Optional volume-change check (if configured). Default is permissive.
+    const volChangePct = (mdata && typeof mdata.volume_change_pct !== 'undefined') ? Number(mdata.volume_change_pct) : null;
+    const minVolChangePct = Number(config.MIN_24H_VOLUME_CHANGE_PCT ?? -1000);
+    const passVolChange = volChangePct === null ? true : (volChangePct >= minVolChangePct);
+
+    const ok = passDepth && pass24h && passVolChange;
+
+    return {
+      ok,
+      details: {
+        liq: liqRes,
+        depthUsdt: liqRes.depthUsdt,
+        computedMinDepth: liqRes.computedMinDepth || minDepth,
+        passDepth,
+        vol24h,
+        min24hVolume,
+        pass24h,
+        volChangePct,
+        minVolChangePct,
+        passVolChange,
+        targetPositionUsd
+      }
+    };
+  } catch (err) {
+    logger.debug({ err, symbol }, 'poller: composite liquidity/volume gate threw, defaulting to allow');
+    return { ok: true, details: { error: err && err.message } };
+  }
 }
 
 async function validateMtfAlignmentConsensus(symbol) {
@@ -2719,22 +2802,34 @@ module.exports = {
                   isHighConfidence = false;
                 }
 
-                // NEW: liquidity gate
+                // NEW: composite liquidity + volume gate (replaces simple depth-only gate)
                 if (decision === 'accept') {
                   try {
-                    const liq = await checkRealtimeLiquidity(symbol);
-                    if (!liq.ok) {
+                    // obtain account equity from signalManager (uses tradeManager.getAccountInfo or config fallback)
+                    let accountEquityUsd = 0;
+                    try {
+                      if (typeof signalManager.getAccountEquityUsd === 'function') {
+                        accountEquityUsd = Number(await signalManager.getAccountEquityUsd()) || 0;
+                      }
+                    } catch (err) {
+                      logger.debug({ err, symbol }, 'poller: failed to get accountEquityUsd from signalManager');
+                    }
+
+                    const composite = await passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd });
+
+                    if (!composite.ok) {
                       logger.info(
-                        { symbol, depthUsdt: liq.depthUsdt },
-                        'poller: liquidity gate blocked accept; downgrading to monitor'
+                        { symbol, composite },
+                        'poller: composite liquidity/volume gate blocked accept; downgrading to monitor'
                       );
                       decision = 'monitor';
                       isHighConfidence = false;
                     }
+
                     if (!signal.meta) signal.meta = {};
-                    signal.meta.liquidityDepthUsdt = liq.depthUsdt;
+                    signal.meta.liquidityGate = composite.details || {};
                   } catch (err) {
-                    logger.debug({ err, symbol }, 'poller: realtime liquidity check failed unexpectedly');
+                    logger.debug({ err, symbol }, 'poller: composite liquidity/volume check failed unexpectedly');
                   }
                 }
 
