@@ -35,6 +35,14 @@ module.exports = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
 
+  // NEW: account sizing / risk scaling
+  DEFAULT_ACCOUNT_EQUITY_USD: Number(
+    process.env.DEFAULT_ACCOUNT_EQUITY_USD || 10000
+  ),
+  TARGET_POSITION_FRAC: Number(
+    process.env.TARGET_POSITION_FRAC || 0.01
+  ),
+
   // NEW: root signal trade-open guard
   MAX_CONSECUTIVE_ROOT_SIGNALS_1D: Number(
     process.env.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2
@@ -75,6 +83,33 @@ module.exports = {
   ),
   LIQUIDITY_MIN_USDT_DEPTH: Number(
     process.env.LIQUIDITY_MIN_USDT_DEPTH || 5000
+  ),
+
+  // NEW: dynamic liquidity requirements scaled by equity
+  LIQUIDITY_DEPTH_MULTIPLIER: Number(
+    process.env.LIQUIDITY_DEPTH_MULTIPLIER || 3
+  ),
+  LIQUIDITY_CHECK_TOP_LEVELS: Number(
+    process.env.LIQUIDITY_CHECK_TOP_LEVELS || 10
+  ),
+
+  // NEW: dynamic 24h volume floor scaled by equity
+  MIN_24H_VOLUME_MULTIPLIER: Number(
+    process.env.MIN_24H_VOLUME_MULTIPLIER || 5
+  ),
+  MIN_24H_VOLUME_ABSOLUTE: Number(
+    process.env.MIN_24H_VOLUME_ABSOLUTE || 5000
+  ),
+
+  // NEW: optional volume change check in composite gate
+  MIN_24H_VOLUME_CHANGE_PCT: Number(
+    process.env.MIN_24H_VOLUME_CHANGE_PCT || -1000
+  ),
+
+  // NEW: log-only mode before enforcing liquidity gate
+  LIQUIDITY_GATE_DRY_RUN: envBool(
+    'LIQUIDITY_GATE_DRY_RUN',
+    true
   ),
 
   ROOT_TFS: parseList(process.env.ROOT_TFS || '60,240,D'),
@@ -209,10 +244,6 @@ module.exports = {
     process.env.MIN_24H_USDT_VOLUME || 0
   ),
 
-  MIN_24H_VOLUME_CHANGE_PCT: Number(
-    process.env.MIN_24H_VOLUME_CHANGE_PCT || -9999
-  ),
-
   COINGECKO_ENABLED:
     process.env.COINGECKO_ENABLED === 'true',
 
@@ -304,5 +335,27 @@ module.exports = {
 
   ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS: Number(
     process.env.ROOT_CANDLE_OPEN_SCAN_INTERVAL_SECS || 60
+  ),
+
+  // NEW: TradingView scanner tuning
+  TV_REQUEST_TIMEOUT_MS: Number(
+    process.env.TV_REQUEST_TIMEOUT_MS || 12000
+  ),
+
+  TRADINGVIEW_EXCHANGE_CANDIDATES: String(
+    process.env.TRADINGVIEW_EXCHANGE_CANDIDATES || 'BYBIT,BINANCE,KUCOIN'
+  ),
+
+  TV_USE_SYMBOL_SEARCH: envBool(
+    'TV_USE_SYMBOL_SEARCH',
+    true
+  ),
+
+  TV_SYMBOL_SEARCH_LIMIT: Number(
+    process.env.TV_SYMBOL_SEARCH_LIMIT || 20
+  ),
+
+  TV_CACHE_TTL_MS: Number(
+    process.env.TV_CACHE_TTL_MS || 3600000
   )
 };
