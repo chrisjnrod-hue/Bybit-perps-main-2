@@ -940,17 +940,30 @@ async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
 
   const alignmentValues = Object.values(alignment || {});
+  const totalCount = alignmentValues.length;
 
-  if (alignmentValues.length === 0) {
+  if (totalCount === 0) {
     return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
   }
 
+  // Accept both boolean and object shapes returned by evaluateMtfAlignment
   const positiveCount = alignmentValues.filter((value) => {
-    return value && value.positive === true;
+    if (typeof value === 'boolean') {
+      return value === true;
+    }
+
+    if (value && typeof value === 'object') {
+      // prefer explicit .positive flag, otherwise treat the object as truthy
+      if (typeof value.positive !== 'undefined') {
+        return value.positive === true;
+      }
+      return !!value;
+    }
+
+    return !!value;
   }).length;
 
-  const totalCount = alignmentValues.length;
-  const mtfScore = positiveCount / totalCount;
+  const mtfScore = totalCount > 0 ? positiveCount / totalCount : 0;
 
   const threshold = Number(
     config.MTF_ALIGNMENT_RATING || 0.6
@@ -2296,7 +2309,7 @@ module.exports = {
             if (latestOpen > processedOpen) {
               const activeSignals = latestSignals.filter((signal) => {
                 return (
-                  signal.symbol === symbol &&
+                  String(signal.symbol || '').toUpperCase() === String(symbol || '').toUpperCase() &&
                   normalizeRootTf(signal.root_tf) === tf
                 );
               });
@@ -2973,10 +2986,8 @@ module.exports = {
             }
           }
 
-          const existingState = Number(safeGetState(processedStateKey) || 0);
-          if (existingState < latestOpen) {
-            safeSetState(processedStateKey, latestOpen);
-          }
+          // FIX: do not blindly mark non-flip candles as processed.
+          // This was suppressing later valid flips for the same candle.
         } catch (err) {
           logger.debug(
             { err, symbol, tf },
