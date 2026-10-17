@@ -7,17 +7,33 @@ const marketData = require('./marketData');
 const macdOptions = { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9, SimpleMAOscillator: false, SimpleMASignal: false };
 
 module.exports = {
+  /**
+   * Fetch kline series (time, close) from DB ordered oldest -> newest.
+   * limit defaults to 500.
+   */
   async getKlineSeries(symbol, timeframe, limit = 500) {
-    const db = dbModule.get();
-    const rows = db.prepare('SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?').all(symbol, timeframe, limit);
-    return rows.map(r => ({ time: r.open_time, close: r.close }));
+    try {
+      const db = dbModule.get();
+      const rows = db.prepare(
+        'SELECT open_time, close FROM klines WHERE symbol=? AND timeframe=? ORDER BY open_time ASC LIMIT ?'
+      ).all(symbol, timeframe, limit);
+      return rows.map(r => ({ time: r.open_time, close: r.close }));
+    } catch (err) {
+      logger.debug({ err, symbol, timeframe }, 'getKlineSeries error');
+      return [];
+    }
   },
 
+  /**
+   * Compute MACD histogram series for a given symbol/timeframe.
+   * Returns array of { time, MACD, signal, histogram } aligned with kline times.
+   */
   async computeMacdHistogram(symbol, timeframe) {
     try {
       const series = await this.getKlineSeries(symbol, timeframe, 500);
-      const closes = series.map(s => s.close);
-      if (closes.length < 35) return null;
+      const closes = series.map(s => Number(s.close));
+      if (!Array.isArray(closes) || closes.length < 35) return null;
+
       const macdInput = { values: closes, ...macdOptions };
       const out = MACD.calculate(macdInput);
       const offset = closes.length - out.length;
@@ -35,13 +51,8 @@ module.exports = {
   },
 
   /**
-   * FIXED: isMacdFlip - Only detect FIRST candle flips (negative->positive)
-   * 
-   * Prevents false positives from 2nd+ candle behavior.
-   * Returns true ONLY if:
-   *   - Previous candle histogram was negative (< 0)
-   *   - Current candle histogram is positive (> 0)
-   *   - This is a 1st candle flip (clean transition)
+   * Detect a strict MACD flip (previous histogram < 0 and last histogram > 0).
+   * Only returns true for the first candle flip (negative -> positive).
    */
   async isMacdFlip(symbol, timeframe) {
     try {
@@ -51,8 +62,6 @@ module.exports = {
       const last = hist[hist.length - 1];      // Current candle (most recent)
       const prev = hist[hist.length - 2];      // Previous candle
 
-      // STRICT: negative -> positive (first candle flip only)
-      // Prevents 2nd candle noise from triggering signals
       if (prev.histogram < 0 && last.histogram > 0) {
         logger.info(
           { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
@@ -68,6 +77,60 @@ module.exports = {
     }
   },
 
+  /**
+   * Return true if the latest daily histogram is > 0.
+   */
+  async isDailyHistogramPositive(symbol) {
+    try {
+      const hist = await this.computeMacdHistogram(symbol, 'D');
+      if (!hist || hist.length < 1) return false;
+
+      const last = hist[hist.length - 1];
+      const value = Number(last?.histogram ?? NaN);
+      if (!Number.isFinite(value)) return false;
+      return value > 0;
+    } catch (err) {
+      logger.debug({ err, symbol }, 'isDailyHistogramPositive error');
+      return false;
+    }
+  },
+
+  /**
+   * Detect daily histogram that is still negative but rising (previous < last < 0).
+   * This captures "negative but improving toward positive".
+   */
+  async isDailyHistNegativeButRising(symbol) {
+    try {
+      const hist = await this.computeMacdHistogram(symbol, 'D');
+      if (!hist || hist.length < 2) return false;
+
+      const last = hist[hist.length - 1];
+      const prev = hist[hist.length - 2];
+
+      const lastVal = Number(last?.histogram ?? NaN);
+      const prevVal = Number(prev?.histogram ?? NaN);
+
+      if (!Number.isFinite(lastVal) || !Number.isFinite(prevVal)) return false;
+
+      // rising and still negative
+      if (prevVal < lastVal && lastVal < 0) {
+        logger.debug(
+          { symbol, prevHistogram: prevVal, lastHistogram: lastVal },
+          'isDailyHistNegativeButRising: daily MACD histogram negative but rising'
+        );
+        return true;
+      }
+
+      return false;
+    } catch (err) {
+      logger.debug({ err, symbol }, 'isDailyHistNegativeButRising error');
+      return false;
+    }
+  },
+
+  /**
+   * Multi-timeframe status helper: for each timeframe give POSITIVE / NEGATIVE / UNKNOWN
+   */
   async getMtfStatus(symbol, tfs = []) {
     const status = {};
     for (const tf of tfs) {
@@ -93,6 +156,9 @@ module.exports = {
     return status;
   },
 
+  /**
+   * Gather signal metrics including tradingview score, mtf status, root macd, and market data.
+   */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
       let tvScore = 0;
@@ -148,10 +214,8 @@ module.exports = {
   },
 
   /**
-   * NEW: Check 7/14/28 simple moving averages on daily series and return true
+   * Check 7/14/28 simple moving averages on daily series and return true
    * if any point in the fetched history shows sma7 > sma14 > sma28.
-   *
-   * "new+old is fine" — so we search across the history provided by getKlineSeries.
    */
   async is1dMaStructure(symbol) {
     try {
