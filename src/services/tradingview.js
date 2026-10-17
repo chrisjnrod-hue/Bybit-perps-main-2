@@ -43,27 +43,46 @@ function normalizeRecommendToScore(recommend) {
 }
 
 /**
- * findRecommendInRow
- * Scans a TradingView row.d array for the most plausible Recommend.All value (1..5)
- * Returns null if none found.
+ * parseRecommendFromResponse(json, preferColumnName)
+ * Uses json.columns (if present) to find the exact index of the Recommend.All column.
+ * Falls back to a safe scan only if no column info is present.
  */
-function findRecommendInRow(d = []) {
-  if (!Array.isArray(d)) return null;
+function parseRecommendFromResponse(json, preferColumnName = 'Recommend.All') {
+  if (!json || !Array.isArray(json.data) || json.data.length === 0) return null;
 
-  // First pass: find the first numeric value strictly between 1..5 (inclusive)
-  for (const v of d) {
-    if (typeof v === 'number' && v >= 1 && v <= 5) {
-      return v;
+  const row = json.data[0];
+  const d = Array.isArray(row.d) ? row.d : [];
+
+  // If server provided column metadata, use it to find Recommend.All explicitly
+  if (Array.isArray(json.columns) && json.columns.length > 0) {
+    // json.columns entries may look like "Recommend.All|1" or "Recommend.All"
+    const idx = json.columns.findIndex((c) => {
+      if (!c) return false;
+      const cc = String(c).toLowerCase();
+      return cc.startsWith(preferColumnName.toLowerCase());
+    });
+
+    if (idx >= 0 && typeof d[idx] !== 'undefined' && d[idx] !== null) {
+      const val = d[idx];
+      const parsed = (typeof val === 'number') ? val
+        : (typeof val === 'string' && val.trim() !== '') ? Number(val)
+        : (val && typeof val === 'object' && typeof val.v !== 'undefined') ? Number(val.v)
+        : NaN;
+      return Number.isFinite(parsed) ? parsed : null;
     }
   }
 
-  // Second pass: sometimes data comes as strings, try parse
+  // Fallback: robust scanning but prefer numbers in 1..5 and ignore other small numerics that resemble RSI etc.
   for (const v of d) {
+    if (typeof v === 'number' && v >= 1 && v <= 5) return v;
     if (typeof v === 'string') {
-      const parsed = Number(v);
-      if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 5) {
-        return parsed;
-      }
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 1 && n <= 5) return n;
+    }
+    if (v && typeof v === 'object') {
+      // sometimes fields are objects {v: <value>, fmt: ...}
+      const n = typeof v.v !== 'undefined' ? Number(v.v) : NaN;
+      if (Number.isFinite(n) && n >= 1 && n <= 5) return n;
     }
   }
 
@@ -71,12 +90,13 @@ function findRecommendInRow(d = []) {
 }
 
 /**
- * tryScannerForTicker
- * Performs the TV scanner POST for a ticker like "BYBIT:BTCUSDT" and returns a validated score object or null.
+ * tryScannerForTicker (robust)
+ * Uses explicit column metadata and adds Origin/Referer headers to better match web requests.
  */
 async function tryScannerForTicker(ticker, timeoutMs = TV_REQUEST_TIMEOUT_MS) {
   const body = {
     symbols: { tickers: [ticker], query: { types: [] } },
+    // keep Recommend.All first to increase chance server returns it in expected index
     columns: ['Recommend.All|1', 'Recommend.Other|1', 'RSI|14', 'momentum|14']
   };
 
@@ -89,7 +109,9 @@ async function tryScannerForTicker(ticker, timeoutMs = TV_REQUEST_TIMEOUT_MS) {
       body: JSON.stringify(body),
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; bot)'
+        'User-Agent': 'Mozilla/5.0 (compatible; bot)',
+        'Origin': 'https://www.tradingview.com',
+        'Referer': 'https://www.tradingview.com/'
       },
       signal: controller.signal
     });
@@ -102,20 +124,20 @@ async function tryScannerForTicker(ticker, timeoutMs = TV_REQUEST_TIMEOUT_MS) {
     }
 
     const json = await res.json().catch(() => null);
-    if (!json || !Array.isArray(json.data) || json.data.length === 0) {
-      return null;
-    }
+    if (!json) return null;
 
-    const row = json.data[0];
-    const recommend = findRecommendInRow(row.d);
+    // Prefer parsing using columns metadata
+    const recommend = parseRecommendFromResponse(json, 'Recommend.All');
 
     if (recommend === null) {
-      // log raw row.d for debugging at debug level (do not noisy in INFO)
-      logger.debug({ ticker, rawRow: row.d }, 'TV scanner: no Recommend.All found in row.d');
+      logger.debug({ ticker, jsonSnippet: { columns: json.columns?.slice?.(0,10), row: json.data?.[0]?.d?.slice?.(0,10) } }, 'TV scanner: Recommend.All not found in response');
       return null;
     }
 
-    const { score, scorePct } = normalizeRecommendToScore(recommend);
+    // convert 1..5 to 0..1 and pct
+    const clamped = Math.max(1, Math.min(5, Number(recommend)));
+    const score = (clamped - 1) / 4;
+    const scorePct = Math.round(score * 100);
 
     return {
       source: 'tradingview',
@@ -123,7 +145,8 @@ async function tryScannerForTicker(ticker, timeoutMs = TV_REQUEST_TIMEOUT_MS) {
       score_pct: scorePct,
       scorePct,
       tvScore: scorePct,
-      raw: row.d,
+      raw: json.data?.[0]?.d || [],
+      columns: json.columns || [],
       exchange: ticker.split(':')[0] || null
     };
   } catch (err) {
@@ -167,7 +190,9 @@ async function findCanonicalTvTicker(symbol, exchangeCandidates = DEFAULT_EXCHAN
       const pick = preferred || json[0];
       if (pick && pick.symbol) {
         // ensure proper formatting "EXCHANGE:SYMBOL"
-        return String(pick.symbol).toUpperCase();
+        const resolved = String(pick.symbol).toUpperCase();
+        logger.debug({ symbol, exchange: ex, resolved, pick }, 'TV symbol_search picked ticker');
+        return resolved;
       }
     } catch (err) {
       logger.debug({ err, symbol, ex }, 'TV symbol_search attempt failed; continuing to next exchange');
@@ -179,7 +204,7 @@ async function findCanonicalTvTicker(symbol, exchangeCandidates = DEFAULT_EXCHAN
 /**
  * fetchTvRatingForSymbol with improved reliability:
  * - tries configured exchanges in priority order
- * - validates Recommend.All by scanning returned row.d
+ * - validates Recommend.All by scanning returned row.d and columns metadata
  * - optionally uses symbol_search fallback to find canonical ticker
  */
 async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
@@ -397,7 +422,12 @@ async function testTvApi(symbol = 'BTCUSDT') {
       const res = await fetch(TV_SCANNER_URL, {
         method: 'POST',
         body: JSON.stringify(body),
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (compatible; bot)',
+          'Origin': 'https://www.tradingview.com',
+          'Referer': 'https://www.tradingview.com/'
+        },
         signal: controller.signal
       });
 
@@ -408,7 +438,7 @@ async function testTvApi(symbol = 'BTCUSDT') {
         const json = await res.json().catch(() => null);
         const row = json?.data?.[0];
         const d = row?.d ?? [];
-        const recommend = findRecommendInRow(d);
+        const recommend = parseRecommendFromResponse(json, 'Recommend.All');
         const rawScore = (typeof recommend === 'number') ? Math.max(0, Math.min(1, (recommend - 1) / 4)) : null;
         results.push({
           exchange: ex,
@@ -417,7 +447,8 @@ async function testTvApi(symbol = 'BTCUSDT') {
           response_time_ms: elapsed,
           recommend,
           score: rawScore !== null ? Math.round(rawScore * 100) / 100 : 'N/A',
-          rawRow: d
+          rawRow: d,
+          columns: json?.columns || []
         });
       } else {
         results.push({
