@@ -1,3 +1,4 @@
+// macd.js
 const { MACD } = require('technicalindicators');
 const dbModule = require('../db');
 const logger = require('pino')();
@@ -293,24 +294,83 @@ module.exports = {
         }
       }
 
-      // Optionally, allow a very short lookback to capture very recent structure (last 1-3 candles).
-      // If you want that behavior, change lookback to >1 and uncomment the loop below.
-      /*
-      for (let i = Math.max(27, len - 3); i < len; i++) {
-        const s7i = sma7[i], s14i = sma14[i], s28i = sma28[i];
-        if (typeof s7i === 'number' && typeof s14i === 'number' && typeof s28i === 'number') {
-          if (s7i > s14i && s14i > s28i) {
-            logger.debug({ symbol, index: i, sma7: s7i, sma14: s14i, sma28: s28i }, 'is1dMaStructure: upward 7/14/28 observed recently');
-            return true;
-          }
-        }
-      }
-      */
-
       return false;
     } catch (err) {
       logger.debug({ err, symbol }, 'is1dMaStructure error');
       return false;
+    }
+  },
+
+  /**
+   * NEW: evaluate1dRootGate
+   * Centralized 1D gating logic for root-signals.
+   */
+  async evaluate1dRootGate(symbol) {
+    try {
+      const klineSeries = await this.getKlineSeries(symbol, 'D', 300);
+      if (!Array.isArray(klineSeries) || klineSeries.length < 35) {
+        return { passed: false, reason: 'insufficient_daily_data', details: { klineCount: (klineSeries || []).length } };
+      }
+
+      const hist = await this.computeMacdHistogram(symbol, 'D');
+      if (!Array.isArray(hist) || hist.length < 2) {
+        return { passed: false, reason: 'insufficient_daily_macd', details: { histCount: (hist || []).length } };
+      }
+
+      const last = hist[hist.length - 1];
+      const prev = hist[hist.length - 2];
+
+      const prevHistogram = Number.isFinite(Number(prev?.histogram)) ? Number(prev.histogram) : null;
+      const lastHistogram = Number.isFinite(Number(last?.histogram)) ? Number(last.histogram) : null;
+
+      const dailyFlip = prevHistogram !== null && lastHistogram !== null && prevHistogram < 0 && lastHistogram > 0;
+      const dailyHistPositive = lastHistogram !== null && lastHistogram > 0;
+      const dailyHistNegativeRising =
+        prevHistogram !== null &&
+        lastHistogram !== null &&
+        prevHistogram < lastHistogram &&
+        lastHistogram < 0;
+
+      const closes = klineSeries.map((c) => Number(c.close)).filter((v) => Number.isFinite(v));
+      const computeSMA = (vals, period) => {
+        if (!Array.isArray(vals) || vals.length < period) return null;
+        const slice = vals.slice(vals.length - period);
+        return slice.reduce((s, v) => s + v, 0) / slice.length;
+      };
+
+      const sma7 = computeSMA(closes, 7);
+      const sma14 = computeSMA(closes, 14);
+      const sma28 = computeSMA(closes, 28);
+
+      const maStructure = (typeof sma7 === 'number' && typeof sma14 === 'number' && typeof sma28 === 'number')
+        ? (sma7 > sma14 && sma14 > sma28)
+        : false;
+
+      const passed = dailyFlip || (maStructure && (dailyHistPositive || dailyHistNegativeRising));
+      const reason = passed
+        ? (dailyFlip ? 'daily_flip' : 'ma_structure_with_daily_confluence')
+        : 'daily_gate_failed';
+
+      return {
+        passed,
+        reason,
+        dailyFlip,
+        dailyHistPositive,
+        dailyHistNegativeRising,
+        maStructure,
+        prevHistogram,
+        lastHistogram,
+        sma7,
+        sma14,
+        sma28,
+        details: {
+          klineCount: closes.length,
+          histCount: hist.length
+        }
+      };
+    } catch (err) {
+      logger.debug({ err, symbol }, 'evaluate1dRootGate: unexpected error');
+      return { passed: false, reason: 'exception', error: err && err.message };
     }
   }
 };
