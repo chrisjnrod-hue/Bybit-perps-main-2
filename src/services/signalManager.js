@@ -124,11 +124,11 @@ async function getAccountEquityUsd() {
 }
 
 // NEW: TradingView normalization helper
-function normalizeTvResult(tvRes) {
+function normalizeTvResult(tvRes = null, opts = {}) {
   // Normalize to:
-  // { score: 0..1, score_pct: 0..100, tvScore: 0..100, source: '...' }
+  // { score: 0..1, score_pct: 0..100, tvScore: 0..100, source: '...', raw: tvRes, fresh: boolean }
   if (!tvRes) {
-    return { score: 0, score_pct: 0, tvScore: 0, source: 'error' };
+    return { score: 0, score_pct: 0, tvScore: 0, source: 'error', raw: null, fresh: false };
   }
 
   const out = {
@@ -136,41 +136,83 @@ function normalizeTvResult(tvRes) {
     score_pct: 0,
     tvScore: 0,
     source: tvRes.source || tvRes.tvSource || 'unknown',
-    raw: tvRes
+    raw: tvRes,
+    fresh: true
   };
 
-  // tvRes may present as: { score: 0.x } or { score_pct: 70 } or { tvScore: 70 }
-  if (typeof tvRes.tvScore === 'number') {
-    out.tvScore = Math.min(100, Math.max(0, Number(tvRes.tvScore) || 0));
-    out.score_pct = out.tvScore;
-    out.score = out.tvScore / 100;
-    return out;
+  // Accept multiple shapes
+  let rawVal = null;
+  if (typeof tvRes.tvScore === 'number') rawVal = Number(tvRes.tvScore);
+  else if (typeof tvRes.score_pct === 'number') rawVal = Number(tvRes.score_pct);
+  else if (typeof tvRes.scorePct === 'number') rawVal = Number(tvRes.scorePct);
+  else if (typeof tvRes.score === 'number') rawVal = Number(tvRes.score);
+  else if (typeof tvRes.score === 'string' && !isNaN(Number(tvRes.score))) rawVal = Number(tvRes.score);
+
+  if (rawVal !== null && Number.isFinite(rawVal)) {
+    if (rawVal >= 0 && rawVal <= 1) {
+      out.score = rawVal;
+      out.score_pct = Math.round(rawVal * 100);
+      out.tvScore = out.score_pct;
+    } else {
+      const pct = Math.round(Math.max(0, Math.min(100, rawVal)));
+      out.score_pct = pct;
+      out.tvScore = pct;
+      out.score = pct / 100;
+    }
+  } else {
+    out.score = 0;
+    out.score_pct = 0;
+    out.tvScore = 0;
   }
 
-  if (typeof tvRes.score_pct === 'number') {
-    out.score_pct = Math.min(100, Math.max(0, Number(tvRes.score_pct) || 0));
-    out.tvScore = out.score_pct;
-    out.score = out.score_pct / 100;
-    return out;
+  // Freshness: optional TTL check
+  const ttl = Number(opts.tvCacheTtlMs || config.TV_CACHE_TTL_MS || (15 * 60 * 1000));
+  if (ttl > 0) {
+    const tsCandidates = [
+      tvRes.updatedAt,
+      tvRes.updated_at,
+      tvRes.timestamp,
+      tvRes.ts,
+      tvRes.fetched_at
+    ];
+    const ts = tsCandidates.find((v) => typeof v === 'number' || (typeof v === 'string' && !isNaN(Number(v))));
+    if (ts) {
+      const tsNum = Number(ts);
+      if (Date.now() - tsNum > ttl) {
+        out.fresh = false;
+      }
+    }
   }
 
-  if (typeof tvRes.score === 'number') {
-    // assume 0..1
-    out.score = Math.min(1, Math.max(0, Number(tvRes.score) || 0));
-    out.score_pct = Math.round(out.score * 100);
-    out.tvScore = out.score_pct;
-    return out;
-  }
-
-  if (typeof tvRes.scorePct === 'number') {
-    out.score_pct = Math.min(100, Math.max(0, Number(tvRes.scorePct) || 0));
-    out.tvScore = out.score_pct;
-    out.score = out.score_pct / 100;
-    return out;
-  }
-
-  // Fallback to zero
   return out;
+}
+
+/**
+ * Compute combined confidence (0..100) used by poller/signalManager.
+ * - mtfScore is 0..1
+ * - tvNormalized is the result of normalizeTvResult(...)
+ *
+ * Options:
+ * - weights: { mtf: 0..1, tv: 0..1 } (defaults mtf:0.8, tv:0.2)
+ * - tvStalePenalty: fraction to reduce tv weight when tvNormalized.fresh===false (default 0.5)
+ */
+function computeCombinedConfidence(mtfScore = 0, tvNormalized = null, opts = {}) {
+  const weights = opts.weights || { mtf: 0.8, tv: 0.2 };
+  const tvStalePenalty = typeof opts.tvStalePenalty === 'number' ? opts.tvStalePenalty : 0.5;
+
+  const mtfPart = Math.max(0, Math.min(1, Number(mtfScore || 0))) * (weights.mtf || 0.8);
+
+  let tvPart = 0;
+  if (tvNormalized && typeof tvNormalized.score === 'number') {
+    const tvWeight = (weights.tv || 0.2) * (tvNormalized.fresh === false ? tvStalePenalty : 1);
+    tvPart = Math.max(0, Math.min(1, Number(tvNormalized.score || 0))) * tvWeight;
+  }
+
+  // Normalize to 0..1 range relative to sum of weights
+  const weightSum = (weights.mtf || 0.8) + (weights.tv || 0.2) * (tvNormalized && tvNormalized.fresh === false ? tvStalePenalty : 1);
+  const normalized = weightSum > 0 ? (mtfPart + tvPart) / weightSum : 0;
+
+  return Math.round(Math.max(0, Math.min(100, normalized * 100)));
 }
 
 module.exports = {
@@ -182,6 +224,10 @@ module.exports = {
 
   // expose helper for account equity
   getAccountEquityUsd,
+
+  // expose tv normalizer & confidence
+  normalizeTvResult,
+  computeCombinedConfidence,
 
   /**
    * Process a root, root-open, or mid-candle signal.
@@ -287,7 +333,7 @@ module.exports = {
       /*
        * Fetch the cached or fresh TradingView rating and normalize it.
        */
-      let tv = { score: 0, score_pct: 0, tvScore: 0, source: 'error', raw: null };
+      let tv = { score: 0, score_pct: 0, tvScore: 0, source: 'error', raw: null, fresh: false };
 
       try {
         logger.debug(
@@ -311,14 +357,16 @@ module.exports = {
           score_pct: normalized.score_pct,
           tvScore: normalized.tvScore,
           source: normalized.source,
-          raw: normalized.raw
+          raw: normalized.raw,
+          fresh: normalized.fresh
         };
 
         logger.info(
           {
             symbol,
             tvScore: tv.tvScore,
-            source: tv.source
+            source: tv.source,
+            fresh: tv.fresh
           },
           'TV rating acquired (normalized)'
         );
@@ -388,7 +436,8 @@ module.exports = {
               score_pct: norm.score_pct,
               tvScore: norm.tvScore,
               source: 'computed_fallback',
-              raw: fallback
+              raw: norm.raw,
+              fresh: norm.fresh
             };
 
             logger.info(
