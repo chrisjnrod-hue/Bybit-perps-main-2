@@ -1,3 +1,4 @@
+// signalManager.js
 const dbModule = require('../db');
 const macd = require('./macd');
 const tradeManager = require('./tradeManager');
@@ -122,6 +123,56 @@ async function getAccountEquityUsd() {
   return fallback;
 }
 
+// NEW: TradingView normalization helper
+function normalizeTvResult(tvRes) {
+  // Normalize to:
+  // { score: 0..1, score_pct: 0..100, tvScore: 0..100, source: '...' }
+  if (!tvRes) {
+    return { score: 0, score_pct: 0, tvScore: 0, source: 'error' };
+  }
+
+  const out = {
+    score: 0,
+    score_pct: 0,
+    tvScore: 0,
+    source: tvRes.source || tvRes.tvSource || 'unknown',
+    raw: tvRes
+  };
+
+  // tvRes may present as: { score: 0.x } or { score_pct: 70 } or { tvScore: 70 }
+  if (typeof tvRes.tvScore === 'number') {
+    out.tvScore = Math.min(100, Math.max(0, Number(tvRes.tvScore) || 0));
+    out.score_pct = out.tvScore;
+    out.score = out.tvScore / 100;
+    return out;
+  }
+
+  if (typeof tvRes.score_pct === 'number') {
+    out.score_pct = Math.min(100, Math.max(0, Number(tvRes.score_pct) || 0));
+    out.tvScore = out.score_pct;
+    out.score = out.score_pct / 100;
+    return out;
+  }
+
+  if (typeof tvRes.score === 'number') {
+    // assume 0..1
+    out.score = Math.min(1, Math.max(0, Number(tvRes.score) || 0));
+    out.score_pct = Math.round(out.score * 100);
+    out.tvScore = out.score_pct;
+    return out;
+  }
+
+  if (typeof tvRes.scorePct === 'number') {
+    out.score_pct = Math.min(100, Math.max(0, Number(tvRes.scorePct) || 0));
+    out.tvScore = out.score_pct;
+    out.score = out.score_pct / 100;
+    return out;
+  }
+
+  // Fallback to zero
+  return out;
+}
+
 module.exports = {
   start() {
     logger.info('SignalManager started');
@@ -144,6 +195,10 @@ module.exports = {
    *   midcandle_update
    *   mtf_alignment
    *   or another queue-supported type
+   *
+   * New optional params:
+   *   decisionOverride: { decision: 'accept'|'monitor'|'reject', reason: '...' }
+   *   metaOverride: arbitrary object to merge into persisted meta
    */
   async handleRootSignal({
     symbol,
@@ -152,7 +207,9 @@ module.exports = {
     candle_open_time = null,
     eventId = null,
     signalType = null,
-    notifyImmediately = true
+    notifyImmediately = true,
+    decisionOverride = null,
+    metaOverride = null
   } = {}) {
     if (!symbol || !root_tf) {
       logger.warn(
@@ -228,16 +285,9 @@ module.exports = {
       }
 
       /*
-       * Fetch the cached or fresh TradingView rating.
-       * Preserve both normalized score and percent value.
+       * Fetch the cached or fresh TradingView rating and normalize it.
        */
-      let tv = {
-        score: 0,
-        score_pct: 0,
-        scorePct: 0,
-        tvScore: 0,
-        source: 'error'
-      };
+      let tv = { score: 0, score_pct: 0, tvScore: 0, source: 'error', raw: null };
 
       try {
         logger.debug(
@@ -245,58 +295,33 @@ module.exports = {
           'handleRootSignal: fetching TV rating'
         );
 
-        const tvRes =
-          await tradingview.getOrFetchTvRatingCached(
-            symbol
-          );
-
-        if (tvRes) {
-          const normalizedScore =
-            typeof tvRes.score === 'number'
-              ? tvRes.score
-              : 0;
-
-          const rawPercent = Number(
-            tvRes.tvScore ??
-            tvRes.score_pct ??
-            tvRes.scorePct ??
-            (
-              typeof normalizedScore === 'number'
-                ? Math.round(normalizedScore * 100)
-                : 0
-            )
-          );
-
-          const safePercent = Number.isFinite(rawPercent)
-            ? Math.min(100, Math.max(0, rawPercent))
-            : 0;
-
-          tv = {
-            score: normalizedScore,
-            score_pct: safePercent,
-            scorePct: safePercent,
-            tvScore: safePercent,
-            source: tvRes.source || 'unknown'
-          };
-
-          logger.info(
-            {
-              symbol,
-              score: tv.score,
-              score_pct: tv.score_pct,
-              tvScore: tv.tvScore,
-              source: tv.source
-            },
-            'TV rating acquired'
-          );
+        // Prefer the cached helper if tradingview module exposes it.
+        let tvRes;
+        if (tradingview && typeof tradingview.getOrFetchTvRatingCached === 'function') {
+          tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
+        } else if (tradingview && typeof tradingview.fetchTvRatingForSymbol === 'function') {
+          tvRes = await tradingview.fetchTvRatingForSymbol(symbol);
         } else {
-          logger.warn(
-            {
-              symbol
-            },
-            'TV rating fetch returned invalid result'
-          );
+          tvRes = null;
         }
+
+        const normalized = normalizeTvResult(tvRes);
+        tv = {
+          score: normalized.score,
+          score_pct: normalized.score_pct,
+          tvScore: normalized.tvScore,
+          source: normalized.source,
+          raw: normalized.raw
+        };
+
+        logger.info(
+          {
+            symbol,
+            tvScore: tv.tvScore,
+            source: tv.source
+          },
+          'TV rating acquired (normalized)'
+        );
       } catch (err) {
         logger.warn(
           {
@@ -309,21 +334,37 @@ module.exports = {
 
       /*
        * Evaluate MTF alignment using the current MACD histogram data.
+       * If caller provided a decisionOverride, we will still fetch alignment
+       * to include in persisted meta, but we will not let it override the
+       * provided decision.
        */
-      const alignment =
-        await this.evaluateMtfAlignment(symbol);
+      let alignment = {};
+      let mtfScore = 0;
+      let computedDecision = null;
+      let computedReason = null;
 
-      const mtfScore =
-        calculateMtfScore(alignment);
+      try {
+        alignment = await this.evaluateMtfAlignment(symbol);
+        mtfScore = calculateMtfScore(alignment);
 
-      const decision =
-        await this.applyDecision(alignment);
+        // Only compute applyDecision if the caller did not pass a decisionOverride
+        if (!decisionOverride) {
+          const decisionObj = await this.applyDecision(alignment);
+          computedDecision = decisionObj && decisionObj.decision ? decisionObj.decision : 'monitor';
+          computedReason = decisionObj && decisionObj.reason ? decisionObj.reason : null;
+        } else {
+          computedDecision = decisionOverride.decision || 'monitor';
+          computedReason = decisionOverride.reason || null;
+        }
+      } catch (err) {
+        logger.debug({ err, symbol }, 'handleRootSignal: evaluateMtfAlignment/applyDecision failed');
+        // fallback
+        computedDecision = computedDecision || (decisionOverride ? decisionOverride.decision : 'monitor');
+      }
 
       /*
        * If TradingView failed or returned nothing, compute a fallback score
        * using MTF-positive fraction and available volume change.
-       * This prevents a force-zero TV score on symbols that are unsupported
-       * by TradingView but still have enough MTF/volume information.
        */
       if (
         (!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) &&
@@ -341,13 +382,13 @@ module.exports = {
             fallback &&
             Number.isFinite(Number(fallback.score_pct))
           ) {
+            const norm = normalizeTvResult(fallback);
             tv = {
-              score: Number(fallback.score) || 0,
-              score_pct: Number(fallback.score_pct) || 0,
-              scorePct: Number(fallback.scorePct) || Number(fallback.score_pct) || 0,
-              tvScore: Number(fallback.tvScore) || Number(fallback.score_pct) || 0,
+              score: norm.score,
+              score_pct: norm.score_pct,
+              tvScore: norm.tvScore,
               source: 'computed_fallback',
-              raw: null
+              raw: fallback
             };
 
             logger.info(
@@ -357,7 +398,7 @@ module.exports = {
                 volume_change_pct: mdata?.volume_change_pct,
                 fallbackScore: tv.score_pct
               },
-              'handleRootSignal: computed fallback TV score'
+              'handleRootSignal: computed fallback TV score (normalized)'
             );
           }
         } catch (err) {
@@ -371,41 +412,24 @@ module.exports = {
         }
       }
 
-      const meta = {
-        tvScore: Number(
-          tv.tvScore ??
-          tv.score_pct ??
-          tv.scorePct ??
-          0
-        ),
-        score_pct: Number(
-          tv.score_pct ??
-          tv.tvScore ??
-          tv.scorePct ??
-          0
-        ),
-        scorePct: Number(
-          tv.scorePct ??
-          tv.score_pct ??
-          tv.tvScore ??
-          0
-        ),
-        tvScoreNormalized: Number(
-          tv.score ?? 0
-        ),
+      /*
+       * Build meta and persist signal. If caller provided metaOverride, merge it in
+       * so poller or other callers can preserve enriched metadata.
+       */
+      const baseMeta = {
+        tvScore: Number(tv.tvScore || 0),
+        score_pct: Number(tv.score_pct || 0),
+        scorePct: Number(tv.score_pct || 0),
+        tvScoreNormalized: Number(tv.score || 0),
         tvSource: tv.source || 'error',
         mtfScore,
         alignment,
-        acceptReason:
-          decision && decision.reason
-            ? decision.reason
-            : null,
-        decision:
-          decision && decision.decision
-            ? decision.decision
-            : 'monitor',
+        acceptReason: computedReason,
+        decision: computedDecision || (decisionOverride ? decisionOverride.decision : 'monitor'),
         marketData: mdata || {}
       };
+
+      const meta = Object.assign({}, baseMeta, metaOverride || {});
 
       /*
        * Keep this insert compatible with the existing database API.
@@ -413,13 +437,21 @@ module.exports = {
        * notification queue even if the current schema has no eventId
        * or candle_open_time columns.
        */
-      dbModule.insertSignal({
-        symbol,
-        root_tf,
-        detected_at,
-        state: 'detected',
-        meta
-      });
+      try {
+        if (dbModule && typeof dbModule.insertSignal === 'function') {
+          dbModule.insertSignal({
+            symbol,
+            root_tf,
+            detected_at,
+            state: 'detected',
+            meta
+          });
+        } else {
+          logger.debug('handleRootSignal: dbModule.insertSignal not available; skipping DB insert');
+        }
+      } catch (err) {
+        logger.debug({ err, symbol, root_tf }, 'handleRootSignal: insertSignal failed (non-fatal)');
+      }
 
       const signalObj = {
         key,
@@ -472,12 +504,13 @@ module.exports = {
 
       /*
        * Trade opening is still performed only for accepted signals.
-       * Existing tradeManager safeguards should determine whether an
-       * already-open trade is allowed.
+       * Use the final decision (preference: decisionOverride -> computedDecision).
        */
+      const finalDecision = (decisionOverride && decisionOverride.decision) ? decisionOverride.decision : (computedDecision || 'monitor');
+
       if (
-        decision &&
-        decision.decision === 'accept'
+        finalDecision &&
+        finalDecision === 'accept'
       ) {
         if (!config.OPENTRADE) {
           logger.info(
