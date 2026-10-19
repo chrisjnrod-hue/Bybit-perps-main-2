@@ -10,6 +10,7 @@ const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
 const marketData = require('./marketData'); // NEW: used by composite gate
+const tradingview = require('./tradingview');
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -1242,6 +1243,185 @@ async function runDbHealthCheckLoop() {
     }
 
     lastDbConnectivityCheck = Date.now();
+  }
+}
+
+// ============================================================================
+// CENTRALIZED EVALUATION FUNCTION (NEW)
+// ============================================================================
+
+/**
+ * Evaluate a single root boundary candidate deterministically.
+ *
+ * Inputs:
+ *  - symbol (string)
+ *  - tf (string normalized by normalizeRootTf)
+ *  - candleOpenTime (number)
+ *
+ * Returns: object or null. Example:
+ * {
+ *   symbol, root_tf, candle_open_time,
+ *   decision: 'accept'|'monitor'|'reject',
+ *   reason: 'daily_flip'|'ma_structure_with_daily_confluence'|'low_liquidity'|...,
+ *   meta: { mtfValidation, dailyGate, liquidity, technicalRating, combinedConfidence, ... }
+ * }
+ *
+ * Note: This function DOES NOT itself call signalManager.handleRootSignal().
+ * The caller should persist/enqueue and then mark processedStateKey.
+ */
+async function evaluateRootBoundaryCandidate(symbol, tf, candleOpenTime) {
+  try {
+    if (!symbol || !tf || !Number.isFinite(Number(candleOpenTime))) return null;
+
+    const state = {
+      symbol,
+      root_tf: tf,
+      candle_open_time: candleOpenTime,
+      detected_at: Date.now()
+    };
+
+    // 1) Quick dedupe: same key processed?
+    const candidateBaseKey = `${String(symbol).toUpperCase()}|${String(tf)}|${Number(candleOpenTime) || 0}`;
+    if (processedEventKeys.has(`${candidateBaseKey}|rootcandle`) || processedEventKeys.has(`${candidateBaseKey}|ws_rootcandle`)) {
+      // already processed
+      return null;
+    }
+
+    // 2) Confirm MACD flip on this timeframe
+    const flip = await macdUtil.isMacdFlip(symbol, tf);
+    if (!flip) {
+      return null;
+    }
+
+    // 3) MTF alignment consensus
+    const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+
+    // 4) 1D gate - use the new macd.evaluate1dRootGate when available
+    let dailyGate = null;
+    if (typeof macdUtil.evaluate1dRootGate === 'function') {
+      try {
+        dailyGate = await macdUtil.evaluate1dRootGate(symbol);
+      } catch (err) {
+        logger.debug({ err, symbol }, 'evaluateRootBoundaryCandidate: evaluate1dRootGate threw, falling back');
+        dailyGate = { passed: false, reason: 'evaluate1d_exception' };
+      }
+    } else {
+      // fallback: simple checks
+      try {
+        const dailyFlip = await macdUtil.isMacdFlip(symbol, 'D');
+        const dailyPos = await macdUtil.isDailyHistogramPositive(symbol);
+        const dailyNegRising = await macdUtil.isDailyHistNegativeButRising(symbol);
+        const maStruct = typeof macdUtil.is1dMaStructure === 'function' ? await macdUtil.is1dMaStructure(symbol) : false;
+        dailyGate = {
+          passed: dailyFlip || (maStruct && (dailyPos || dailyNegRising)),
+          reason: dailyFlip ? 'daily_flip' : (maStruct ? 'ma_structure_with_daily_confluence' : 'daily_gate_failed'),
+          dailyFlip, dailyPos, dailyNegRising, maStruct
+        };
+      } catch (err) {
+        logger.debug({ err, symbol }, 'evaluateRootBoundaryCandidate: fallback daily checks threw');
+        dailyGate = { passed: false, reason: 'daily_check_failed' };
+      }
+    }
+
+    // Preliminary decision based on MTF
+    const acceptThreshold = Number(config.MTF_HIGH_CONFIDENCE_THRESHOLD || 0.7);
+    let decision = mtfValidation.mtfScore >= acceptThreshold ? 'accept' : 'monitor';
+
+    // Enforce daily gate: accept only if daily gate passed (even if mtf high)
+    if (decision === 'accept' && (!dailyGate || !dailyGate.passed)) {
+      decision = 'monitor';
+    }
+
+    // 5) If still 'accept', check composite liquidity/volume gate
+    let compositeDetails = null;
+    if (decision === 'accept') {
+      try {
+        let accountEquityUsd = 0;
+        if (typeof signalManager.getAccountEquityUsd === 'function') {
+          accountEquityUsd = Number(await signalManager.getAccountEquityUsd()) || 0;
+        }
+        const composite = await passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd });
+        compositeDetails = composite.details || composite;
+        if (!composite.ok) {
+          decision = 'monitor';
+        }
+      } catch (err) {
+        // if composite fails unexpectedly, don't block accept; log only
+        logger.debug({ err, symbol }, 'evaluateRootBoundaryCandidate: composite gate failed unexpectedly');
+      }
+    }
+
+    // 6) Consecutive 1D limit (if TF is D)
+    if (decision === 'accept' && normalizeRootTf(tf) === 'D') {
+      resetStaleConsecutive1dCounts();
+      const current = getConsecutive1dCount(symbol);
+      const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
+      if (current >= maxAllowed) {
+        decision = 'monitor';
+      }
+      // Do not increment here: increment only when accept is persisted by caller
+    }
+
+    // 7) Optionally compute technical rating if available
+    let technicalRating = null;
+    if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
+      try {
+        technicalRating = await macdUtil.computeTechnicalRating(symbol, tf);
+      } catch (err) {
+        logger.debug({ err, symbol }, 'evaluateRootBoundaryCandidate: computeTechnicalRating failed');
+      }
+    }
+
+    // 8) Build combined confidence using signalManager helpers if available
+    let combinedConfidence = null;
+    try {
+      // Fetch a TV normalized object via signalManager.normalizeTvResult if available, else try tradingview directly
+      let tvNormalized = null;
+      if (typeof signalManager.normalizeTvResult === 'function') {
+        try {
+          const tvRes = (tradingview && typeof tradingview.getOrFetchTvRatingCached === 'function')
+            ? await tradingview.getOrFetchTvRatingCached(symbol)
+            : null;
+          tvNormalized = signalManager.normalizeTvResult(tvRes || null);
+        } catch (err) {
+          tvNormalized = signalManager.normalizeTvResult(null);
+        }
+      }
+
+      if (typeof signalManager.computeCombinedConfidence === 'function') {
+        combinedConfidence = signalManager.computeCombinedConfidence(mtfValidation.mtfScore, tvNormalized, { weights: { mtf: 0.8, tv: 0.2 } });
+      } else {
+        combinedConfidence = Math.round((mtfValidation.mtfScore || 0) * 100);
+      }
+    } catch (err) {
+      logger.debug({ err, symbol }, 'evaluateRootBoundaryCandidate: combinedConfidence calc failed');
+      combinedConfidence = Math.round((mtfValidation.mtfScore || 0) * 100);
+    }
+
+    const result = {
+      symbol,
+      root_tf: tf,
+      candle_open_time: candleOpenTime,
+      detected_at: Date.now(),
+      eventId: buildEventId('rootcandle', symbol, tf, candleOpenTime),
+      decision,
+      reason: decision === 'accept' ? (dailyGate?.reason || 'accept_by_mtf') : (dailyGate ? dailyGate.reason : 'monitor_by_mtf'),
+      meta: {
+        mtfValidation,
+        dailyGate,
+        compositeDetails,
+        technicalRating,
+        combinedConfidence,
+        poller: {
+          evaluatedAt: Date.now()
+        }
+      }
+    };
+
+    return result;
+  } catch (err) {
+    logger.debug({ err, symbol, tf, candleOpenTime }, 'evaluateRootBoundaryCandidate: unexpected error');
+    return null;
   }
 }
 
@@ -2740,315 +2920,71 @@ module.exports = {
       let countPersistFailures = 0;
       let countNonFlipCandidates = 0;
 
+      // --- REPLACED: centralized candidate evaluation using evaluateRootBoundaryCandidate
       const candidatePromises = readyCandidates.map(async (candidate) => {
         const { symbol, tf, latestOpen, processedStateKey } = candidate;
 
         try {
-          const flipKey = `${symbol}|${tf}|${latestOpen}`;
-          if (macdFlipTracker.has(flipKey)) {
-            logger.debug(
-              { symbol, tf, latestOpen, flipKey },
-              'poller: skipping already-processed MACD flip'
-            );
-            return null;
-          }
+          // Evaluate candidate
+          const evalRes = await evaluateRootBoundaryCandidate(symbol, tf, latestOpen);
 
-          const flip = await macdUtil.isMacdFlip(symbol, tf);
-
-          if (!flip) {
-            // Do not mark non-flip candles as processed here: leave them so a later flip in the same candle can be detected.
+          if (!evalRes) {
+            // either no flip or dedup
             countNonFlipCandidates++;
+            // mark processed if it was deduped? already handled in evaluateRootBoundaryCandidate
             return null;
           }
 
-          // We have a MACD flip
-          countFlipDetected++;
-          logger.info(
-            { symbol, tf, latestOpen },
-            'poller: MACD flip detected'
-          );
+          // Build overrides for persistence
+          const decisionOverride = { decision: evalRes.decision, reason: evalRes.reason };
+          const metaOverride = Object.assign({}, evalRes.meta || {}, {
+            pollerEvaluatedAt: Date.now(),
+            suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
+          });
 
-          macdFlipTracker.set(flipKey, { firedAt: Date.now() });
-
-          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-          const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
-
-          const rootCandidate = {
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            candle_open_time: latestOpen,
-            eventId,
+          // Persist via signalManager (this will upsert into DB and optionally enqueue)
+          const persisted = await signalManager.handleRootSignal({
+            symbol: evalRes.symbol,
+            root_tf: evalRes.root_tf,
+            detected_at: evalRes.detected_at,
+            candle_open_time: evalRes.candle_open_time,
+            eventId: evalRes.eventId,
             signalType: 'rootcandle_update',
-            notifyImmediately: true
-          };
+            notifyImmediately: evalRes.decision === 'accept',
+            decisionOverride,
+            metaOverride
+          });
 
-          if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
-            logger.debug(
-              { symbol, tf, latestOpen, eventId },
-              'poller: skipping startup-batch duplicate root candle signal'
-            );
-            safeSetState(processedStateKey, latestOpen);
-            return null;
-          }
-
-          if (alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
-            logger.debug({ symbol, tf, latestOpen }, 'poller: root candidate already processed via dedupe');
-            safeSetState(processedStateKey, latestOpen);
-            return null;
-          }
-
-          // --- NEW FLOW: evaluate MTF -> 1D gating -> liquidity/consecutive -> THEN persist final signal
-          const acceptThreshold = 0.7;
-          let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
-
-          // start with preliminary decision based on mtf score
-          let decision = isHighConfidence ? 'accept' : 'monitor';
-
-          // --- 1) 1D gating (final rule):
-          // ACCEPT if:
-          //  - daily MACD flip is true
-          //  OR
-          //  - 7/14/28 MA structure is true AND (daily hist is positive OR daily hist is negative but rising)
-          // Negative-but-rising alone does NOT accept.
-          let passedDailyFlip = false;
-          let passedMaStructure = false;
-          let passedDailyHistogramPositive = false;
-          let passedDailyHistNegativeRising = false;
-
-          try {
-            try {
-              passedDailyFlip = await macdUtil.isMacdFlip(symbol, 'D');
-            } catch (err) {
-              logger.debug({ err, symbol }, 'poller: daily MACD flip check failed');
-            }
-
-            if (typeof macdUtil.is1dMaStructure === 'function') {
-              try {
-                passedMaStructure = await macdUtil.is1dMaStructure(symbol);
-              } catch (err) {
-                logger.debug({ err, symbol }, 'poller: is1dMaStructure threw');
-              }
-            } else {
-              logger.warn({ symbol }, 'poller: macdUtil.is1dMaStructure missing; cannot evaluate MA structure gate');
-            }
-
-            if (typeof macdUtil.isDailyHistogramPositive === 'function') {
-              try {
-                passedDailyHistogramPositive = await macdUtil.isDailyHistogramPositive(symbol);
-              } catch (err) {
-                logger.debug({ err, symbol }, 'poller: isDailyHistogramPositive threw');
-              }
-            }
-
-            if (typeof macdUtil.isDailyHistNegativeButRising === 'function') {
-              try {
-                passedDailyHistNegativeRising = await macdUtil.isDailyHistNegativeButRising(symbol);
-              } catch (err) {
-                logger.debug({ err, symbol }, 'poller: isDailyHistNegativeButRising threw');
-              }
-            }
-
-            const maStructureWithPositiveOrRising =
-              passedMaStructure && (passedDailyHistogramPositive || passedDailyHistNegativeRising);
-
-            const passed1dCriteria = passedDailyFlip || maStructureWithPositiveOrRising;
-
-            if (!passed1dCriteria) {
-              if (decision === 'accept') {
-                logger.info(
-                  {
-                    symbol,
-                    tf,
-                    latestOpen,
-                    passedDailyFlip,
-                    passedMaStructure,
-                    passedDailyHistogramPositive,
-                    passedDailyHistNegativeRising
-                  },
-                  'poller: 1d criteria gate failed; downgrading preliminary accept to monitor'
-                );
-              }
-              decision = 'monitor';
-              isHighConfidence = false;
-              countFailed1d++;
-            } else {
-              logger.info(
-                {
-                  symbol,
-                  tf,
-                  latestOpen,
-                  passedDailyFlip,
-                  passedMaStructure,
-                  passedDailyHistogramPositive,
-                  passedDailyHistNegativeRising
-                },
-                'poller: 1d criteria gate passed'
-              );
-            }
-          } catch (err) {
-            logger.debug({ err, symbol, tf }, 'poller: 1d criteria gate threw; downgrading to monitor');
-            decision = 'monitor';
-            isHighConfidence = false;
-            countFailed1d++;
-          }
-
-          // --- 2) Composite liquidity/volume gate (only relevant if still 'accept')
-          let compositeDetails = null;
-          if (decision === 'accept') {
-            try {
-              let accountEquityUsd = 0;
-              try {
-                if (typeof signalManager.getAccountEquityUsd === 'function') {
-                  accountEquityUsd = Number(await signalManager.getAccountEquityUsd()) || 0;
-                } else if (typeof signalManager.getAccountEquityUsd === 'number') {
-                  accountEquityUsd = Number(signalManager.getAccountEquityUsd) || 0;
-                }
-              } catch (err) {
-                logger.debug({ err, symbol }, 'poller: failed to get accountEquityUsd from signalManager');
-              }
-
-              const composite = await passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd });
-              compositeDetails = composite.details || composite;
-
-              if (!composite.ok) {
-                logger.info(
-                  { symbol, composite },
-                  'poller: composite liquidity/volume gate blocked accept; downgrading to monitor'
-                );
-                decision = 'monitor';
-                isHighConfidence = false;
-                countFailedLiquidity++;
-              }
-            } catch (err) {
-              logger.debug({ err, symbol }, 'poller: composite liquidity/volume check failed unexpectedly');
-            }
-          }
-
-          // --- 3) Consecutive 1D limit (only relevant if still 'accept' and TF is D)
-          if (decision === 'accept') {
-            try {
-              const normalizedTf = normalizeRootTf(tf);
-              if (normalizedTf === 'D') {
-                resetStaleConsecutive1dCounts();
-                const current = getConsecutive1dCount(symbol);
-                const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
-
-                if (current >= maxAllowed) {
-                  logger.info({ symbol, current, maxAllowed }, 'poller: 1d consecutive accept limit reached; downgrading to monitor');
-                  decision = 'monitor';
-                  isHighConfidence = false;
-                  countRejectedByConsecutive1d++;
-                } else {
-                  incrementConsecutive1dCount(symbol);
-                }
-              }
-            } catch (err) {
-              logger.debug({ err, symbol }, 'poller: consecutive 1d count check failed');
-            }
-          }
-
-          // --- 4) Technical rating (optional)
-          let technicalRating = null;
-          try {
-            if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
-              technicalRating = await macdUtil.computeTechnicalRating(symbol, tf);
-            }
-          } catch (err) {
-            logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
-          }
-
-          // Build accept reasons list for meta
-          const accept1dCriteria = [];
-          if (passedDailyFlip) accept1dCriteria.push('daily_flip');
-          if (passedMaStructure) accept1dCriteria.push('ma_7_14_28');
-          if (passedDailyHistogramPositive) accept1dCriteria.push('daily_hist_positive');
-          if (passedDailyHistNegativeRising) accept1dCriteria.push('daily_hist_negative_rising');
-
-          const confidenceTag = isHighConfidence ? 'mtf_high_confidence' : 'mtf_monitor_required';
-          const acceptReasons = [confidenceTag, ...accept1dCriteria];
-          const acceptReasonStr = acceptReasons.join('+');
-
-          // Now we have the final decision — call handleRootSignal once with the final state/meta
-          try {
-            // Prepare overrides so the persisted signal reflects poller's final decision + meta
-            const decisionOverride = { decision, reason: acceptReasonStr || `poller_${decision}` };
-            const metaOverride = {
-              acceptReasons,
-              acceptReason: acceptReasonStr,
-              liquidityGate: compositeDetails || null,
-              technicalRating: technicalRating !== null ? technicalRating : null,
-              pollerMtfScore: mtfValidation.mtfScore,
-              pollerMtfAligned: mtfValidation.isAligned,
-              suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-            };
-
-            const persisted = await signalManager.handleRootSignal({
-              symbol,
-              root_tf: tf,
-              detected_at: Date.now(),
-              candle_open_time: latestOpen,
-              eventId,
-              signalType: 'rootcandle_update',
-              notifyImmediately: decision === 'accept',
-              decisionOverride,
-              metaOverride
-            });
-
-            if (!persisted) {
-              logger.info({ symbol, tf, latestOpen, eventId }, 'poller: handleRootSignal returned null after final evaluation');
-              safeSetState(processedStateKey, latestOpen);
-              countPersistFailures++;
-              return null;
-            }
-
-            // Ensure persisted.meta contains our poller metadata if not set by signalManager
-            if (!persisted.meta) persisted.meta = {};
-            persisted.meta = Object.assign({}, persisted.meta, metaOverride, {
-              mtfScore: mtfValidation.mtfScore,
-              mtfAligned: mtfValidation.isAligned,
-              decision,
-              acceptReason: acceptReasonStr
-            });
-
-            const finalSignal = {
-              ...persisted,
-              eventId,
-              notificationType: 'new_root_candle',
-              signalType: 'rootcandle_update',
-              state: decision,
-              meta: persisted.meta
-            };
-
-            logger.info(
-              {
-                symbol,
-                tf,
-                latestOpen,
-                eventId,
-                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                decision,
-                mtfAligned: mtfValidation.isAligned
-              },
-              'poller: root candle flip detected and persisted with final decision'
-            );
-
-            safeSetState(processedStateKey, latestOpen);
-            return finalSignal;
-          } catch (err) {
-            logger.debug({ err, symbol, tf }, 'poller: handleRootSignal (final) failed');
+          if (!persisted) {
+            logger.info({ symbol, tf, latestOpen, eventId: evalRes.eventId }, 'poller: handleRootSignal returned null after final evaluation');
             safeSetState(processedStateKey, latestOpen);
             countPersistFailures++;
             return null;
           }
-        } catch (err) {
-          logger.debug(
-            { err, symbol, tf },
-            'poller: error evaluating fast-path candidate'
-          );
-        }
 
-        return null;
+          // If persisted accepted and TF is D, increment consecutive count
+          if (evalRes.decision === 'accept' && normalizeRootTf(tf) === 'D') {
+            incrementConsecutive1dCount(symbol);
+          }
+
+          // Mark processed state and dedupe key AFTER successful persist
+          safeSetState(processedStateKey, latestOpen);
+          const dedupeKey = `${String(symbol).toUpperCase()}|${String(tf)}|${Number(latestOpen)}|rootcandle`;
+          processedEventKeys.set(dedupeKey, Date.now());
+
+          // Attach poller meta to persisted result for downstream logging
+          if (!persisted.meta) persisted.meta = {};
+          persisted.meta = Object.assign({}, persisted.meta, evalRes.meta || {}, { pollerEvaluatedAt: Date.now() });
+
+          return persisted;
+        } catch (err) {
+          logger.debug({ err, symbol, tf }, 'poller: error evaluating fast-path candidate');
+          // Ensure we mark processed to avoid repeated failures causing loops
+          try {
+            safeSetState(processedStateKey, latestOpen);
+          } catch (_) {}
+          return null;
+        }
       });
 
       const evaluatedResults = await Promise.all(candidatePromises);
@@ -3171,7 +3107,7 @@ module.exports = {
           mtfAligned: signal.meta?.mtfAligned || false,
           alignmentDetails: signal.meta?.alignment || {},
           acceptReason: signal.meta?.acceptReason || 'none',
-          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
+          confidence: signal.meta?.combinedConfidence ? `${signal.meta.combinedConfidence}%` : (signal.meta?.mtfScore ? `${(signal.meta.mtfScore*100).toFixed(1)}%` : 'N/A')
         };
 
         logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
