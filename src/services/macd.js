@@ -1,4 +1,3 @@
-// macd.js
 const { MACD } = require('technicalindicators');
 const dbModule = require('../db');
 const logger = require('pino')();
@@ -159,45 +158,25 @@ module.exports = {
 
   /**
    * Gather signal metrics including tradingview score, mtf status, root macd, and market data.
+   * FIXED: Added robust TradingView score scale normalization to ensure accurate scores (Issue 2)
    */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
-      // Normalize TV result helper (fallback if tradingview doesn't expose normalizer)
-      function normalizeLocalTv(tvRes) {
-        if (!tvRes) return { tvScore: 0, source: 'error', score: 0, score_pct: 0 };
-        if (typeof tvRes.tvScore === 'number') {
-          const tv = Math.min(100, Math.max(0, Number(tvRes.tvScore) || 0));
-          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
-        }
-        if (typeof tvRes.score_pct === 'number') {
-          const tv = Math.min(100, Math.max(0, Number(tvRes.score_pct) || 0));
-          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
-        }
-        if (typeof tvRes.score === 'number') {
-          const tv = Math.round(Math.min(1, Math.max(0, Number(tvRes.score) || 0)) * 100);
-          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
-        }
-        return { tvScore: 0, source: tvRes.source || tvRes.tvSource || 'unknown', score: 0, score_pct: 0 };
-      }
-
       let tvScore = 0;
       let tvSource = 'fallback';
       try {
-        let tvRes = null;
-        if (tradingview && typeof tradingview.getOrFetchTvRatingCached === 'function') {
-          tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
-        } else if (tradingview && typeof tradingview.fetchTvRatingForSymbol === 'function') {
-          tvRes = await tradingview.fetchTvRatingForSymbol(symbol);
-        } else {
-          tvRes = null;
+        const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
+        if (tvResult) {
+          const rawScore = Number(tvResult.tvScore ?? tvResult.score_pct ?? tvResult.score ?? 0);
+          if (rawScore >= -1.0 && rawScore <= 1.0) {
+            tvScore = ((rawScore + 1) / 2) * 100;
+          } else if (rawScore > 1.0 && rawScore <= 100.0) {
+            tvScore = rawScore;
+          } else {
+            tvScore = Math.min(100, Math.max(0, rawScore));
+          }
+          tvSource = tvResult.source || 'unknown';
         }
-
-        const normalized = (tradingview && typeof tradingview.normalizeTvResult === 'function')
-          ? tradingview.normalizeTvResult(tvRes)
-          : normalizeLocalTv(tvRes);
-
-        tvScore = normalized.tvScore || 0;
-        tvSource = normalized.source || 'unknown';
       } catch (e) {
         logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
         tvScore = 0;
@@ -246,14 +225,10 @@ module.exports = {
 
   /**
    * Check 7/14/28 simple moving averages on daily series and return true
-   * if the latest candle shows sma7 > sma14 > sma28.
-   *
-   * NOTE: previous implementation scanned entire history; updated to check
-   * the most recent candle (optional short lookback can be enabled).
+   * if any point in the fetched history shows sma7 > sma14 > sma28.
    */
   async is1dMaStructure(symbol) {
     try {
-      // fetch daily series; keep a reasonable lookback (200 daily candles)
       const series = await this.getKlineSeries(symbol, 'D', 200);
       if (!series || series.length < 28) return false;
 
@@ -261,7 +236,6 @@ module.exports = {
       const len = closes.length;
       if (len < 28) return false;
 
-      // helper to compute SMA array for a given period
       function computeSMAArray(values, period) {
         const result = new Array(values.length).fill(null);
         let sum = 0;
@@ -281,16 +255,15 @@ module.exports = {
       const sma14 = computeSMAArray(closes, 14);
       const sma28 = computeSMAArray(closes, 28);
 
-      // Check the most recent candle's SMA structure (current MA condition).
-      const idx = len - 1;
-      const s7 = sma7[idx];
-      const s14 = sma14[idx];
-      const s28 = sma28[idx];
-
-      if (typeof s7 === 'number' && typeof s14 === 'number' && typeof s28 === 'number') {
-        if (s7 > s14 && s14 > s28) {
-          logger.debug({ symbol, index: idx, sma7: s7, sma14: s14, sma28: s28 }, 'is1dMaStructure: upward 7/14/28 observed on latest candle');
-          return true;
+      for (let i = 27; i < len; i++) {
+        const s7 = sma7[i];
+        const s14 = sma14[i];
+        const s28 = sma28[i];
+        if (typeof s7 === 'number' && typeof s14 === 'number' && typeof s28 === 'number') {
+          if (s7 > s14 && s14 > s28) {
+            logger.debug({ symbol, index: i, sma7: s7, sma14: s14, sma28: s28 }, 'is1dMaStructure: upward 7/14/28 observed in history');
+            return true;
+          }
         }
       }
 
@@ -298,79 +271,6 @@ module.exports = {
     } catch (err) {
       logger.debug({ err, symbol }, 'is1dMaStructure error');
       return false;
-    }
-  },
-
-  /**
-   * NEW: evaluate1dRootGate
-   * Centralized 1D gating logic for root-signals.
-   */
-  async evaluate1dRootGate(symbol) {
-    try {
-      const klineSeries = await this.getKlineSeries(symbol, 'D', 300);
-      if (!Array.isArray(klineSeries) || klineSeries.length < 35) {
-        return { passed: false, reason: 'insufficient_daily_data', details: { klineCount: (klineSeries || []).length } };
-      }
-
-      const hist = await this.computeMacdHistogram(symbol, 'D');
-      if (!Array.isArray(hist) || hist.length < 2) {
-        return { passed: false, reason: 'insufficient_daily_macd', details: { histCount: (hist || []).length } };
-      }
-
-      const last = hist[hist.length - 1];
-      const prev = hist[hist.length - 2];
-
-      const prevHistogram = Number.isFinite(Number(prev?.histogram)) ? Number(prev.histogram) : null;
-      const lastHistogram = Number.isFinite(Number(last?.histogram)) ? Number(last.histogram) : null;
-
-      const dailyFlip = prevHistogram !== null && lastHistogram !== null && prevHistogram < 0 && lastHistogram > 0;
-      const dailyHistPositive = lastHistogram !== null && lastHistogram > 0;
-      const dailyHistNegativeRising =
-        prevHistogram !== null &&
-        lastHistogram !== null &&
-        prevHistogram < lastHistogram &&
-        lastHistogram < 0;
-
-      const closes = klineSeries.map((c) => Number(c.close)).filter((v) => Number.isFinite(v));
-      const computeSMA = (vals, period) => {
-        if (!Array.isArray(vals) || vals.length < period) return null;
-        const slice = vals.slice(vals.length - period);
-        return slice.reduce((s, v) => s + v, 0) / slice.length;
-      };
-
-      const sma7 = computeSMA(closes, 7);
-      const sma14 = computeSMA(closes, 14);
-      const sma28 = computeSMA(closes, 28);
-
-      const maStructure = (typeof sma7 === 'number' && typeof sma14 === 'number' && typeof sma28 === 'number')
-        ? (sma7 > sma14 && sma14 > sma28)
-        : false;
-
-      const passed = dailyFlip || (maStructure && (dailyHistPositive || dailyHistNegativeRising));
-      const reason = passed
-        ? (dailyFlip ? 'daily_flip' : 'ma_structure_with_daily_confluence')
-        : 'daily_gate_failed';
-
-      return {
-        passed,
-        reason,
-        dailyFlip,
-        dailyHistPositive,
-        dailyHistNegativeRising,
-        maStructure,
-        prevHistogram,
-        lastHistogram,
-        sma7,
-        sma14,
-        sma28,
-        details: {
-          klineCount: closes.length,
-          histCount: hist.length
-        }
-      };
-    } catch (err) {
-      logger.debug({ err, symbol }, 'evaluate1dRootGate: unexpected error');
-      return { passed: false, reason: 'exception', error: err && err.message };
     }
   }
 };
