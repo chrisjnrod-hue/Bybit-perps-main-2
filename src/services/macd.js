@@ -161,12 +161,42 @@ module.exports = {
    */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
+      // Normalize TV result helper (fallback if tradingview doesn't expose normalizer)
+      function normalizeLocalTv(tvRes) {
+        if (!tvRes) return { tvScore: 0, source: 'error', score: 0, score_pct: 0 };
+        if (typeof tvRes.tvScore === 'number') {
+          const tv = Math.min(100, Math.max(0, Number(tvRes.tvScore) || 0));
+          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
+        }
+        if (typeof tvRes.score_pct === 'number') {
+          const tv = Math.min(100, Math.max(0, Number(tvRes.score_pct) || 0));
+          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
+        }
+        if (typeof tvRes.score === 'number') {
+          const tv = Math.round(Math.min(1, Math.max(0, Number(tvRes.score) || 0)) * 100);
+          return { tvScore: tv, source: tvRes.source || tvRes.tvSource || 'unknown', score: tv / 100, score_pct: tv };
+        }
+        return { tvScore: 0, source: tvRes.source || tvRes.tvSource || 'unknown', score: 0, score_pct: 0 };
+      }
+
       let tvScore = 0;
       let tvSource = 'fallback';
       try {
-        const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
-        tvScore = tvResult && typeof tvResult.score === 'number' ? tvResult.score : 0;
-        tvSource = tvResult && tvResult.source ? tvResult.source : 'error';
+        let tvRes = null;
+        if (tradingview && typeof tradingview.getOrFetchTvRatingCached === 'function') {
+          tvRes = await tradingview.getOrFetchTvRatingCached(symbol);
+        } else if (tradingview && typeof tradingview.fetchTvRatingForSymbol === 'function') {
+          tvRes = await tradingview.fetchTvRatingForSymbol(symbol);
+        } else {
+          tvRes = null;
+        }
+
+        const normalized = (tradingview && typeof tradingview.normalizeTvResult === 'function')
+          ? tradingview.normalizeTvResult(tvRes)
+          : normalizeLocalTv(tvRes);
+
+        tvScore = normalized.tvScore || 0;
+        tvSource = normalized.source || 'unknown';
       } catch (e) {
         logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
         tvScore = 0;
@@ -215,7 +245,10 @@ module.exports = {
 
   /**
    * Check 7/14/28 simple moving averages on daily series and return true
-   * if any point in the fetched history shows sma7 > sma14 > sma28.
+   * if the latest candle shows sma7 > sma14 > sma28.
+   *
+   * NOTE: previous implementation scanned entire history; updated to check
+   * the most recent candle (optional short lookback can be enabled).
    */
   async is1dMaStructure(symbol) {
     try {
@@ -247,20 +280,33 @@ module.exports = {
       const sma14 = computeSMAArray(closes, 14);
       const sma28 = computeSMAArray(closes, 28);
 
-      // scan history - if any index satisfies sma7 > sma14 > sma28, return true
-      for (let i = 27; i < len; i++) {
-        const s7 = sma7[i];
-        const s14 = sma14[i];
-        const s28 = sma28[i];
-        if (typeof s7 === 'number' && typeof s14 === 'number' && typeof s28 === 'number') {
-          if (s7 > s14 && s14 > s28) {
-            logger.debug({ symbol, index: i, sma7: s7, sma14: s14, sma28: s28 }, 'is1dMaStructure: upward 7/14/28 observed in history');
+      // Check the most recent candle's SMA structure (current MA condition).
+      const idx = len - 1;
+      const s7 = sma7[idx];
+      const s14 = sma14[idx];
+      const s28 = sma28[idx];
+
+      if (typeof s7 === 'number' && typeof s14 === 'number' && typeof s28 === 'number') {
+        if (s7 > s14 && s14 > s28) {
+          logger.debug({ symbol, index: idx, sma7: s7, sma14: s14, sma28: s28 }, 'is1dMaStructure: upward 7/14/28 observed on latest candle');
+          return true;
+        }
+      }
+
+      // Optionally, allow a very short lookback to capture very recent structure (last 1-3 candles).
+      // If you want that behavior, change lookback to >1 and uncomment the loop below.
+      /*
+      for (let i = Math.max(27, len - 3); i < len; i++) {
+        const s7i = sma7[i], s14i = sma14[i], s28i = sma28[i];
+        if (typeof s7i === 'number' && typeof s14i === 'number' && typeof s28i === 'number') {
+          if (s7i > s14i && s14i > s28i) {
+            logger.debug({ symbol, index: i, sma7: s7i, sma14: s14i, sma28: s28i }, 'is1dMaStructure: upward 7/14/28 observed recently');
             return true;
           }
         }
       }
+      */
 
-      // no upward 7/14/28 crossing observed
       return false;
     } catch (err) {
       logger.debug({ err, symbol }, 'is1dMaStructure error');
