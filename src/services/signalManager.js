@@ -77,6 +77,37 @@ function buildFallbackMarketData() {
   };
 }
 
+// Canonicalize TradingView scores from either 0..1 or 0..100 styles.
+// This prevents bad tv_score math when values are emitted in inconsistent units.
+function normalizeTvScoreValue(value) {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+
+  if (typeof value === 'string') {
+    const cleaned = value.trim().replace(/%/g, '').replace(/,/g, '.');
+    const num = Number(cleaned);
+
+    if (!Number.isFinite(num)) {
+      return 0;
+    }
+
+    return num > 1
+      ? Math.min(100, Math.max(0, num))
+      : Math.min(100, Math.max(0, num * 100));
+  }
+
+  const num = Number(value);
+
+  if (!Number.isFinite(num)) {
+    return 0;
+  }
+
+  return num > 1
+    ? Math.min(100, Math.max(0, num))
+    : Math.min(100, Math.max(0, num * 100));
+}
+
 function calculateMtfScore(alignment) {
   const values = Object.values(alignment || {});
 
@@ -91,63 +122,13 @@ function calculateMtfScore(alignment) {
   return positiveCount / values.length;
 }
 
-/**
- * FIXED: Centralized robust TradingView score normalization handling multiple scales 
- * (-1 to 1 oscillators, 0 to 1 decimals, or 0 to 100 percentages) (Issue 2)
- */
-function normalizeTvScore(tvRes) {
-  if (!tvRes) {
-    return {
-      score: 0,
-      score_pct: 0,
-      scorePct: 0,
-      tvScore: 0,
-      source: 'error'
-    };
-  }
-
-  const rawScore = Number(
-    tvRes.tvScore ??
-    tvRes.score_pct ??
-    tvRes.scorePct ??
-    tvRes.score ??
-    0
-  );
-
-  const safeRaw = Number.isFinite(rawScore) ? rawScore : 0;
-
-  let normalizedScore = 0;
-  let percent = 0;
-
-  if (safeRaw >= -1.0 && safeRaw <= 1.0) {
-    percent = ((safeRaw + 1) / 2) * 100;
-    normalizedScore = safeRaw;
-  } else if (safeRaw > 1.0 && safeRaw <= 100.0) {
-    percent = safeRaw;
-    normalizedScore = safeRaw / 100;
-  } else {
-    percent = Math.min(100, Math.max(0, safeRaw));
-    normalizedScore = percent / 100;
-  }
-
-  const safePercent = Number.isFinite(percent)
-    ? Math.min(100, Math.max(0, percent))
-    : 0;
-
-  return {
-    score: normalizedScore,
-    score_pct: safePercent,
-    scorePct: safePercent,
-    tvScore: safePercent,
-    source: tvRes.source || 'unknown'
-  };
-}
-
+// NEW: small helper to provide account equity (USD) to other modules
 async function getAccountEquityUsd() {
   try {
     if (tradeManager && typeof tradeManager.getAccountInfo === 'function') {
       const info = await tradeManager.getAccountInfo();
       if (info) {
+        // adapt to multiple possible shapes returned by tradeManager
         const equityCandidates = [
           info.equityUsd,
           info.equity,
@@ -179,8 +160,22 @@ module.exports = {
 
   setOpenTradesAllowed,
 
+  // expose helper for account equity
   getAccountEquityUsd,
 
+  /**
+   * Process a root, root-open, or mid-candle signal.
+   *
+   * notifyImmediately:
+   *   true  - enqueue immediately
+   *   false - return the signal to the caller so the caller can batch it
+   *
+   * signalType:
+   *   new_root_candle
+   *   midcandle_update
+   *   mtf_alignment
+   *   or another queue-supported type
+   */
   async handleRootSignal({
     symbol,
     root_tf,
@@ -236,6 +231,10 @@ module.exports = {
         'Root signal received'
       );
 
+      /*
+       * Fetch fresh market data. Failure is non-fatal because the
+       * signal should still be available for notification and review.
+       */
       let mdata = null;
 
       try {
@@ -259,6 +258,10 @@ module.exports = {
         mdata = buildFallbackMarketData();
       }
 
+      /*
+       * Fetch the cached or fresh TradingView rating.
+       * Preserve both normalized score and percent value.
+       */
       let tv = {
         score: 0,
         score_pct: 0,
@@ -279,8 +282,34 @@ module.exports = {
           );
 
         if (tvRes) {
-          // FIXED: Use centralized normalizeTvScore to ensure accurate scaling (Issue 2)
-          tv = normalizeTvScore(tvRes);
+          const normalizedScore =
+            typeof tvRes.score === 'number'
+              ? tvRes.score
+              : 0;
+
+          const rawPercent = normalizeTvScoreValue(
+            tvRes.tvScore ??
+            tvRes.score_pct ??
+            tvRes.scorePct ??
+            tvRes.score ??
+            (
+              typeof normalizedScore === 'number'
+                ? Math.round(normalizedScore * 100)
+                : 0
+            )
+          );
+
+          const safePercent = Number.isFinite(rawPercent)
+            ? Math.min(100, Math.max(0, rawPercent))
+            : 0;
+
+          tv = {
+            score: safePercent / 100,
+            score_pct: safePercent,
+            scorePct: safePercent,
+            tvScore: safePercent,
+            source: tvRes.source || 'unknown'
+          };
 
           logger.info(
             {
@@ -310,6 +339,9 @@ module.exports = {
         );
       }
 
+      /*
+       * Evaluate MTF alignment using the current MACD histogram data.
+       */
       const alignment =
         await this.evaluateMtfAlignment(symbol);
 
@@ -319,6 +351,12 @@ module.exports = {
       const decision =
         await this.applyDecision(alignment);
 
+      /*
+       * If TradingView failed or returned nothing, compute a fallback score
+       * using MTF-positive fraction and available volume change.
+       * This prevents a force-zero TV score on symbols that are unsupported
+       * by TradingView but still have enough MTF/volume information.
+       */
       if (
         (!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) &&
         typeof tradingview.fallbackScore === 'function'
@@ -335,10 +373,21 @@ module.exports = {
             fallback &&
             Number.isFinite(Number(fallback.score_pct))
           ) {
-            tv = normalizeTvScore({
-              ...fallback,
-              source: 'computed_fallback'
-            });
+            const fallbackPercent = normalizeTvScoreValue(
+              Number(fallback.score_pct) ||
+              Number(fallback.scorePct) ||
+              Number(fallback.tvScore) ||
+              0
+            );
+
+            tv = {
+              score: fallbackPercent / 100,
+              score_pct: fallbackPercent,
+              scorePct: fallbackPercent,
+              tvScore: fallbackPercent,
+              source: 'computed_fallback',
+              raw: null
+            };
 
             logger.info(
               {
@@ -397,6 +446,12 @@ module.exports = {
         marketData: mdata || {}
       };
 
+      /*
+       * Keep this insert compatible with the existing database API.
+       * Event metadata remains on signalObj and is available to the
+       * notification queue even if the current schema has no eventId
+       * or candle_open_time columns.
+       */
       dbModule.insertSignal({
         symbol,
         root_tf,
@@ -418,6 +473,11 @@ module.exports = {
         meta
       };
 
+      /*
+       * Immediate notifications are used by callers that do not need
+       * a summary batch. Boundary and root-open scans pass false and
+       * enqueue the returned object themselves.
+       */
       if (notifyImmediately) {
         const queueType =
           normalizedSignalType || 'realtime';
@@ -449,6 +509,11 @@ module.exports = {
         );
       }
 
+      /*
+       * Trade opening is still performed only for accepted signals.
+       * Existing tradeManager safeguards should determine whether an
+       * already-open trade is allowed.
+       */
       if (
         decision &&
         decision.decision === 'accept'
@@ -612,10 +677,17 @@ module.exports = {
 
       return null;
     } finally {
+      /*
+       * Delete only this event's lock. A later root-open or mid-candle
+       * event for the same symbol/timeframe remains independent.
+       */
       inProgress.delete(key);
     }
   },
 
+  /**
+   * Return detailed MTF alignment for the configured MTF timeframes.
+   */
   async evaluateMtfAlignment(symbol) {
     const result = {};
     const mtfTfs = Array.isArray(config.MTF_TFS)
@@ -690,6 +762,15 @@ module.exports = {
     return result;
   },
 
+  /**
+   * Determine signal acceptance from MTF alignment.
+   *
+   * Rules:
+   * - all configured timeframes positive: accept
+   * - only daily timeframe negative and rising: accept
+   * - one or more negative timeframes: monitor
+   * - no usable data: reject
+   */
   async applyDecision(alignment = {}) {
     const tfList = Object.keys(alignment || {});
 
