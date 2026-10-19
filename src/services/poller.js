@@ -1085,6 +1085,16 @@ function registerBybitWsListeners() {
       );
 
       if (openTime > processedOpen) {
+        // detect if the incoming WS kline is the final/closed candle.
+        const isFinalKline = Boolean(
+          kline.confirm ||
+          kline.is_final ||
+          kline.isFinal ||
+          kline.is_closed ||
+          kline.isClosed ||
+          (kline.raw && (kline.raw.confirm || kline.raw.is_final || kline.raw.is_closed))
+        );
+
         const flip = await macdUtil.isMacdFlip(symbol, tf);
 
         if (flip) {
@@ -1165,8 +1175,21 @@ function registerBybitWsListeners() {
               'poller.ws: ws_rootcandle already processed; skipping enqueue'
             );
           }
+
+          // Important: update processed state because we detected and handled a flip for this open time.
+          safeSetState(processedStateKey, openTime);
+        } else {
+          // If the WS message explicitly indicates the candle is final/closed (isFinal),
+          // mark it processed to prevent repeated re-processing of the same closed candle.
+          // Otherwise do not mark processed so that a flip occurring later in the same candle
+          // (e.g., a late MACD flip after additional kline data) can still be detected.
+          if (isFinalKline) {
+            logger.debug({ symbol, tf, openTime }, 'poller.ws: non-flip final kline - marking processed');
+            safeSetState(processedStateKey, openTime);
+          } else {
+            logger.debug({ symbol, tf, openTime }, 'poller.ws: non-final kline update without flip - leaving unmarked for later detection');
+          }
         }
-        safeSetState(processedStateKey, openTime);
       }
     } catch (err) {
       logger.debug(
@@ -2272,7 +2295,7 @@ module.exports = {
       const rootTfs = buildRootTfs();
       const alignmentAlerts = [];
 
-      const latestSignals = dbModule.getLatestSignalsSnapshot() || [];
+      const latestSignals = dbModule.getLatestSignalsSnapshot ? dbModule.getLatestSignalsSnapshot() : [];
 
       for (const row of validRows) {
         const symbol = row.symbol;
@@ -2709,6 +2732,14 @@ module.exports = {
       const computeStart = performance.now();
       const allBoundarySignals = [];
 
+      // Diagnostics counters to explain why signals may be empty later
+      let countFlipDetected = 0;
+      let countFailed1d = 0;
+      let countFailedLiquidity = 0;
+      let countRejectedByConsecutive1d = 0;
+      let countPersistFailures = 0;
+      let countNonFlipCandidates = 0;
+
       const candidatePromises = readyCandidates.map(async (candidate) => {
         const { symbol, tf, latestOpen, processedStateKey } = candidate;
 
@@ -2724,270 +2755,292 @@ module.exports = {
 
           const flip = await macdUtil.isMacdFlip(symbol, tf);
 
-          if (flip) {
-            logger.info(
-              { symbol, tf, latestOpen },
-              'poller: MACD flip detected'
+          if (!flip) {
+            // Do not mark non-flip candles as processed here: leave them so a later flip in the same candle can be detected.
+            countNonFlipCandidates++;
+            return null;
+          }
+
+          // We have a MACD flip
+          countFlipDetected++;
+          logger.info(
+            { symbol, tf, latestOpen },
+            'poller: MACD flip detected'
+          );
+
+          macdFlipTracker.set(flipKey, { firedAt: Date.now() });
+
+          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+          const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
+
+          const rootCandidate = {
+            symbol,
+            root_tf: tf,
+            detected_at: Date.now(),
+            candle_open_time: latestOpen,
+            eventId,
+            signalType: 'rootcandle_update',
+            notifyImmediately: true
+          };
+
+          if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+            logger.debug(
+              { symbol, tf, latestOpen, eventId },
+              'poller: skipping startup-batch duplicate root candle signal'
             );
+            safeSetState(processedStateKey, latestOpen);
+            return null;
+          }
 
-            macdFlipTracker.set(flipKey, { firedAt: Date.now() });
+          if (alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+            logger.debug({ symbol, tf, latestOpen }, 'poller: root candidate already processed via dedupe');
+            safeSetState(processedStateKey, latestOpen);
+            return null;
+          }
 
-            const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-            const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
+          // --- NEW FLOW: evaluate MTF -> 1D gating -> liquidity/consecutive -> THEN persist final signal
+          const acceptThreshold = 0.7;
+          let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
 
-            const rootCandidate = {
+          // start with preliminary decision based on mtf score
+          let decision = isHighConfidence ? 'accept' : 'monitor';
+
+          // --- 1) 1D gating (final rule):
+          // ACCEPT if:
+          //  - daily MACD flip is true
+          //  OR
+          //  - 7/14/28 MA structure is true AND (daily hist is positive OR daily hist is negative but rising)
+          // Negative-but-rising alone does NOT accept.
+          let passedDailyFlip = false;
+          let passedMaStructure = false;
+          let passedDailyHistogramPositive = false;
+          let passedDailyHistNegativeRising = false;
+
+          try {
+            try {
+              passedDailyFlip = await macdUtil.isMacdFlip(symbol, 'D');
+            } catch (err) {
+              logger.debug({ err, symbol }, 'poller: daily MACD flip check failed');
+            }
+
+            if (typeof macdUtil.is1dMaStructure === 'function') {
+              try {
+                passedMaStructure = await macdUtil.is1dMaStructure(symbol);
+              } catch (err) {
+                logger.debug({ err, symbol }, 'poller: is1dMaStructure threw');
+              }
+            } else {
+              logger.warn({ symbol }, 'poller: macdUtil.is1dMaStructure missing; cannot evaluate MA structure gate');
+            }
+
+            if (typeof macdUtil.isDailyHistogramPositive === 'function') {
+              try {
+                passedDailyHistogramPositive = await macdUtil.isDailyHistogramPositive(symbol);
+              } catch (err) {
+                logger.debug({ err, symbol }, 'poller: isDailyHistogramPositive threw');
+              }
+            }
+
+            if (typeof macdUtil.isDailyHistNegativeButRising === 'function') {
+              try {
+                passedDailyHistNegativeRising = await macdUtil.isDailyHistNegativeButRising(symbol);
+              } catch (err) {
+                logger.debug({ err, symbol }, 'poller: isDailyHistNegativeButRising threw');
+              }
+            }
+
+            const maStructureWithPositiveOrRising =
+              passedMaStructure && (passedDailyHistogramPositive || passedDailyHistNegativeRising);
+
+            const passed1dCriteria = passedDailyFlip || maStructureWithPositiveOrRising;
+
+            if (!passed1dCriteria) {
+              if (decision === 'accept') {
+                logger.info(
+                  {
+                    symbol,
+                    tf,
+                    latestOpen,
+                    passedDailyFlip,
+                    passedMaStructure,
+                    passedDailyHistogramPositive,
+                    passedDailyHistNegativeRising
+                  },
+                  'poller: 1d criteria gate failed; downgrading preliminary accept to monitor'
+                );
+              }
+              decision = 'monitor';
+              isHighConfidence = false;
+              countFailed1d++;
+            } else {
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  latestOpen,
+                  passedDailyFlip,
+                  passedMaStructure,
+                  passedDailyHistogramPositive,
+                  passedDailyHistNegativeRising
+                },
+                'poller: 1d criteria gate passed'
+              );
+            }
+          } catch (err) {
+            logger.debug({ err, symbol, tf }, 'poller: 1d criteria gate threw; downgrading to monitor');
+            decision = 'monitor';
+            isHighConfidence = false;
+            countFailed1d++;
+          }
+
+          // --- 2) Composite liquidity/volume gate (only relevant if still 'accept')
+          let compositeDetails = null;
+          if (decision === 'accept') {
+            try {
+              let accountEquityUsd = 0;
+              try {
+                if (typeof signalManager.getAccountEquityUsd === 'function') {
+                  accountEquityUsd = Number(await signalManager.getAccountEquityUsd()) || 0;
+                } else if (typeof signalManager.getAccountEquityUsd === 'number') {
+                  accountEquityUsd = Number(signalManager.getAccountEquityUsd) || 0;
+                }
+              } catch (err) {
+                logger.debug({ err, symbol }, 'poller: failed to get accountEquityUsd from signalManager');
+              }
+
+              const composite = await passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd });
+              compositeDetails = composite.details || composite;
+
+              if (!composite.ok) {
+                logger.info(
+                  { symbol, composite },
+                  'poller: composite liquidity/volume gate blocked accept; downgrading to monitor'
+                );
+                decision = 'monitor';
+                isHighConfidence = false;
+                countFailedLiquidity++;
+              }
+            } catch (err) {
+              logger.debug({ err, symbol }, 'poller: composite liquidity/volume check failed unexpectedly');
+            }
+          }
+
+          // --- 3) Consecutive 1D limit (only relevant if still 'accept' and TF is D)
+          if (decision === 'accept') {
+            try {
+              const normalizedTf = normalizeRootTf(tf);
+              if (normalizedTf === 'D') {
+                resetStaleConsecutive1dCounts();
+                const current = getConsecutive1dCount(symbol);
+                const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
+
+                if (current >= maxAllowed) {
+                  logger.info({ symbol, current, maxAllowed }, 'poller: 1d consecutive accept limit reached; downgrading to monitor');
+                  decision = 'monitor';
+                  isHighConfidence = false;
+                  countRejectedByConsecutive1d++;
+                } else {
+                  incrementConsecutive1dCount(symbol);
+                }
+              }
+            } catch (err) {
+              logger.debug({ err, symbol }, 'poller: consecutive 1d count check failed');
+            }
+          }
+
+          // --- 4) Technical rating (optional)
+          let technicalRating = null;
+          try {
+            if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
+              technicalRating = await macdUtil.computeTechnicalRating(symbol, tf);
+            }
+          } catch (err) {
+            logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
+          }
+
+          // Build accept reasons list for meta
+          const accept1dCriteria = [];
+          if (passedDailyFlip) accept1dCriteria.push('daily_flip');
+          if (passedMaStructure) accept1dCriteria.push('ma_7_14_28');
+          if (passedDailyHistogramPositive) accept1dCriteria.push('daily_hist_positive');
+          if (passedDailyHistNegativeRising) accept1dCriteria.push('daily_hist_negative_rising');
+
+          const confidenceTag = isHighConfidence ? 'mtf_high_confidence' : 'mtf_monitor_required';
+          const acceptReasons = [confidenceTag, ...accept1dCriteria];
+          const acceptReasonStr = acceptReasons.join('+');
+
+          // Now we have the final decision — call handleRootSignal once with the final state/meta
+          try {
+            // Prepare overrides so the persisted signal reflects poller's final decision + meta
+            const decisionOverride = { decision, reason: acceptReasonStr || `poller_${decision}` };
+            const metaOverride = {
+              acceptReasons,
+              acceptReason: acceptReasonStr,
+              liquidityGate: compositeDetails || null,
+              technicalRating: technicalRating !== null ? technicalRating : null,
+              pollerMtfScore: mtfValidation.mtfScore,
+              pollerMtfAligned: mtfValidation.isAligned,
+              suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
+            };
+
+            const persisted = await signalManager.handleRootSignal({
               symbol,
               root_tf: tf,
               detected_at: Date.now(),
               candle_open_time: latestOpen,
               eventId,
               signalType: 'rootcandle_update',
-              notifyImmediately: true
-            };
+              notifyImmediately: decision === 'accept',
+              decisionOverride,
+              metaOverride
+            });
 
-            if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
-              logger.debug(
-                { symbol, tf, latestOpen, eventId },
-                'poller: skipping startup-batch duplicate root candle signal'
-              );
+            if (!persisted) {
+              logger.info({ symbol, tf, latestOpen, eventId }, 'poller: handleRootSignal returned null after final evaluation');
               safeSetState(processedStateKey, latestOpen);
+              countPersistFailures++;
               return null;
             }
 
-            if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
-              // --- NEW FLOW: evaluate MTF -> 1D gating -> liquidity/consecutive -> THEN persist final signal
-              const acceptThreshold = 0.7;
-              let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
+            // Ensure persisted.meta contains our poller metadata if not set by signalManager
+            if (!persisted.meta) persisted.meta = {};
+            persisted.meta = Object.assign({}, persisted.meta, metaOverride, {
+              mtfScore: mtfValidation.mtfScore,
+              mtfAligned: mtfValidation.isAligned,
+              decision,
+              acceptReason: acceptReasonStr
+            });
 
-              // start with preliminary decision based on mtf score
-              let decision = isHighConfidence ? 'accept' : 'monitor';
+            const finalSignal = {
+              ...persisted,
+              eventId,
+              notificationType: 'new_root_candle',
+              signalType: 'rootcandle_update',
+              state: decision,
+              meta: persisted.meta
+            };
 
-              // --- 1) 1D gating (final rule):
-              // ACCEPT if:
-              //  - daily MACD flip is true
-              //  OR
-              //  - 7/14/28 MA structure is true AND (daily hist is positive OR daily hist is negative but rising)
-              // Negative-but-rising alone does NOT accept.
-              let passedDailyFlip = false;
-              let passedMaStructure = false;
-              let passedDailyHistogramPositive = false;
-              let passedDailyHistNegativeRising = false;
+            logger.info(
+              {
+                symbol,
+                tf,
+                latestOpen,
+                eventId,
+                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                decision,
+                mtfAligned: mtfValidation.isAligned
+              },
+              'poller: root candle flip detected and persisted with final decision'
+            );
 
-              try {
-                try {
-                  passedDailyFlip = await macdUtil.isMacdFlip(symbol, 'D');
-                } catch (err) {
-                  logger.debug({ err, symbol }, 'poller: daily MACD flip check failed');
-                }
-
-                if (typeof macdUtil.is1dMaStructure === 'function') {
-                  try {
-                    passedMaStructure = await macdUtil.is1dMaStructure(symbol);
-                  } catch (err) {
-                    logger.debug({ err, symbol }, 'poller: is1dMaStructure threw');
-                  }
-                } else {
-                  logger.warn({ symbol }, 'poller: macdUtil.is1dMaStructure missing; cannot evaluate MA structure gate');
-                }
-
-                if (typeof macdUtil.isDailyHistogramPositive === 'function') {
-                  try {
-                    passedDailyHistogramPositive = await macdUtil.isDailyHistogramPositive(symbol);
-                  } catch (err) {
-                    logger.debug({ err, symbol }, 'poller: isDailyHistogramPositive threw');
-                  }
-                }
-
-                if (typeof macdUtil.isDailyHistNegativeButRising === 'function') {
-                  try {
-                    passedDailyHistNegativeRising = await macdUtil.isDailyHistNegativeButRising(symbol);
-                  } catch (err) {
-                    logger.debug({ err, symbol }, 'poller: isDailyHistNegativeButRising threw');
-                  }
-                }
-
-                const maStructureWithPositiveOrRising =
-                  passedMaStructure && (passedDailyHistogramPositive || passedDailyHistNegativeRising);
-
-                const passed1dCriteria = passedDailyFlip || maStructureWithPositiveOrRising;
-
-                if (!passed1dCriteria) {
-                  if (decision === 'accept') {
-                    logger.info(
-                      {
-                        symbol,
-                        tf,
-                        latestOpen,
-                        passedDailyFlip,
-                        passedMaStructure,
-                        passedDailyHistogramPositive,
-                        passedDailyHistNegativeRising
-                      },
-                      'poller: 1d criteria gate failed; downgrading preliminary accept to monitor'
-                    );
-                  }
-                  decision = 'monitor';
-                  isHighConfidence = false;
-                } else {
-                  logger.info(
-                    {
-                      symbol,
-                      tf,
-                      latestOpen,
-                      passedDailyFlip,
-                      passedMaStructure,
-                      passedDailyHistogramPositive,
-                      passedDailyHistNegativeRising
-                    },
-                    'poller: 1d criteria gate passed'
-                  );
-                }
-              } catch (err) {
-                logger.debug({ err, symbol, tf }, 'poller: 1d criteria gate threw; downgrading to monitor');
-                decision = 'monitor';
-                isHighConfidence = false;
-              }
-
-              // --- 2) Composite liquidity/volume gate (only relevant if still 'accept')
-              let compositeDetails = null;
-              if (decision === 'accept') {
-                try {
-                  let accountEquityUsd = 0;
-                  try {
-                    if (typeof signalManager.getAccountEquityUsd === 'function') {
-                      accountEquityUsd = Number(await signalManager.getAccountEquityUsd()) || 0;
-                    }
-                  } catch (err) {
-                    logger.debug({ err, symbol }, 'poller: failed to get accountEquityUsd from signalManager');
-                  }
-
-                  const composite = await passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd });
-                  compositeDetails = composite.details || composite;
-
-                  if (!composite.ok) {
-                    logger.info(
-                      { symbol, composite },
-                      'poller: composite liquidity/volume gate blocked accept; downgrading to monitor'
-                    );
-                    decision = 'monitor';
-                    isHighConfidence = false;
-                  }
-                } catch (err) {
-                  logger.debug({ err, symbol }, 'poller: composite liquidity/volume check failed unexpectedly');
-                }
-              }
-
-              // --- 3) Consecutive 1D limit (only relevant if still 'accept' and TF is D)
-              if (decision === 'accept') {
-                try {
-                  const normalizedTf = normalizeRootTf(tf);
-                  if (normalizedTf === 'D') {
-                    resetStaleConsecutive1dCounts();
-                    const current = getConsecutive1dCount(symbol);
-                    const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
-
-                    if (current >= maxAllowed) {
-                      logger.info({ symbol, current, maxAllowed }, 'poller: 1d consecutive accept limit reached; downgrading to monitor');
-                      decision = 'monitor';
-                      isHighConfidence = false;
-                    } else {
-                      incrementConsecutive1dCount(symbol);
-                    }
-                  }
-                } catch (err) {
-                  logger.debug({ err, symbol }, 'poller: consecutive 1d count check failed');
-                }
-              }
-
-              // --- 4) Technical rating (optional)
-              let technicalRating = null;
-              try {
-                if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
-                  technicalRating = await macdUtil.computeTechnicalRating(symbol, tf);
-                }
-              } catch (err) {
-                logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
-              }
-
-              // Now we have the final decision — call handleRootSignal once with the final state/meta
-              try {
-                const persisted = await signalManager.handleRootSignal({
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  eventId,
-                  signalType: 'rootcandle_update',
-                  notifyImmediately: decision === 'accept'
-                });
-
-                if (!persisted) {
-                  logger.info({ symbol, tf, latestOpen, eventId }, 'poller: handleRootSignal returned null after final evaluation');
-                  safeSetState(processedStateKey, latestOpen);
-                  return null;
-                }
-
-                // Enrich persisted signal with our final decision/meta
-                if (!persisted.meta) persisted.meta = {};
-                const accept1dCriteria = [];
-                if (passedDailyFlip) accept1dCriteria.push('daily_flip');
-                if (passedMaStructure) accept1dCriteria.push('ma_7_14_28');
-                if (passedDailyHistogramPositive) accept1dCriteria.push('daily_hist_positive');
-                if (passedDailyHistNegativeRising) accept1dCriteria.push('daily_hist_negative_rising');
-
-                const confidenceTag = isHighConfidence ? 'mtf_high_confidence' : 'mtf_monitor_required';
-                persisted.meta.acceptReasons = [confidenceTag, ...accept1dCriteria];
-                persisted.meta.acceptReason = persisted.meta.acceptReasons.join('+');
-
-                if (compositeDetails) {
-                  persisted.meta.liquidityGate = compositeDetails;
-                }
-                if (technicalRating !== null) {
-                  persisted.meta.technicalRating = technicalRating;
-                }
-
-                const finalSignal = {
-                  ...persisted,
-                  eventId,
-                  notificationType: 'new_root_candle',
-                  signalType: 'rootcandle_update',
-                  state: decision,
-                  meta: {
-                    ...(persisted.meta || {}),
-                    mtfScore: mtfValidation.mtfScore,
-                    mtfAligned: mtfValidation.isAligned,
-                    alignment: mtfValidation.alignment || {},
-                    decision,
-                    acceptReason: persisted.meta.acceptReason,
-                    suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-                  }
-                };
-
-                logger.info(
-                  {
-                    symbol,
-                    tf,
-                    latestOpen,
-                    eventId,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    decision,
-                    mtfAligned: mtfValidation.isAligned
-                  },
-                  'poller: root candle flip detected and persisted with final decision'
-                );
-
-                safeSetState(processedStateKey, latestOpen);
-                return finalSignal;
-              } catch (err) {
-                logger.debug({ err, symbol, tf }, 'poller: handleRootSignal (final) failed');
-                safeSetState(processedStateKey, latestOpen);
-                return null;
-              }
-            }
+            safeSetState(processedStateKey, latestOpen);
+            return finalSignal;
+          } catch (err) {
+            logger.debug({ err, symbol, tf }, 'poller: handleRootSignal (final) failed');
+            safeSetState(processedStateKey, latestOpen);
+            countPersistFailures++;
+            return null;
           }
-
-          // FIX: do not blindly mark non-flip candles as processed.
-          // This was suppressing later valid flips for the same candle.
         } catch (err) {
           logger.debug(
             { err, symbol, tf },
@@ -3086,6 +3139,14 @@ module.exports = {
             ).toFixed(1) + '%'
           : 'N/A',
         totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
+        diagnostics: {
+          countFlipDetected,
+          countNonFlipCandidates,
+          countFailed1d,
+          countFailedLiquidity,
+          countRejectedByConsecutive1d,
+          countPersistFailures
+        },
         detailedBreakdown: tfsToProcess.map((tf) => {
           const tfSignals = allBoundarySignals.filter((s) => normalizeRootTf(s.root_tf) === tf);
           return {
@@ -3122,6 +3183,7 @@ module.exports = {
       acceptedSignals = sortByRootTfPriority(acceptedSignals);
       monitorSignals = sortByRootTfPriority(monitorSignals);
 
+      // Always emit a recommended block, even if empty, with diagnostics
       if (acceptedSignals.length > 0) {
         const acceptedBlock = {
           actionType: 'ACCEPT',
@@ -3139,6 +3201,14 @@ module.exports = {
         };
 
         logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
+      } else {
+        logger.info(
+          {
+            diagnostics: summaryBlock.diagnostics,
+            timeframes: tfsToProcess
+          },
+          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT) - none'
+        );
       }
 
       if (monitorSignals.length > 0) {
@@ -3158,12 +3228,20 @@ module.exports = {
         };
 
         logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
+      } else {
+        logger.info(
+          {
+            diagnostics: summaryBlock.diagnostics,
+            timeframes: tfsToProcess
+          },
+          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR) - none'
+        );
       }
 
       if (acceptedSignals.length === 0 && monitorSignals.length === 0 && detectedNewCandles) {
         logger.info(
-          { timeframes: tfsToProcess },
-          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
+          { timeframes: tfsToProcess, diagnostics: summaryBlock.diagnostics },
+          'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips or all gated out'
         );
       }
 
