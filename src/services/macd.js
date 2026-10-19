@@ -51,20 +51,68 @@ module.exports = {
   },
 
   /**
+   * Return a rich MACD flip state for a symbol/timeframe.
+   * This includes the exact candle timestamps for the previous and current candles
+   * so callers can alert only on the exact flipped candle that triggered the event.
+   */
+  async getMacdFlipState(symbol, timeframe) {
+    try {
+      const hist = await this.computeMacdHistogram(symbol, timeframe);
+      if (!hist || hist.length < 2) {
+        return null;
+      }
+
+      const prev = hist[hist.length - 2];
+      const last = hist[hist.length - 1];
+
+      const prevHistogram = Number(prev?.histogram ?? NaN);
+      const lastHistogram = Number(last?.histogram ?? NaN);
+      const prevTime = Number(prev?.time ?? NaN);
+      const lastTime = Number(last?.time ?? NaN);
+
+      if (!Number.isFinite(prevHistogram) || !Number.isFinite(lastHistogram)) {
+        return null;
+      }
+
+      const flippedPositive = prevHistogram < 0 && lastHistogram > 0;
+      const negativeButRising = prevHistogram < lastHistogram && lastHistogram < 0;
+
+      return {
+        symbol,
+        timeframe,
+        prevHistogram,
+        lastHistogram,
+        prevTime,
+        lastTime,
+        flippedPositive,
+        negativeButRising
+      };
+    } catch (err) {
+      logger.debug({ err, symbol, timeframe }, 'getMacdFlipState error');
+      return null;
+    }
+  },
+
+  /**
    * Detect a strict MACD flip (previous histogram < 0 and last histogram > 0).
    * Only returns true for the first candle flip (negative -> positive).
    */
   async isMacdFlip(symbol, timeframe) {
     try {
-      const hist = await this.computeMacdHistogram(symbol, timeframe);
-      if (!hist || hist.length < 2) return false;
+      const flipState = await this.getMacdFlipState(symbol, timeframe);
+      if (!flipState) return false;
 
-      const last = hist[hist.length - 1];      // Current candle (most recent)
-      const prev = hist[hist.length - 2];      // Previous candle
+      const { flippedPositive } = flipState;
 
-      if (prev.histogram < 0 && last.histogram > 0) {
+      if (flippedPositive) {
         logger.info(
-          { symbol, timeframe, prevHistogram: prev.histogram, lastHistogram: last.histogram },
+          {
+            symbol,
+            timeframe,
+            prevHistogram: flipState.prevHistogram,
+            lastHistogram: flipState.lastHistogram,
+            lastTime: flipState.lastTime
+          },
           'MACD flip detected (1st candle: negative->positive)'
         );
         return true;
@@ -158,7 +206,6 @@ module.exports = {
 
   /**
    * Gather signal metrics including tradingview score, mtf status, root macd, and market data.
-   * FIXED: Added robust TradingView score scale normalization to ensure accurate scores (Issue 2)
    */
   async getSignalMetrics(symbol, rootTf, mtfTfs = []) {
     try {
@@ -166,17 +213,8 @@ module.exports = {
       let tvSource = 'fallback';
       try {
         const tvResult = await tradingview.fetchTvRatingForSymbol(symbol);
-        if (tvResult) {
-          const rawScore = Number(tvResult.tvScore ?? tvResult.score_pct ?? tvResult.score ?? 0);
-          if (rawScore >= -1.0 && rawScore <= 1.0) {
-            tvScore = ((rawScore + 1) / 2) * 100;
-          } else if (rawScore > 1.0 && rawScore <= 100.0) {
-            tvScore = rawScore;
-          } else {
-            tvScore = Math.min(100, Math.max(0, rawScore));
-          }
-          tvSource = tvResult.source || 'unknown';
-        }
+        tvScore = tvResult && typeof tvResult.score === 'number' ? tvResult.score : 0;
+        tvSource = tvResult && tvResult.source ? tvResult.source : 'error';
       } catch (e) {
         logger.debug({ e, symbol }, 'getSignalMetrics: TV score fetch failed, using fallback');
         tvScore = 0;
@@ -229,6 +267,7 @@ module.exports = {
    */
   async is1dMaStructure(symbol) {
     try {
+      // fetch daily series; keep a reasonable lookback (200 daily candles)
       const series = await this.getKlineSeries(symbol, 'D', 200);
       if (!series || series.length < 28) return false;
 
@@ -236,6 +275,7 @@ module.exports = {
       const len = closes.length;
       if (len < 28) return false;
 
+      // helper to compute SMA array for a given period
       function computeSMAArray(values, period) {
         const result = new Array(values.length).fill(null);
         let sum = 0;
@@ -255,6 +295,7 @@ module.exports = {
       const sma14 = computeSMAArray(closes, 14);
       const sma28 = computeSMAArray(closes, 28);
 
+      // scan history - if any index satisfies sma7 > sma14 > sma28, return true
       for (let i = 27; i < len; i++) {
         const s7 = sma7[i];
         const s14 = sma14[i];
@@ -267,6 +308,7 @@ module.exports = {
         }
       }
 
+      // no upward 7/14/28 crossing observed
       return false;
     } catch (err) {
       logger.debug({ err, symbol }, 'is1dMaStructure error');
