@@ -1014,18 +1014,23 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, candleOpenTime) 
     lastAlertedCandleOpenTime: 0
   };
 
-  const isNow100Percent = mtfValidation.positiveCount === mtfValidation.totalCount && mtfValidation.totalCount > 0;
+  const isNow100Percent =
+    mtfValidation &&
+    mtfValidation.totalCount > 0 &&
+    mtfValidation.positiveCount === mtfValidation.totalCount;
+
+  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
 
   const shouldAlert =
     isNow100Percent &&
     !prevState.isAligned &&
-    Number(candleOpenTime) > Number(prevState.lastAlertedCandleOpenTime || 0);
+    normalizedCandleOpenTime > Number(prevState.lastAlertedCandleOpenTime || 0);
 
   mtfAlignmentStates.set(stateKey, {
-    isAligned: isNow100Percent,
-    candleOpenTime: Number(candleOpenTime) || 0,
+    isAligned: !!isNow100Percent,
+    candleOpenTime: normalizedCandleOpenTime,
     lastAlertedCandleOpenTime: shouldAlert
-      ? Number(candleOpenTime) || 0
+      ? normalizedCandleOpenTime
       : Number(prevState.lastAlertedCandleOpenTime || 0)
   });
 
@@ -2381,6 +2386,7 @@ module.exports = {
                     symbol,
                     root_tf: tf,
                     detected_at: Date.now(),
+                    candle_open_time: latestOpen,
                     eventId,
                     signalType: 'mtf_alignment',
                     notificationType: 'mtf_alignment',
