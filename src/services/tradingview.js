@@ -368,18 +368,19 @@ async function getOrFetchTvRatingCached(symbol) {
 function fallbackScore({ macdPositiveFraction = 0.5, volChangePct = 0.0 } = {}) {
   try {
     const volNorm = Math.max(0, Math.min(1, (volChangePct + 100) / 200));
-    const score = Math.max(0, Math.min(1, 0.6 * macdPositiveFraction + 0.4 * volNorm));
-    const pct = Math.round(score * 100);
-    return { score: Math.round(score * 100) / 100, score_pct: pct, scorePct: pct, tvScore: pct };
+    const calculatedFraction = Math.max(0, Math.min(1, 0.6 * macdPositiveFraction + 0.4 * volNorm));
+    const pct = Math.round(calculatedFraction * 100);
+    return { 
+      score: Math.round(calculatedFraction * 100) / 100, 
+      score_pct: pct, 
+      scorePct: pct, 
+      tvScore: pct 
+    };
   } catch (err) {
     logger.debug({ err }, 'fallbackScore calculation error');
     return { score: 0, score_pct: 0, scorePct: 0, tvScore: 0 };
   }
 }
-
-/**
- * clearOldTvRatingCache(olderThanHours)
- */
 function clearOldTvRatingCache(olderThanHours = 24) {
   try {
     const db = dbModule.get();
