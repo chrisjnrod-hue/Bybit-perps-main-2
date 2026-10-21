@@ -2375,62 +2375,47 @@ module.exports = {
               });
 
               if (activeSignals.length > 0) {
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+  const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
-                  const activeSignal = activeSignals[0];
-                  const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
-
-                  alignmentAlerts.push({
-                    ...activeSignal,
-                    symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    candle_open_time: latestOpen,
-                    eventId,
-                    signalType: 'mtf_alignment',
-                    notificationType: 'mtf_alignment',
-                    state: 'accept',
-                    meta: {
-                      ...(activeSignal.meta || {}),
-                      alignment: mtfValidation.alignment || {},
-                      decision: 'accept',
-                      acceptReason: 'mtf_alignment_alert_100_percent',
-                      tvScore: Number(activeSignal?.meta?.tvScore ?? activeSignal?.tvScore ?? 0),
-                      tvSource: activeSignal?.meta?.tvSource || 'tradingview',
-                      mtfScore: mtfValidation.mtfScore,
-                      positiveCount: mtfValidation.positiveCount,
-                      totalCount: mtfValidation.totalCount,
-                      suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-                    }
-                  });
-
-                  logger.info(
-                    {
-                      symbol,
-                      tf,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      positiveCount: mtfValidation.positiveCount,
-                      totalCount: mtfValidation.totalCount
-                    },
-                    'poller.loop2: MTF alignment reached 100% - alert generated'
-                  );
-                }
-              }
-            }
-          } catch (err) {
-            logger.debug(
-              {
-                err,
-                symbol,
-                tf
-              },
-              'poller.loop2: symbol/timeframe scan failed'
-            );
-          }
-        }
+  if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
+    const activeSignal = activeSignals[0];
+    const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
+    
+    const alignmentAlertSignal = {
+      ...activeSignal,
+      symbol,
+      root_tf: tf,
+      detected_at: Date.now(),
+      candle_open_time: latestOpen,
+      eventId,
+      signalType: 'mtf_alignment',
+      notificationType: 'mtf_alignment',
+      state: 'accept',
+      meta: {
+        ...(activeSignal.meta || {}),
+        alignment: mtfValidation.alignment || {},
+        decision: 'accept',
+        acceptReason: 'mtf_alignment_alert_100_percent',
+        tvScore: Number(activeSignal?.meta?.tvScore ?? activeSignal?.tvScore ?? 0),
+        tvSource: activeSignal?.meta?.tvSource || 'tradingview',
+        mtfScore: mtfValidation.mtfScore,
+        positiveCount: mtfValidation.positiveCount,
+        totalCount: mtfValidation.totalCount,
+        suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
       }
+    };
 
+    // Use an explicit unique deduplication signature for the alignment family
+    if (!alreadyProcessedSignal(alignmentAlertSignal, 'mtf_alignment')) {
+      alignmentAlerts.push(alignmentAlertSignal);
+      
+      logger.info(
+        { symbol, tf, mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%' },
+        'poller.loop2: MTF alignment reached 100% - alert unique signature generated'
+      );
+    }
+  }
+              }
       for (const alert of alignmentAlerts) {
         try {
           const queued =
