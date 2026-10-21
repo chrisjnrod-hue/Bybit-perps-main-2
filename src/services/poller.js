@@ -41,7 +41,7 @@ const restFallbackCooldowns = new Map();
 const rootTfBoundaryStates = new Map();
 
 // Track MTF alignment state for each symbol/TF to prevent duplicate alerts
-// Key: ${symbol}|${tf}, Value: { isAligned, lastAlignedCandleOpenTime, lastObservedCandleOpenTime }
+// Key: ${symbol}|${tf}, Value: { lastAlignmentState, lastFlipTime }
 const mtfAlignmentStates = new Map();
 
 // In-memory fallback state cache when DB is temporarily unavailable
@@ -1010,30 +1010,28 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, candleOpenTime) 
   const stateKey = `${symbol}|${tf}`;
   const prevState = mtfAlignmentStates.get(stateKey) || {
     isAligned: false,
-    lastAlignedCandleOpenTime: 0,
-    lastObservedCandleOpenTime: 0
+    candleOpenTime: 0,
+    lastAlertedCandleOpenTime: 0
   };
 
-  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
-
-  const nowAligned =
+  const isNow100Percent =
     mtfValidation &&
     mtfValidation.totalCount > 0 &&
     mtfValidation.positiveCount === mtfValidation.totalCount;
 
-  const wasAligned = !!prevState.isAligned;
+  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
 
   const shouldAlert =
-    nowAligned &&
-    !wasAligned &&
-    normalizedCandleOpenTime > Number(prevState.lastAlignedCandleOpenTime || 0);
+    isNow100Percent &&
+    !prevState.isAligned &&
+    normalizedCandleOpenTime > Number(prevState.lastAlertedCandleOpenTime || 0);
 
   mtfAlignmentStates.set(stateKey, {
-    isAligned: !!nowAligned,
-    lastAlignedCandleOpenTime: shouldAlert
+    isAligned: !!isNow100Percent,
+    candleOpenTime: normalizedCandleOpenTime,
+    lastAlertedCandleOpenTime: shouldAlert
       ? normalizedCandleOpenTime
-      : (nowAligned ? Number(prevState.lastAlignedCandleOpenTime || 0) : 0),
-    lastObservedCandleOpenTime: normalizedCandleOpenTime
+      : Number(prevState.lastAlertedCandleOpenTime || 0)
   });
 
   return shouldAlert;
@@ -1168,7 +1166,7 @@ function registerBybitWsListeners() {
                 totalCount: mtfValidation.totalCount,
                 reason: mtfValidation.reason
               },
-              'poller.ws: MACD flip detected but MTF alignment not met — still proceeding'
+              'poller.ws: MACD flip detected but MTF alignment not met â€” still proceeding'
             );
           }
 
@@ -1270,12 +1268,12 @@ async function runDbHealthCheckLoop() {
 
     if (!isCurrentlyHealthy && wasHealthy) {
       logger.error(
-        'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
+        'poller: âš ï¸  DATABASE CONNECTION LOST - switching to in-memory cache'
       );
       dbIsHealthy = false;
     } else if (isCurrentlyHealthy && !wasHealthy) {
       logger.info(
-        'poller: ✅ DATABASE CONNECTION RESTORED'
+        'poller: âœ… DATABASE CONNECTION RESTORED'
       );
       dbIsHealthy = true;
     }
@@ -2369,43 +2367,55 @@ module.exports = {
             );
 
             if (latestOpen > processedOpen) {
-              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-
-              if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
-                const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
-
-                alignmentAlerts.push({
-                  symbol,
-                  root_tf: tf,
-                  detected_at: Date.now(),
-                  candle_open_time: latestOpen,
-                  eventId,
-                  signalType: 'mtf_alignment',
-                  notificationType: 'mtf_alignment',
-                  state: 'accept',
-                  meta: {
-                    alignment: mtfValidation.alignment || {},
-                    decision: 'accept',
-                    acceptReason: 'mtf_alignment_alert_100_percent',
-                    mtfScore: mtfValidation.mtfScore,
-                    positiveCount: mtfValidation.positiveCount,
-                    totalCount: mtfValidation.totalCount,
-                    suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-                  }
-                });
-
-                logger.info(
-                  {
-                    symbol,
-                    tf,
-                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                    positiveCount: mtfValidation.positiveCount,
-                    totalCount: mtfValidation.totalCount,
-                    candleOpenTime: latestOpen,
-                    eventId
-                  },
-                  'poller.loop2: MTF alignment reached 100% - alert generated'
+              const activeSignals = latestSignals.filter((signal) => {
+                return (
+                  String(signal.symbol || '').toUpperCase() === String(symbol || '').toUpperCase() &&
+                  normalizeRootTf(signal.root_tf) === tf
                 );
+              });
+
+              if (activeSignals.length > 0) {
+                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+
+                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
+                  const activeSignal = activeSignals[0];
+                  const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
+
+                  alignmentAlerts.push({
+                    ...activeSignal,
+                    symbol,
+                    root_tf: tf,
+                    detected_at: Date.now(),
+                    candle_open_time: latestOpen,
+                    eventId,
+                    signalType: 'mtf_alignment',
+                    notificationType: 'mtf_alignment',
+                    state: 'accept',
+                    meta: {
+                      ...(activeSignal.meta || {}),
+                      alignment: mtfValidation.alignment || {},
+                      decision: 'accept',
+                      acceptReason: 'mtf_alignment_alert_100_percent',
+                      tvScore: Number(activeSignal?.meta?.tvScore ?? activeSignal?.tvScore ?? 0),
+                      tvSource: activeSignal?.meta?.tvSource || 'tradingview',
+                      mtfScore: mtfValidation.mtfScore,
+                      positiveCount: mtfValidation.positiveCount,
+                      totalCount: mtfValidation.totalCount,
+                      suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
+                    }
+                  });
+
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      positiveCount: mtfValidation.positiveCount,
+                      totalCount: mtfValidation.totalCount
+                    },
+                    'poller.loop2: MTF alignment reached 100% - alert generated'
+                  );
+                }
               }
             }
           } catch (err) {
@@ -2592,7 +2602,7 @@ module.exports = {
     const db = await ensureDbReady(3, 500);
     if (!db) {
       logger.error(
-        'poller: ⚠️  DATABASE CONNECTION UNAVAILABLE - aborting candle open scan to prevent signal loss'
+        'poller: âš ï¸  DATABASE CONNECTION UNAVAILABLE - aborting candle open scan to prevent signal loss'
       );
       return false;
     }
@@ -2960,7 +2970,7 @@ module.exports = {
                 logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
               }
 
-              // Now we have the final decision — call handleRootSignal once with the final state/meta
+              // Now we have the final decision â€” call handleRootSignal once with the final state/meta
               try {
                 const persisted = await signalManager.handleRootSignal({
                   symbol,
@@ -3111,7 +3121,7 @@ module.exports = {
                   tf,
                   signalCount: tfSignals.length
                 },
-                'poller: ⚠️  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
+                'poller: âš ï¸  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
               );
             }
           }
@@ -3199,7 +3209,7 @@ module.exports = {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
-          reason: 'MTF alignment high-confidence (≥ 70%) + 1D structure/liquidity gates passed',
+          reason: 'MTF alignment high-confidence (â‰¥ 70%) + 1D structure/liquidity gates passed',
           signals: acceptedSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
