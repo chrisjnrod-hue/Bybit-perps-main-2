@@ -27,33 +27,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function normalizeTvSymbol(symbol) {
-  if (!symbol) return '';
-  let s = String(symbol).trim().toUpperCase();
-
-  // strip common future/perpetual naming variants
-  s = s.replace(/\.P$/i, '');
-  s = s.replace(/-PERP$/i, '');
-  s = s.replace(/_PERP$/i, '');
-
-  return s;
-}
-
-function buildCanonicalTvTicker(symbol, exchange = 'BYBIT') {
-  const normalizedSymbol = normalizeTvSymbol(symbol);
-
-  if (!normalizedSymbol) {
-    return null;
-  }
-
-  if (normalizedSymbol.includes(':')) {
-    return normalizedSymbol.toUpperCase();
-  }
-
-  const ex = String(exchange || 'BYBIT').trim().toUpperCase();
-  return `${ex}:${normalizedSymbol}`;
-}
-
 /**
  * normalizeRecommendToScore
  * Accepts a numeric TradingView Recommend.All value in 1..5 and returns 0..1 float and percent 0..100
@@ -70,7 +43,7 @@ function normalizeRecommendToScore(recommend) {
 }
 
 /**
- * parseRecommendFromResponse
+ * parseRecommendFromResponse(json, preferColumnName)
  * Uses json.columns (if present) to find the exact index of the Recommend.All column.
  * Falls back to a safe scan only if no column info is present.
  */
@@ -95,10 +68,7 @@ function parseRecommendFromResponse(json, preferColumnName = 'Recommend.All') {
         : (typeof val === 'string' && val.trim() !== '') ? Number(val)
         : (val && typeof val === 'object' && typeof val.v !== 'undefined') ? Number(val.v)
         : NaN;
-
-      if (Number.isFinite(parsed) && parsed >= 1 && parsed <= 5) {
-        return parsed;
-      }
+      return Number.isFinite(parsed) ? parsed : null;
     }
   }
 
@@ -194,13 +164,10 @@ async function tryScannerForTicker(ticker, timeoutMs = TV_REQUEST_TIMEOUT_MS) {
  */
 async function findCanonicalTvTicker(symbol, exchangeCandidates = DEFAULT_EXCHANGES, timeoutMs = 5000) {
   if (!TV_USE_SYMBOL_SEARCH) return null;
-
-  const normalizedSymbol = normalizeTvSymbol(symbol);
-
   // try each exchange until we find a plausible match
   for (const ex of exchangeCandidates) {
     try {
-      const q = `?text=${encodeURIComponent(normalizedSymbol)}&exchange=${encodeURIComponent(ex)}&limit=${TV_SYMBOL_SEARCH_LIMIT}`;
+      const q = `?text=${encodeURIComponent(symbol)}&exchange=${encodeURIComponent(ex)}&limit=${TV_SYMBOL_SEARCH_LIMIT}`;
       const url = `${TV_SYMBOL_SEARCH_URL}${q}`;
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -217,7 +184,7 @@ async function findCanonicalTvTicker(symbol, exchangeCandidates = DEFAULT_EXCHAN
         // item.symbol is like "BYBIT:BTCUSDT" or long format
         const sym = String(item?.symbol ?? '').toUpperCase();
         const short = String(item?.short_name ?? '').toUpperCase();
-        return sym.endsWith(`:${normalizedSymbol}`) || short === normalizedSymbol;
+        return sym.endsWith(`:${String(symbol).toUpperCase()}`) || short === String(symbol).toUpperCase();
       });
 
       const pick = preferred || json[0];
@@ -240,40 +207,29 @@ async function findCanonicalTvTicker(symbol, exchangeCandidates = DEFAULT_EXCHAN
  * - validates Recommend.All by scanning returned row.d and columns metadata
  * - optionally uses symbol_search fallback to find canonical ticker
  */
-async function fetchTvRatingForSymbol(symbol, maxRetries = 3, preferredExchange = 'BYBIT') {
+async function fetchTvRatingForSymbol(symbol, maxRetries = 3) {
   if (!symbol) {
     logger.warn('fetchTvRatingForSymbol: symbol is empty');
     return { source: 'error', score: 0, score_pct: 0, scorePct: 0, tvScore: 0 };
   }
 
-  const normalizedSymbol = normalizeTvSymbol(symbol);
   const exchangeCandidates = Array.isArray(DEFAULT_EXCHANGES) && DEFAULT_EXCHANGES.length > 0
-    ? [preferredExchange, ...DEFAULT_EXCHANGES.filter((x) => x !== preferredExchange)]
+    ? DEFAULT_EXCHANGES
     : ['BYBIT', 'BINANCE', 'KUCOIN'];
 
-  logger.debug({ symbol, normalizedSymbol, exchanges: exchangeCandidates }, 'fetchTvRatingForSymbol: starting fetch');
+  logger.debug({ symbol, exchanges: exchangeCandidates }, 'fetchTvRatingForSymbol: starting fetch');
 
   // Try direct scanner calls first (exchange priority order)
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     for (const ex of exchangeCandidates) {
       try {
-        const ticker = buildCanonicalTvTicker(normalizedSymbol, ex);
+        const ticker = `${ex}:${symbol}`;
         logger.debug({ attempt, exchange: ex, ticker }, 'TV fetch attempt');
 
         const res = await tryScannerForTicker(ticker, TV_REQUEST_TIMEOUT_MS);
         if (res && res.source === 'tradingview') {
-          logger.info({ symbol, ticker, score: res.score, scorePct: res.scorePct, attempt, exchange: ex }, '✅ TV rating fetched successfully');
-
-          const normalized = {
-            ...res,
-            score: Math.max(0, Math.min(1, Number(res.score) || 0)),
-            score_pct: Math.max(0, Math.min(100, Number(res.score_pct) || 0)),
-            scorePct: Math.max(0, Math.min(100, Number(res.scorePct) || 0)),
-            tvScore: Math.max(0, Math.min(100, Number(res.tvScore) || 0)),
-            exchange: ex
-          };
-
-          return normalized;
+          logger.info({ symbol, ticker, score: res.score, scorePct: res.scorePct, attempt, exchange: ex }, 'âœ… TV rating fetched successfully');
+          return res;
         }
       } catch (err) {
         logger.debug({ err, symbol, exchange: ex, attempt }, 'TV fetch attempt failed');
@@ -283,23 +239,13 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3, preferredExchange 
     // If direct attempts fail AND symbol_search is enabled, try to resolve canonical ticker then re-run scanner
     if (TV_USE_SYMBOL_SEARCH) {
       try {
-        const resolved = await findCanonicalTvTicker(normalizedSymbol, exchangeCandidates);
+        const resolved = await findCanonicalTvTicker(symbol, exchangeCandidates);
         if (resolved) {
           logger.debug({ symbol, resolved }, 'TV symbol_search resolved ticker; trying scanner on resolved ticker');
           const res = await tryScannerForTicker(resolved, TV_REQUEST_TIMEOUT_MS);
           if (res && res.source === 'tradingview') {
-            logger.info({ symbol, resolved, score: res.score, scorePct: res.scorePct }, '✅ TV rating fetched via symbol_search -> scanner');
-
-            const normalized = {
-              ...res,
-              score: Math.max(0, Math.min(1, Number(res.score) || 0)),
-              score_pct: Math.max(0, Math.min(100, Number(res.score_pct) || 0)),
-              scorePct: Math.max(0, Math.min(100, Number(res.scorePct) || 0)),
-              tvScore: Math.max(0, Math.min(100, Number(res.tvScore) || 0)),
-              exchange: String(resolved).split(':')[0] || preferredExchange
-            };
-
-            return normalized;
+            logger.info({ symbol, resolved, score: res.score, scorePct: res.scorePct }, 'âœ… TV rating fetched via symbol_search -> scanner');
+            return res;
           }
         }
       } catch (err) {
@@ -315,8 +261,8 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3, preferredExchange 
     }
   }
 
-  logger.warn({ symbol, attempts: maxRetries, exchanges: exchangeCandidates }, '⚠️ TV rating unavailable after all retries, using fallback score of 0');
-  return { source: 'fallback', score: 0, score_pct: 0, scorePct: 0, tvScore: 0, exchange: preferredExchange };
+  logger.warn({ symbol, attempts: maxRetries, exchanges: exchangeCandidates }, 'âš ï¸ TV rating unavailable after all retries, using fallback score of 0');
+  return { source: 'fallback', score: 0, score_pct: 0, scorePct: 0, tvScore: 0, raw: null };
 }
 
 /**
@@ -328,11 +274,8 @@ async function fetchTvRatingForSymbol(symbol, maxRetries = 3, preferredExchange 
  *
  * Returns object with { score (0..1), score_pct (0..100), scorePct, tvScore, source, exchange, cached }
  */
-async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
+async function getOrFetchTvRatingCached(symbol) {
   if (!symbol) return { source: 'error', score: 0, score_pct: 0, scorePct: 0, tvScore: 0 };
-
-  const normalizedSymbol = normalizeTvSymbol(symbol);
-  const canonicalTicker = buildCanonicalTvTicker(normalizedSymbol, exchange);
 
   try {
     const db = dbModule.get();
@@ -343,10 +286,9 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
       db.prepare(`
         CREATE TABLE IF NOT EXISTS tv_ratings (
           symbol TEXT PRIMARY KEY,
-          canonical_ticker TEXT,
-          exchange TEXT,
           score REAL DEFAULT 0,
           source TEXT,
+          exchange TEXT,
           updated_at INTEGER DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_tv_ratings_updated_at ON tv_ratings(updated_at);
@@ -358,33 +300,26 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
     // Check cache (TTL from config or default)
     const cutoff = Date.now() - (Number(process.env.TV_CACHE_TTL_MS || TV_CACHE_TTL_MS));
     const cached = db.prepare(`
-      SELECT symbol, canonical_ticker, score, source, exchange, updated_at
+      SELECT score, source, exchange, updated_at
       FROM tv_ratings
       WHERE symbol = ? AND updated_at > ?
-    `).get(normalizedSymbol, cutoff);
+    `).get(symbol, cutoff);
 
     if (cached) {
-      const sameTicker = (cached.canonical_ticker || '').toUpperCase() === (canonicalTicker || '').toUpperCase();
-      if (sameTicker) {
-        const ageMinutes = Math.round((Date.now() - cached.updated_at) / 60000);
-        const rawScore = Number(cached.score) || 0;
-        const normalizedScore = Math.max(0, Math.min(1, rawScore));
-        const scorePct = Math.round(normalizedScore * 100);
-        logger.info({ symbol, source: cached.source, score: normalizedScore, scorePct, ageMinutes }, '⏱️ TV rating retrieved from cache');
+      const ageMinutes = Math.round((Date.now() - cached.updated_at) / 60000);
+      const rawScore = Number(cached.score) || 0;
+      const scorePct = Math.round(rawScore * 100);
+      logger.info({ symbol, source: cached.source, score: rawScore, scorePct, ageMinutes }, 'â±ï¸ TV rating retrieved from cache');
 
-        return {
-          source: cached.source || 'cache',
-          score: normalizedScore,
-          score_pct: scorePct,
-          scorePct,
-          tvScore: scorePct,
-          exchange: cached.exchange || exchange,
-          cached: true
-        };
-      }
-
-      // cache mismatch: delete stale/incompatible entry and refresh
-      db.prepare(`DELETE FROM tv_ratings WHERE symbol = ?`).run(normalizedSymbol);
+      return {
+        source: 'cache',
+        score: rawScore,
+        score_pct: scorePct,
+        scorePct: scorePct,
+        tvScore: scorePct,
+        exchange: cached.exchange || null,
+        cached: true
+      };
     }
   } catch (err) {
     logger.debug({ err: err && err.message, symbol }, 'Cache check failed (will fetch fresh)');
@@ -392,7 +327,7 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
 
   // Fetch fresh from TV API
   logger.debug({ symbol }, 'Fetching fresh TV rating from API');
-  const fresh = await fetchTvRatingForSymbol(normalizedSymbol, 3, exchange);
+  const fresh = await fetchTvRatingForSymbol(symbol);
 
   // Try to cache result only if source === 'tradingview'
   try {
@@ -400,9 +335,9 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
     if (db && fresh && fresh.source === 'tradingview') {
       db.prepare(`
         INSERT OR REPLACE INTO tv_ratings 
-        (symbol, canonical_ticker, exchange, score, source, updated_at) 
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(normalizedSymbol, canonicalTicker, exchange, fresh.score, fresh.source, Date.now());
+        (symbol, score, source, exchange, updated_at) 
+        VALUES (?, ?, ?, ?, ?)
+      `).run(symbol, fresh.score, fresh.source, fresh.exchange || null, Date.now());
       logger.debug({ symbol, score: fresh.score, source: fresh.source }, 'TV rating cached');
     }
   } catch (err) {
@@ -410,8 +345,8 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
   }
 
   // Ensure returned object always has score_pct, aliases, and exchange
-  const normalizedScore = typeof fresh.score === 'number' ? Math.max(0, Math.min(1, fresh.score)) : 0;
-  const normalizedPct = typeof fresh.score_pct === 'number' ? Math.max(0, Math.min(100, fresh.score_pct)) : Math.round(normalizedScore * 100);
+  const normalizedScore = typeof fresh.score === 'number' ? fresh.score : 0;
+  const normalizedPct = typeof fresh.score_pct === 'number' ? fresh.score_pct : Math.round(normalizedScore * 100);
 
   return {
     source: fresh.source || 'unknown',
@@ -419,7 +354,7 @@ async function getOrFetchTvRatingCached(symbol, exchange = 'BYBIT') {
     score_pct: normalizedPct,
     scorePct: normalizedPct,
     tvScore: normalizedPct,
-    exchange: fresh.exchange || exchange,
+    exchange: fresh.exchange || null,
     raw: fresh.raw || null
   };
 }
@@ -455,7 +390,7 @@ function clearOldTvRatingCache(olderThanHours = 24) {
     const result = stmt.run(cutoffTime);
 
     if (result.changes > 0) {
-      logger.info({ deletedCount: result.changes, olderThanHours }, '🗑️ Cleared old TV ratings from cache');
+      logger.info({ deletedCount: result.changes, olderThanHours }, 'ðŸ—‘ï¸ Cleared old TV ratings from cache');
     }
   } catch (err) {
     logger.debug({ err: err && err.message }, 'Failed to clear old TV ratings cache');
@@ -467,14 +402,14 @@ function clearOldTvRatingCache(olderThanHours = 24) {
  * - tries the configured exchange set and logs results (keeps behavior but improved parsing)
  */
 async function testTvApi(symbol = 'BTCUSDT') {
-  logger.info({ symbol }, '🧪 Testing TV API connectivity...');
+  logger.info({ symbol }, 'ðŸ§ª Testing TV API connectivity...');
 
   const results = [];
   const exchanges = Array.isArray(DEFAULT_EXCHANGES) && DEFAULT_EXCHANGES.length > 0 ? DEFAULT_EXCHANGES : ['BYBIT', 'BINANCE', 'KUCOIN', 'COINBASE'];
 
   for (const ex of exchanges) {
     try {
-      const ticker = buildCanonicalTvTicker(symbol, ex);
+      const ticker = `${ex}:${symbol}`;
       const body = {
         symbols: { tickers: [ticker], query: { types: [] } },
         columns: ['Recommend.All|1']
@@ -508,7 +443,7 @@ async function testTvApi(symbol = 'BTCUSDT') {
         results.push({
           exchange: ex,
           ticker,
-          status: '✅ OK',
+          status: 'âœ… OK',
           response_time_ms: elapsed,
           recommend,
           score: rawScore !== null ? Math.round(rawScore * 100) / 100 : 'N/A',
@@ -519,21 +454,21 @@ async function testTvApi(symbol = 'BTCUSDT') {
         results.push({
           exchange: ex,
           ticker,
-          status: `❌ HTTP ${res.status}`,
+          status: `âŒ HTTP ${res.status}`,
           response_time_ms: elapsed
         });
       }
     } catch (err) {
       results.push({
         exchange: ex,
-        ticker: buildCanonicalTvTicker(symbol, ex),
-        status: `❌ ${err.name || 'Error'}`,
+        ticker: `${ex}:${symbol}`,
+        status: `âŒ ${err.name || 'Error'}`,
         error: err.message
       });
     }
   }
 
-  logger.info({ results }, '📊 TV API test results');
+  logger.info({ results }, 'ðŸ“Š TV API test results');
   return results;
 }
 
@@ -542,8 +477,5 @@ module.exports = {
   getOrFetchTvRatingCached,
   fallbackScore,
   clearOldTvRatingCache,
-  testTvApi,
-  normalizeTvSymbol,
-  buildCanonicalTvTicker,
-  parseRecommendFromResponse
+  testTvApi
 };
