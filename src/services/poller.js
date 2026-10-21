@@ -41,7 +41,7 @@ const restFallbackCooldowns = new Map();
 const rootTfBoundaryStates = new Map();
 
 // Track MTF alignment state for each symbol/TF to prevent duplicate alerts
-// Key: ${symbol}|${tf}, Value: { lastAlignmentState, lastFlipTime }
+// Key: ${symbol}|${tf}, Value: { isAligned, lastAlignedCandleOpenTime, lastObservedCandleOpenTime }
 const mtfAlignmentStates = new Map();
 
 // In-memory fallback state cache when DB is temporarily unavailable
@@ -1010,28 +1010,30 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, candleOpenTime) 
   const stateKey = `${symbol}|${tf}`;
   const prevState = mtfAlignmentStates.get(stateKey) || {
     isAligned: false,
-    candleOpenTime: 0,
-    lastAlertedCandleOpenTime: 0
+    lastAlignedCandleOpenTime: 0,
+    lastObservedCandleOpenTime: 0
   };
 
-  const isNow100Percent =
+  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
+
+  const nowAligned =
     mtfValidation &&
     mtfValidation.totalCount > 0 &&
     mtfValidation.positiveCount === mtfValidation.totalCount;
 
-  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
+  const wasAligned = !!prevState.isAligned;
 
   const shouldAlert =
-    isNow100Percent &&
-    !prevState.isAligned &&
-    normalizedCandleOpenTime > Number(prevState.lastAlertedCandleOpenTime || 0);
+    nowAligned &&
+    !wasAligned &&
+    normalizedCandleOpenTime > Number(prevState.lastAlignedCandleOpenTime || 0);
 
   mtfAlignmentStates.set(stateKey, {
-    isAligned: !!isNow100Percent,
-    candleOpenTime: normalizedCandleOpenTime,
-    lastAlertedCandleOpenTime: shouldAlert
+    isAligned: !!nowAligned,
+    lastAlignedCandleOpenTime: shouldAlert
       ? normalizedCandleOpenTime
-      : Number(prevState.lastAlertedCandleOpenTime || 0)
+      : (nowAligned ? Number(prevState.lastAlignedCandleOpenTime || 0) : 0),
+    lastObservedCandleOpenTime: normalizedCandleOpenTime
   });
 
   return shouldAlert;
@@ -2367,55 +2369,43 @@ module.exports = {
             );
 
             if (latestOpen > processedOpen) {
-              const activeSignals = latestSignals.filter((signal) => {
-                return (
-                  String(signal.symbol || '').toUpperCase() === String(symbol || '').toUpperCase() &&
-                  normalizeRootTf(signal.root_tf) === tf
-                );
-              });
+              const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-              if (activeSignals.length > 0) {
-                const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+              if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
+                const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
 
-                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
-                  const activeSignal = activeSignals[0];
-                  const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
+                alignmentAlerts.push({
+                  symbol,
+                  root_tf: tf,
+                  detected_at: Date.now(),
+                  candle_open_time: latestOpen,
+                  eventId,
+                  signalType: 'mtf_alignment',
+                  notificationType: 'mtf_alignment',
+                  state: 'accept',
+                  meta: {
+                    alignment: mtfValidation.alignment || {},
+                    decision: 'accept',
+                    acceptReason: 'mtf_alignment_alert_100_percent',
+                    mtfScore: mtfValidation.mtfScore,
+                    positiveCount: mtfValidation.positiveCount,
+                    totalCount: mtfValidation.totalCount,
+                    suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
+                  }
+                });
 
-                  alignmentAlerts.push({
-                    ...activeSignal,
+                logger.info(
+                  {
                     symbol,
-                    root_tf: tf,
-                    detected_at: Date.now(),
-                    candle_open_time: latestOpen,
-                    eventId,
-                    signalType: 'mtf_alignment',
-                    notificationType: 'mtf_alignment',
-                    state: 'accept',
-                    meta: {
-                      ...(activeSignal.meta || {}),
-                      alignment: mtfValidation.alignment || {},
-                      decision: 'accept',
-                      acceptReason: 'mtf_alignment_alert_100_percent',
-                      tvScore: Number(activeSignal?.meta?.tvScore ?? activeSignal?.tvScore ?? 0),
-                      tvSource: activeSignal?.meta?.tvSource || 'tradingview',
-                      mtfScore: mtfValidation.mtfScore,
-                      positiveCount: mtfValidation.positiveCount,
-                      totalCount: mtfValidation.totalCount,
-                      suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-                    }
-                  });
-
-                  logger.info(
-                    {
-                      symbol,
-                      tf,
-                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                      positiveCount: mtfValidation.positiveCount,
-                      totalCount: mtfValidation.totalCount
-                    },
-                    'poller.loop2: MTF alignment reached 100% - alert generated'
-                  );
-                }
+                    tf,
+                    mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                    positiveCount: mtfValidation.positiveCount,
+                    totalCount: mtfValidation.totalCount,
+                    candleOpenTime: latestOpen,
+                    eventId
+                  },
+                  'poller.loop2: MTF alignment reached 100% - alert generated'
+                );
               }
             }
           } catch (err) {
