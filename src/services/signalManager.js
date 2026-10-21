@@ -282,34 +282,29 @@ module.exports = {
           );
 
         if (tvRes) {
-          const normalizedScore =
-            typeof tvRes.score === 'number'
-              ? tvRes.score
-              : 0;
+  // If the source is an explicit zero/empty cache object, evaluate its properties strictly
+  let safePercent = 0;
+  
+  if (typeof tvRes.tvScore === 'number' && tvRes.tvScore > 0) {
+    safePercent = Math.min(100, Math.max(0, tvRes.tvScore));
+  } else if (typeof tvRes.score_pct === 'number' && tvRes.score_pct > 0) {
+    safePercent = Math.min(100, Math.max(0, tvRes.score_pct));
+  } else if (typeof tvRes.scorePct === 'number' && tvRes.scorePct > 0) {
+    safePercent = Math.min(100, Math.max(0, tvRes.scorePct));
+  } else if (typeof tvRes.score === 'number' && tvRes.score > 0) {
+    // If it's a raw score float (0..1), scale it correctly to 100
+    const rawVal = tvRes.score;
+    safePercent = rawVal > 1 ? Math.min(100, rawVal) : Math.round(rawVal * 100);
+  }
 
-          const rawPercent = normalizeTvScoreValue(
-            tvRes.tvScore ??
-            tvRes.score_pct ??
-            tvRes.scorePct ??
-            tvRes.score ??
-            (
-              typeof normalizedScore === 'number'
-                ? Math.round(normalizedScore * 100)
-                : 0
-            )
-          );
-
-          const safePercent = Number.isFinite(rawPercent)
-            ? Math.min(100, Math.max(0, rawPercent))
-            : 0;
-
-          tv = {
-            score: safePercent / 100,
-            score_pct: safePercent,
-            scorePct: safePercent,
-            tvScore: safePercent,
-            source: tvRes.source || 'unknown'
-          };
+  tv = {
+    score: safePercent / 100,
+    score_pct: safePercent,
+    scorePct: safePercent,
+    tvScore: safePercent,
+    source: tvRes.source || 'unknown'
+  };
+}
 
           logger.info(
             {
