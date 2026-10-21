@@ -302,27 +302,6 @@ function normalizeRootTf(tf) {
   return value;
 }
 
-// Canonicalize TradingView scores from either 0..1 or 0..100 styles.
-// This prevents bad tv_score math when values are emitted in inconsistent units.
-function normalizeTvScoreValue(value) {
-  if (value === null || value === undefined) return 0;
-
-  if (typeof value === 'string') {
-    const cleaned = value.trim().replace(/%/g, '').replace(/,/g, '.');
-    const num = Number(cleaned);
-    if (!Number.isFinite(num)) return 0;
-    return num > 1
-      ? Math.min(100, Math.max(0, num))
-      : Math.min(100, Math.max(0, num * 100));
-  }
-
-  const num = Number(value);
-  if (!Number.isFinite(num)) return 0;
-  return num > 1
-    ? Math.min(100, Math.max(0, num))
-    : Math.min(100, Math.max(0, num * 100));
-}
-
 function buildRootTfs() {
   const raw = Array.isArray(config.ROOT_TFS)
     ? config.ROOT_TFS
@@ -1006,82 +985,43 @@ async function validateMtfAlignmentConsensus(symbol) {
  * Check if MTF alignment state has changed and should trigger an alert
  * CRITICAL: Only fires when MTF reaches 100% AND last TF candle just opened
  */
-function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, candleOpenTime) {
+function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
   const stateKey = `${symbol}|${tf}`;
-  const prevState = mtfAlignmentStates.get(stateKey) || {
-    isAligned: false,
-    candleOpenTime: 0,
-    lastAlertedCandleOpenTime: 0
-  };
+  const prevState = mtfAlignmentStates.get(stateKey);
 
-  const isNow100Percent =
-    mtfValidation &&
-    mtfValidation.totalCount > 0 &&
-    mtfValidation.positiveCount === mtfValidation.totalCount;
+  const isNow100Percent = mtfValidation.positiveCount === mtfValidation.totalCount && mtfValidation.totalCount > 0;
 
-  const normalizedCandleOpenTime = Number(candleOpenTime) || 0;
+  if (!prevState) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return isNow100Percent;
+  }
 
-  const shouldAlert =
-    isNow100Percent &&
-    !prevState.isAligned &&
-    normalizedCandleOpenTime > Number(prevState.lastAlertedCandleOpenTime || 0);
+  const wasAlignedBefore = prevState.lastAlignmentState;
 
-  mtfAlignmentStates.set(stateKey, {
-    isAligned: !!isNow100Percent,
-    candleOpenTime: normalizedCandleOpenTime,
-    lastAlertedCandleOpenTime: shouldAlert
-      ? normalizedCandleOpenTime
-      : Number(prevState.lastAlertedCandleOpenTime || 0)
-  });
+  if (!wasAlignedBefore && isNow100Percent) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return true;
+  }
 
-  return shouldAlert;
-}
+  if (wasAlignedBefore && isNow100Percent) {
+    return false;
+  }
 
-function buildRootBoundarySummarySignal({
-  timeframes = [],
-  totalSymbolsScanned = 0,
-  allBoundarySignals = [],
-  acceptedSignals = [],
-  monitorSignals = [],
-  detectedNewCandles = false,
-  nowMs = Date.now()
-} = {}) {
-  const acceptedCount = Array.isArray(acceptedSignals) ? acceptedSignals.length : 0;
-  const monitorCount = Array.isArray(monitorSignals) ? monitorSignals.length : 0;
+  if (wasAlignedBefore && !isNow100Percent) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return false;
+  }
 
-  return {
-    type: 'root_boundary_summary',
-    signalType: 'root_boundary_summary',
-    notificationType: 'root_boundary_summary',
-    detected_at: nowMs,
-    timestamp: nowMs,
-    timeframes: Array.isArray(timeframes) ? timeframes : [],
-    totalSymbolsScanned,
-    signalsGenerated: Array.isArray(allBoundarySignals) ? allBoundarySignals.length : 0,
-    acceptSignals: acceptedCount,
-    monitorSignals: monitorCount,
-    detectedNewCandles,
-    recommended: acceptedCount > 0 ? 'accept' : monitorCount > 0 ? 'monitor' : 'none',
-    meta: {
-      summary: true,
-      acceptedSignals: acceptedSignals.map((s) => ({
-        symbol: s.symbol,
-        root_tf: s.root_tf,
-        eventId: s.eventId
-      })),
-      monitorSignals: monitorSignals.map((s) => ({
-        symbol: s.symbol,
-        root_tf: s.root_tf,
-        eventId: s.eventId
-      })),
-      avgMtfScore: allBoundarySignals.length > 0
-        ? (
-            (allBoundarySignals.reduce((sum, s) => sum + Number(s.meta?.mtfScore || 0), 0) /
-              allBoundarySignals.length) * 100
-          )
-        : 0
-    }
-  };
+  return false;
 }
 
 function registerBybitWsListeners() {
@@ -1148,83 +1088,85 @@ function registerBybitWsListeners() {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
 
         if (flip) {
+          logger.info(
+            { symbol, tf, openTime },
+            'poller.ws: MACD flip detected'
+          );
+
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
-          const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
 
-          const rootCandidate = {
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            candle_open_time: openTime,
-            eventId: rootEventId,
-            signalType: 'rootcandle_update',
-            notifyImmediately: true
-          };
-
-          if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
-            safeSetState(processedStateKey, openTime);
-            return;
-          }
-
-          const signal = await signalManager.handleRootSignal({
-            symbol,
-            root_tf: tf,
-            detected_at: Date.now(),
-            candle_open_time: openTime,
-            eventId: rootEventId,
-            signalType: 'rootcandle_update',
-            notifyImmediately: true
-          });
-
-          if (!signal) {
-            logger.info(
-              { symbol, tf, openTime, rootEventId },
-              'poller.ws: handleRootSignal returned null after MACD flip'
-            );
-          } else {
-            const rootSignal = {
-              ...signal,
-              eventId: rootEventId,
-              notificationType: 'new_root_candle',
-              signalType: 'rootcandle_update',
-              meta: {
-                ...(signal.meta || {}),
-                mtfScore: mtfValidation.mtfScore,
-                mtfAligned: mtfValidation.isAligned,
-                alignment: mtfValidation.alignment || {},
-                mtfAlignment: mtfValidation.alignment || {},
-                suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
-              }
-            };
-
-            const queued = notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
-
+          if (!mtfValidation.isAligned) {
             logger.info(
               {
                 symbol,
                 tf,
                 openTime,
-                rootEventId,
-                queued,
-                mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
-                mtfAligned: mtfValidation.isAligned
+                mtfScore: mtfValidation.mtfScore,
+                positiveCount: mtfValidation.positiveCount,
+                totalCount: mtfValidation.totalCount,
+                reason: mtfValidation.reason
               },
-              'poller.ws: ws-triggered root candle signal enqueue result'
+              'poller.ws: MACD flip detected but MTF alignment not met — still proceeding'
             );
           }
-        } else {
-          logger.info(
-            { symbol, tf, openTime },
-            'poller.ws: no MACD flip on ws root candle; skipping enqueue'
-          );
-        }
 
+          if (!alreadyProcessedSignal(wsSignal, 'ws_rootcandle')) {
+            const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
+
+            const signal = await signalManager.handleRootSignal({
+              symbol,
+              root_tf: tf,
+              detected_at: Date.now(),
+              candle_open_time: openTime,
+              eventId: rootEventId,
+              signalType: 'rootcandle_update',
+              notifyImmediately: false
+            });
+
+            if (!signal) {
+              logger.info(
+                { symbol, tf, openTime, rootEventId },
+                'poller.ws: handleRootSignal returned null after MACD flip'
+              );
+            } else {
+              const rootSignal = {
+                ...signal,
+                eventId: rootEventId,
+                notificationType: 'new_root_candle',
+                signalType: 'rootcandle_update',
+                meta: {
+                  ...(signal.meta || {}),
+                  mtfScore: mtfValidation.mtfScore,
+                  mtfAligned: mtfValidation.isAligned,
+                  alignment: mtfValidation.alignment || {},
+                  mtfAlignment: mtfValidation.alignment || {},
+                  suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
+                }
+              };
+
+              const queued = notificationQueue.enqueueSignal(rootSignal, 'new_root_candle');
+
+              logger.info(
+                {
+                  symbol,
+                  tf,
+                  openTime,
+                  rootEventId,
+                  queued,
+                  mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                  mtfAligned: mtfValidation.isAligned
+                },
+                'poller.ws: ws-triggered root candle signal enqueue result'
+              );
+            }
+          } else {
+            logger.info(
+              { symbol, tf, openTime },
+              'poller.ws: ws_rootcandle already processed; skipping enqueue'
+            );
+          }
+        }
         safeSetState(processedStateKey, openTime);
-      } else {
-        logger.info(
-          { symbol, tf, openTime },
-          'poller.ws: ws_rootcandle already processed; skipping enqueue'
-        );
       }
     } catch (err) {
       logger.debug(
@@ -1266,12 +1208,12 @@ async function runDbHealthCheckLoop() {
 
     if (!isCurrentlyHealthy && wasHealthy) {
       logger.error(
-        'poller: DATABASE CONNECTION LOST - switching to in-memory cache'
+        'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
       );
       dbIsHealthy = false;
     } else if (isCurrentlyHealthy && !wasHealthy) {
       logger.info(
-        'poller: DATABASE CONNECTION RESTORED'
+        'poller: ✅ DATABASE CONNECTION RESTORED'
       );
       dbIsHealthy = true;
     }
@@ -2375,16 +2317,15 @@ module.exports = {
               if (activeSignals.length > 0) {
                 const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
+                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation)) {
                   const activeSignal = activeSignals[0];
                   const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
 
-                  const alignmentAlertSignal = {
+                  alignmentAlerts.push({
                     ...activeSignal,
                     symbol,
                     root_tf: tf,
                     detected_at: Date.now(),
-                    candle_open_time: latestOpen,
                     eventId,
                     signalType: 'mtf_alignment',
                     notificationType: 'mtf_alignment',
@@ -2401,22 +2342,30 @@ module.exports = {
                       totalCount: mtfValidation.totalCount,
                       suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
                     }
-                  };
+                  });
 
-                  // Use an explicit unique deduplication signature for the alignment family
-                  if (!alreadyProcessedSignal(alignmentAlertSignal, 'mtf_alignment')) {
-                    alignmentAlerts.push(alignmentAlertSignal);
-
-                    logger.info(
-                      { symbol, tf, mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%' },
-                      'poller.loop2: MTF alignment reached 100% - alert unique signature generated'
-                    );
-                  }
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      mtfScore: (mtfValidation.mtfScore * 100).toFixed(0) + '%',
+                      positiveCount: mtfValidation.positiveCount,
+                      totalCount: mtfValidation.totalCount
+                    },
+                    'poller.loop2: MTF alignment reached 100% - alert generated'
+                  );
                 }
               }
             }
           } catch (err) {
-            logger.error({ err }, 'poller.loop2: scan iteration failed');
+            logger.debug(
+              {
+                err,
+                symbol,
+                tf
+              },
+              'poller.loop2: symbol/timeframe scan failed'
+            );
           }
         }
       }
@@ -2592,7 +2541,7 @@ module.exports = {
     const db = await ensureDbReady(3, 500);
     if (!db) {
       logger.error(
-        'poller: DATABASE CONNECTION UNAVAILABLE - aborting candle open scan to prevent signal loss'
+        'poller: ⚠️  DATABASE CONNECTION UNAVAILABLE - aborting candle open scan to prevent signal loss'
       );
       return false;
     }
@@ -3111,40 +3060,12 @@ module.exports = {
                   tf,
                   signalCount: tfSignals.length
                 },
-                'poller: CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
+                'poller: ⚠️  CRITICAL - FAILED to enqueue root TF candle-open batch for timeframe'
               );
             }
           }
         }
       }
-
-      const acceptedSignals = sortByRootTfPriority(
-        allBoundarySignals.filter((s) => s.meta?.decision === 'accept')
-      );
-      const monitorSignals = sortByRootTfPriority(
-        allBoundarySignals.filter((s) => s.meta?.decision === 'monitor')
-      );
-
-      const summarySignal = buildRootBoundarySummarySignal({
-        timeframes: tfsToProcess,
-        totalSymbolsScanned: validRows.length,
-        allBoundarySignals,
-        acceptedSignals,
-        monitorSignals,
-        detectedNewCandles
-      });
-
-      const queuedSummary = notificationQueue.enqueueSignal(summarySignal, 'root_boundary_summary');
-
-      logger.info(
-        {
-          queuedSummary,
-          accepted: acceptedSignals.length,
-          monitor: monitorSignals.length,
-          signalsGenerated: allBoundarySignals.length
-        },
-        'poller.rootTfCandleOpen: root boundary summary enqueued'
-      );
 
       const summaryBlock = {
         timestamp: new Date(nowMs).toISOString(),
@@ -3155,8 +3076,8 @@ module.exports = {
         slowPathQueued: missingDataQueue.length,
         newCandlesDetected: detectedNewCandles,
         signalsGenerated: allBoundarySignals.length,
-        acceptSignals: acceptedSignals.length,
-        monitorSignals: monitorSignals.length,
+        acceptSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'accept').length,
+        monitorSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'monitor').length,
         avgMtfScore: allBoundarySignals.length > 0
           ? (
               (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) /
@@ -3195,11 +3116,17 @@ module.exports = {
         logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
       }
 
+      let acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
+      let monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
+
+      acceptedSignals = sortByRootTfPriority(acceptedSignals);
+      monitorSignals = sortByRootTfPriority(monitorSignals);
+
       if (acceptedSignals.length > 0) {
         const acceptedBlock = {
           actionType: 'ACCEPT',
           count: acceptedSignals.length,
-          reason: 'MTF alignment high-confidence (>= 70%) + 1D structure/liquidity gates passed',
+          reason: 'MTF alignment high-confidence (≥ 70%) + 1D structure/liquidity gates passed',
           signals: acceptedSignals.map((s) => ({
             symbol: s.symbol,
             timeframe: normalizeRootTf(s.root_tf),
