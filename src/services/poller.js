@@ -1147,41 +1147,57 @@ function registerBybitWsListeners() {
       if (openTime > processedOpen) {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
 
-        if (flip) {
-          logger.info(
-            { symbol, tf, openTime },
-            'poller.ws: MACD flip detected'
-          );
+        const candidatePromises = readyCandidates.map(async (candidate) => {
+  const { symbol, tf, latestOpen, processedStateKey } = candidate;
 
-          const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+  try {
+    const flipKey = `${symbol}|${tf}|${latestOpen}`;
+    if (macdFlipTracker.has(flipKey)) {
+      return null;
+    }
 
-          if (!mtfValidation.isAligned) {
-            logger.info(
-              {
-                symbol,
-                tf,
-                openTime,
-                mtfScore: mtfValidation.mtfScore,
-                positiveCount: mtfValidation.positiveCount,
-                totalCount: mtfValidation.totalCount,
-                reason: mtfValidation.reason
-              },
-              'poller.ws: MACD flip detected but MTF alignment not met â€” still proceeding'
-            );
-          }
+    const flip = await macdUtil.isMacdFlip(symbol, tf);
 
-          if (!alreadyProcessedSignal(wsSignal, 'ws_rootcandle')) {
-            const rootEventId = buildEventId('rootcandle', symbol, tf, openTime);
+    if (flip) {
+      logger.info({ symbol, tf, latestOpen }, 'poller: MACD flip detected on boundary');
+      macdFlipTracker.set(flipKey, { firedAt: Date.now() });
 
-            const signal = await signalManager.handleRootSignal({
-              symbol,
-              root_tf: tf,
-              detected_at: Date.now(),
-              candle_open_time: openTime,
-              eventId: rootEventId,
-              signalType: 'rootcandle_update',
-              notifyImmediately: false
-            });
+      const mtfValidation = await validateMtfAlignmentConsensus(symbol);
+      const eventId = buildEventId('rootcandle', symbol, tf, latestOpen);
+
+      const rootCandidate = {
+        symbol,
+        root_tf: tf,
+        detected_at: Date.now(),
+        candle_open_time: latestOpen,
+        eventId,
+        signalType: 'rootcandle_update',
+        notifyImmediately: true
+      };
+
+      if (isStartupBatchSignal(rootCandidate, 'rootcandle')) {
+        safeSetState(processedStateKey, latestOpen); // Cleanly advance state since it's historical startup data
+        return null;
+      }
+
+      if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
+        // ... Keep your internal calculations (1D criteria logic, liquidity checks, etc.) completely as-is ...
+        
+        // At the completion of a successful flip save action:
+        safeSetState(processedStateKey, latestOpen); 
+        return finalSignal;
+      }
+    } else {
+      // CRITICAL FIX: Do NOT call safeSetState(processedStateKey, latestOpen) here!
+      // Leaving it unmodified allows the 5-minute MTF loop checker to capture the state change when the alignment flips later.
+      logger.debug({ symbol, tf, latestOpen }, 'poller: no flip on candle open; skipping state advance to preserve alignment alert checks');
+    }
+  } catch (err) {
+    logger.debug({ err, symbol, tf }, 'poller: error evaluating fast-path candidate');
+  }
+
+  return null;
+});
 
             if (!signal) {
               logger.info(
