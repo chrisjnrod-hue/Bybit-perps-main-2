@@ -352,37 +352,24 @@ module.exports = {
        * This prevents a force-zero TV score on symbols that are unsupported
        * by TradingView but still have enough MTF/volume information.
        */
-      if (
-        (!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) &&
-        typeof tradingview.fallbackScore === 'function'
-      ) {
-        try {
-          const fallback = tradingview.fallbackScore({
-            macdPositiveFraction: typeof mtfScore === 'number' ? mtfScore : 0,
-            volChangePct: Number.isFinite(Number(mdata?.volume_change_pct))
-              ? Number(mdata.volume_change_pct)
-              : 0
-          });
+      if ((!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) && typeof tradingview.fallbackScore === 'function') {
+  try {
+    const fallback = tradingview.fallbackScore({
+      macdPositiveFraction: typeof mtfScore === 'number' ? mtfScore : 0,
+      volChangePct: Number.isFinite(Number(mdata?.volume_change_pct)) ? Number(mdata.volume_change_pct) : 0
+    });
 
-          if (
-            fallback &&
-            Number.isFinite(Number(fallback.score_pct))
-          ) {
-            const fallbackPercent = normalizeTvScoreValue(
-              Number(fallback.score_pct) ||
-              Number(fallback.scorePct) ||
-              Number(fallback.tvScore) ||
-              0
-            );
+    if (fallback && typeof fallback.tvScore === 'number') {
+      const fallbackPercent = Math.min(100, Math.max(0, fallback.tvScore));
 
-            tv = {
-              score: fallbackPercent / 100,
-              score_pct: fallbackPercent,
-              scorePct: fallbackPercent,
-              tvScore: fallbackPercent,
-              source: 'computed_fallback',
-              raw: null
-            };
+      tv = {
+        score: fallbackPercent / 100,
+        score_pct: fallbackPercent,
+        scorePct: fallbackPercent,
+        tvScore: fallbackPercent,
+        source: 'computed_fallback',
+        raw: null
+      };
 
             logger.info(
               {
