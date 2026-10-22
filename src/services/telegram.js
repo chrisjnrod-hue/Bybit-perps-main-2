@@ -1,4 +1,3 @@
-// telegram.js
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config');
 const logger = require('pino')();
@@ -443,6 +442,62 @@ module.exports = {
           )
         : null;
 
+    const flipFrom =
+      meta.flipFrom ||
+      meta.lastFlipFrom ||
+      null;
+
+    const flipTo =
+      meta.flipTo ||
+      meta.lastFlipTo ||
+      null;
+
+    const candleOpen =
+      meta.candleOpen ??
+      meta.candle_open_time ??
+      meta.candleOpenTime ??
+      null;
+
+    const tfText =
+      meta.timeframe ||
+      root_tf ||
+      null;
+
+    const extraLines = [];
+
+    if (
+      notificationType === 'mtf_alignment' &&
+      (flipFrom || flipTo || candleOpen || tfText)
+    ) {
+      extraLines.push(
+        '🔁 Flip Details:'
+      );
+
+      if (flipFrom) {
+        extraLines.push(
+          `From: ${String(flipFrom).toUpperCase()}`
+        );
+      }
+
+      if (flipTo) {
+        extraLines.push(
+          `To: ${String(flipTo).toUpperCase()}`
+        );
+      }
+
+      if (candleOpen) {
+        extraLines.push(
+          `Candle Open: ${Number(candleOpen).toFixed(8)}`
+        );
+      }
+
+      if (tfText) {
+        extraLines.push(
+          `TF: ${tfText}`
+        );
+      }
+    }
+
     const msgParts = [
       ...(eventTitle
         ? [
@@ -462,6 +517,7 @@ module.exports = {
       '',
       mtfHeader,
       alignmentLines || 'No MTF data',
+      ...(extraLines.length > 0 ? ['', ...extraLines] : []),
       '',
       marketBlock
     ];
