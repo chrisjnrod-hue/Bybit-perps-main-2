@@ -164,7 +164,6 @@ async function runStartup() {
       const allSymbols =
         getPersistedSymbols();
 
-      // Filter out invalid symbols before subscribing
       const validSymbols = allSymbols.filter(
         (symbol) => {
           return validateSymbolForWs(symbol);
@@ -363,7 +362,8 @@ async function gracefulShutdown(signal) {
 
     if (
       server &&
-      typeof server.close === 'function'
+      typeof server.close ===
+      'function'
     ) {
       logger.info(
         'Closing HTTP server'
