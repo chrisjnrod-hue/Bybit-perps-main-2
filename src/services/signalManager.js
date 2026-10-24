@@ -18,16 +18,6 @@ function setOpenTradesAllowed(value) {
   );
 }
 
-/*
- * This lock only prevents the same event from being processed
- * concurrently. It must not use only symbol:root_tf because a symbol
- * can legitimately produce:
- *
- *   root_open:BTCUSDT:60:candle
- *   midcandle:BTCUSDT:60:candle
- *
- * during the same root candle.
- */
 const inProgress = new Map();
 
 function normalizeEventType(signalType) {
@@ -77,6 +67,35 @@ function buildFallbackMarketData() {
   };
 }
 
+function normalizeTvScoreValue(value) {
+  if (value === null || value === undefined) {
+    return 0;
+  }
+
+  if (typeof value === 'string') {
+    const cleaned = value.trim().replace(/%/g, '').replace(/,/g, '.');
+    const num = Number(cleaned);
+
+    if (!Number.isFinite(num)) {
+      return 0;
+    }
+
+    return num > 1
+      ? Math.min(100, Math.max(0, num))
+      : Math.min(100, Math.max(0, num * 100));
+  }
+
+  const num = Number(value);
+
+  if (!Number.isFinite(num)) {
+    return 0;
+  }
+
+  return num > 1
+    ? Math.min(100, Math.max(0, num))
+    : Math.min(100, Math.max(0, num * 100));
+}
+
 function calculateMtfScore(alignment) {
   const values = Object.values(alignment || {});
 
@@ -85,13 +104,23 @@ function calculateMtfScore(alignment) {
   }
 
   const positiveCount = values.filter((value) => {
-    return value && value.positive;
+    if (typeof value === 'boolean') {
+      return value === true;
+    }
+
+    if (value && typeof value === 'object') {
+      if (typeof value.positive !== 'undefined') {
+        return value.positive === true;
+      }
+      return !!value;
+    }
+
+    return !!value;
   }).length;
 
   return positiveCount / values.length;
 }
 
-// small helper to provide account equity (USD) to other modules
 async function getAccountEquityUsd() {
   try {
     if (tradeManager && typeof tradeManager.getAccountInfo === 'function') {
@@ -151,8 +180,7 @@ module.exports = {
       return null;
     }
 
-    const normalizedSignalType =
-      normalizeEventType(signalType);
+    const normalizedSignalType = normalizeEventType(signalType);
 
     const key = buildEventKey({
       symbol,
@@ -188,12 +216,16 @@ module.exports = {
       let mdata = null;
 
       try {
-        mdata =
-          await marketData.updateSymbolMarketData(
-            symbol
-          );
+        if (
+          marketData &&
+          typeof marketData.updateSymbolMarketData === 'function'
+        ) {
+          mdata = await marketData.updateSymbolMarketData(symbol);
 
-        if (!mdata) {
+          if (!mdata) {
+            mdata = buildFallbackMarketData();
+          }
+        } else {
           mdata = buildFallbackMarketData();
         }
       } catch (err) {
@@ -208,9 +240,6 @@ module.exports = {
         mdata = buildFallbackMarketData();
       }
 
-      // TradingView fetch:
-      // - score should always be normalized to 0..100 for notifications
-      // - if TradingView returns 0 because symbol not in scanner, fallback score must fill in
       let tv = {
         score: 0,
         score_pct: 0,
@@ -225,59 +254,47 @@ module.exports = {
           'handleRootSignal: fetching TV rating'
         );
 
-        const tvRes =
-          await tradingview.getOrFetchTvRatingCached(
-            symbol
-          );
+        if (
+          tradingview &&
+          typeof tradingview.getOrFetchTvRatingCached === 'function'
+        ) {
+          const tvRes =
+            await tradingview.getOrFetchTvRatingCached(symbol);
 
-        if (tvRes) {
-          const normalizedScore =
-            typeof tvRes.score === 'number'
-              ? tvRes.score
-              : 0;
+          if (tvRes) {
+            let safePercent = 0;
 
-          const rawPercent =
-            Number(
-              tvRes.tvScore ??
-              tvRes.score_pct ??
-              tvRes.scorePct ??
-              (
-                typeof normalizedScore === 'number'
-                  ? Math.round(normalizedScore * 100)
-                  : 0
-              )
-            );
+            if (typeof tvRes.tvScore === 'number' && tvRes.tvScore > 0) {
+              safePercent = Math.min(100, Math.max(0, tvRes.tvScore));
+            } else if (typeof tvRes.score_pct === 'number' && tvRes.score_pct > 0) {
+              safePercent = Math.min(100, Math.max(0, tvRes.score_pct));
+            } else if (typeof tvRes.scorePct === 'number' && tvRes.scorePct > 0) {
+              safePercent = Math.min(100, Math.max(0, tvRes.scorePct));
+            } else if (typeof tvRes.score === 'number' && tvRes.score > 0) {
+              const rawVal = tvRes.score;
+              safePercent = rawVal > 1 ? Math.min(100, rawVal) : Math.round(rawVal * 100);
+            }
 
-          const safePercent = Number.isFinite(rawPercent)
-            ? Math.min(100, Math.max(0, rawPercent))
-            : 0;
-
-          tv = {
-            score: normalizedScore,
-            score_pct: safePercent,
-            scorePct: safePercent,
-            tvScore: safePercent,
-            source: tvRes.source || 'unknown'
-          };
-
-          logger.info(
-            {
-              symbol,
-              score: tv.score,
-              score_pct: tv.score_pct,
-              tvScore: tv.tvScore,
-              source: tv.source
-            },
-            'TV rating acquired'
-          );
-        } else {
-          logger.warn(
-            {
-              symbol
-            },
-            'TV rating fetch returned invalid result'
-          );
+            tv = {
+              score: safePercent / 100,
+              score_pct: safePercent,
+              scorePct: safePercent,
+              tvScore: safePercent,
+              source: tvRes.source || 'unknown'
+            };
+          }
         }
+
+        logger.info(
+          {
+            symbol,
+            score: tv.score,
+            score_pct: tv.score_pct,
+            tvScore: tv.tvScore,
+            source: tv.source
+          },
+          'TV rating acquired'
+        );
       } catch (err) {
         logger.warn(
           {
@@ -297,29 +314,25 @@ module.exports = {
       const decision =
         await this.applyDecision(alignment);
 
-      // Critical fix: do not leave TV at zero when the symbol is unsupported or when scanner is empty.
-      // Replace with computed fallback based on MTF positive fraction and recent volume change.
       if (
         (!tv || Number(tv.score_pct || tv.tvScore || 0) === 0) &&
+        tradingview &&
         typeof tradingview.fallbackScore === 'function'
       ) {
         try {
           const fallback = tradingview.fallbackScore({
             macdPositiveFraction: typeof mtfScore === 'number' ? mtfScore : 0,
-            volChangePct: Number.isFinite(Number(mdata?.volume_change_pct))
-              ? Number(mdata.volume_change_pct)
-              : 0
+            volChangePct: Number.isFinite(Number(mdata?.volume_change_pct)) ? Number(mdata.volume_change_pct) : 0
           });
 
-          if (
-            fallback &&
-            Number.isFinite(Number(fallback.score_pct))
-          ) {
+          if (fallback && typeof fallback.tvScore === 'number') {
+            const fallbackPercent = Math.min(100, Math.max(0, fallback.tvScore));
+
             tv = {
-              score: Number(fallback.score) || 0,
-              score_pct: Number(fallback.score_pct) || 0,
-              scorePct: Number(fallback.scorePct) || Number(fallback.score_pct) || 0,
-              tvScore: Number(fallback.tvScore) || Number(fallback.score_pct) || 0,
+              score: fallbackPercent / 100,
+              score_pct: fallbackPercent,
+              scorePct: fallbackPercent,
+              tvScore: fallbackPercent,
               source: 'computed_fallback',
               raw: null
             };
@@ -381,13 +394,15 @@ module.exports = {
         marketData: mdata || {}
       };
 
-      dbModule.insertSignal({
-        symbol,
-        root_tf,
-        detected_at,
-        state: 'detected',
-        meta
-      });
+      if (dbModule && typeof dbModule.insertSignal === 'function') {
+        dbModule.insertSignal({
+          symbol,
+          root_tf,
+          detected_at,
+          state: 'detected',
+          meta
+        });
+      }
 
       const signalObj = {
         key,
@@ -417,10 +432,15 @@ module.exports = {
           'handleRootSignal: enqueuing immediate notification'
         );
 
-        notificationQueue.enqueueSignal(
-          signalObj,
-          queueType
-        );
+        if (
+          notificationQueue &&
+          typeof notificationQueue.enqueueSignal === 'function'
+        ) {
+          notificationQueue.enqueueSignal(
+            signalObj,
+            queueType
+          );
+        }
       } else {
         logger.debug(
           {
@@ -540,23 +560,37 @@ module.exports = {
 
           if (passFilters) {
             try {
-              await tradeManager.openTrade({
-                symbol,
-                root_tf,
-                alignment,
-                meta,
-                eventId,
-                signalType: normalizedSignalType
-              });
-
-              logger.info(
-                {
+              if (
+                tradeManager &&
+                typeof tradeManager.openTrade === 'function'
+              ) {
+                await tradeManager.openTrade({
                   symbol,
                   root_tf,
-                  eventId
-                },
-                'handleRootSignal: trade opening initiated'
-              );
+                  alignment,
+                  meta,
+                  eventId,
+                  signalType: normalizedSignalType
+                });
+
+                logger.info(
+                  {
+                    symbol,
+                    root_tf,
+                    eventId
+                  },
+                  'handleRootSignal: trade opening initiated'
+                );
+              } else {
+                logger.warn(
+                  {
+                    symbol,
+                    root_tf,
+                    eventId
+                  },
+                  'handleRootSignal: tradeManager.openTrade not available'
+                );
+              }
             } catch (err) {
               logger.error(
                 {
@@ -610,6 +644,17 @@ module.exports = {
       const tf = String(configuredTf);
 
       try {
+        if (
+          !macd ||
+          typeof macd.computeMacdHistogram !== 'function'
+        ) {
+          result[tf] = {
+            ok: false,
+            positive: false
+          };
+          continue;
+        }
+
         const hist =
           await macd.computeMacdHistogram(
             symbol,
