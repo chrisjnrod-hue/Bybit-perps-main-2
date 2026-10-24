@@ -70,9 +70,7 @@ function getSignalId(signal) {
 }
 
 function resolveQueueItemType(type, signal = null) {
-  const rawType = String(type || '')
-    .trim()
-    .toLowerCase();
+  const rawType = String(type || '').trim().toLowerCase();
 
   const aliasMap = {
     'new_root_candle_open': 'root_candle_open_batch',
@@ -97,9 +95,7 @@ function resolveQueueItemType(type, signal = null) {
   }
 
   if (!rawType) {
-    const notificationType = String(getNotificationType(signal) || '')
-      .trim()
-      .toLowerCase();
+    const notificationType = String(getNotificationType(signal) || '').trim().toLowerCase();
 
     const signalMap = {
       'new_root_candle_open': 'root_candle_open_batch',
@@ -269,10 +265,7 @@ class NotificationQueue {
       return false;
     }
 
-    const normalized = this.normalizeSignal(
-      signal,
-      type === 'realtime' ? null : type
-    );
+    const normalized = this.normalizeSignal(signal, type === 'realtime' ? null : type);
 
     if (!normalized) {
       logger.warn({ signal, type }, 'NotificationQueue: signal normalization failed');
