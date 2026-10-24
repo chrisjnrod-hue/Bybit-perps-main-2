@@ -1,3 +1,4 @@
+// telegram.js
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('../config');
 const logger = require('pino')();
@@ -55,16 +56,12 @@ function normalizeNotificationType(signal) {
 module.exports = {
   init() {
     if (!config.TELEGRAM_BOT_TOKEN) {
-      logger.warn(
-        'Telegram token not configured; telegram disabled'
-      );
+      logger.warn('Telegram token not configured; telegram disabled');
       return;
     }
 
     if (!config.TELEGRAM_CHAT_ID) {
-      logger.warn(
-        'Telegram chat ID not configured; telegram disabled'
-      );
+      logger.warn('Telegram chat ID not configured; telegram disabled');
       return;
     }
 
@@ -76,9 +73,7 @@ module.exports = {
         }
       );
 
-      logger.info(
-        'Telegram bot initialized'
-      );
+      logger.info('Telegram bot initialized');
     }
   },
 
@@ -96,10 +91,7 @@ module.exports = {
     return bot;
   },
 
-  getLabel(
-    index,
-    { lowercase = true } = {}
-  ) {
+  getLabel(index, { lowercase = true } = {}) {
     if (
       typeof index !== 'number' ||
       index < 0
@@ -442,62 +434,6 @@ module.exports = {
           )
         : null;
 
-    const flipFrom =
-      meta.flipFrom ||
-      meta.lastFlipFrom ||
-      null;
-
-    const flipTo =
-      meta.flipTo ||
-      meta.lastFlipTo ||
-      null;
-
-    const candleOpen =
-      meta.candleOpen ??
-      meta.candle_open_time ??
-      meta.candleOpenTime ??
-      null;
-
-    const tfText =
-      meta.timeframe ||
-      root_tf ||
-      null;
-
-    const extraLines = [];
-
-    if (
-      notificationType === 'mtf_alignment' &&
-      (flipFrom || flipTo || candleOpen || tfText)
-    ) {
-      extraLines.push(
-        '🔁 Flip Details:'
-      );
-
-      if (flipFrom) {
-        extraLines.push(
-          `From: ${String(flipFrom).toUpperCase()}`
-        );
-      }
-
-      if (flipTo) {
-        extraLines.push(
-          `To: ${String(flipTo).toUpperCase()}`
-        );
-      }
-
-      if (candleOpen) {
-        extraLines.push(
-          `Candle Open: ${Number(candleOpen).toFixed(8)}`
-        );
-      }
-
-      if (tfText) {
-        extraLines.push(
-          `TF: ${tfText}`
-        );
-      }
-    }
-
     const msgParts = [
       ...(eventTitle
         ? [
@@ -517,7 +453,6 @@ module.exports = {
       '',
       mtfHeader,
       alignmentLines || 'No MTF data',
-      ...(extraLines.length > 0 ? ['', ...extraLines] : []),
       '',
       marketBlock
     ];
@@ -701,21 +636,14 @@ module.exports = {
     this.ensureInitialized();
 
     try {
-      let signals =
-        Array.isArray(snapshot)
-          ? snapshot
-          : [];
+      let signals = Array.isArray(snapshot) ? snapshot : [];
 
       if (timeframeFilter) {
-        const targetTf =
-          String(timeframeFilter);
+        const targetTf = String(timeframeFilter);
 
-        signals =
-          signals.filter((signal) => {
-            return String(
-              signal.root_tf || ''
-            ) === targetTf;
-          });
+        signals = signals.filter((signal) => {
+          return String(signal.root_tf || '') === targetTf;
+        });
       }
 
       if (signals.length === 0) {
@@ -731,27 +659,19 @@ module.exports = {
 
       const delayMs = Math.max(
         500,
-        Number(
-          config.TELEGRAM_SEND_DELAY_MS
-        ) || 1000
+        Number(config.TELEGRAM_SEND_DELAY_MS) || 1000
       );
 
       const tfCounts = {};
       const symbolSet = new Set();
 
       for (const signal of signals) {
-        const tf =
-          String(
-            signal.root_tf || 'unknown'
-          );
+        const tf = String(signal.root_tf || 'unknown');
 
-        tfCounts[tf] =
-          (tfCounts[tf] || 0) + 1;
+        tfCounts[tf] = (tfCounts[tf] || 0) + 1;
 
         if (signal.symbol) {
-          symbolSet.add(
-            signal.symbol
-          );
+          symbolSet.add(signal.symbol);
         }
       }
 
@@ -767,55 +687,39 @@ module.exports = {
           : Object.keys(tfCounts);
 
       if (timeframeFilter) {
-        const targetTf =
-          String(timeframeFilter);
+        const targetTf = String(timeframeFilter);
 
-        orderedRootTfs = [
-          targetTf
-        ];
+        orderedRootTfs = [targetTf];
       } else {
-        for (
-          const tf of Object.keys(tfCounts)
-        ) {
-          if (
-            !orderedRootTfs.includes(tf)
-          ) {
+        for (const tf of Object.keys(tfCounts)) {
+          if (!orderedRootTfs.includes(tf)) {
             orderedRootTfs.push(tf);
           }
         }
       }
 
-      const summaryParts =
-        orderedRootTfs.map((tf) => {
-          return `${tf}: ${tfCounts[tf] || 0}`;
-        });
+      const summaryParts = orderedRootTfs.map((tf) => {
+        return `${tf}: ${tfCounts[tf] || 0}`;
+      });
 
-      const allSymbols =
-        Array.from(symbolSet).sort(
-          (a, b) => {
-            return a.localeCompare(
-              b,
-              undefined,
-              {
-                sensitivity: 'base'
-              }
-            );
+      const allSymbols = Array.from(symbolSet).sort((a, b) => {
+        return a.localeCompare(
+          b,
+          undefined,
+          {
+            sensitivity: 'base'
           }
         );
+      });
 
-      const symbolLines =
-        allSymbols.length > 0
-          ? allSymbols.join('\n')
-          : 'n/a';
+      const symbolLines = allSymbols.length > 0 ? allSymbols.join('\n') : 'n/a';
 
       const header =
         `${title} (${signals.length} signals):\n` +
         `${summaryParts.join(' • ')}\n\n` +
         symbolLines;
 
-      await this._sendMessage(
-        header
-      );
+      await this._sendMessage(header);
 
       logger.info(
         {
@@ -828,39 +732,33 @@ module.exports = {
 
       await this._sleep(delayMs);
 
-      const sortedSignals =
-        [...signals].sort((a, b) => {
-          const symbolOrder =
-            String(a.symbol || '').localeCompare(
-              String(b.symbol || ''),
-              undefined,
-              {
-                sensitivity: 'base'
-              }
-            );
-
-          if (symbolOrder !== 0) {
-            return symbolOrder;
-          }
-
-          return String(
-            a.root_tf || ''
-          ).localeCompare(
-            String(b.root_tf || ''),
+      const sortedSignals = [...signals].sort((a, b) => {
+        const symbolOrder =
+          String(a.symbol || '').localeCompare(
+            String(b.symbol || ''),
             undefined,
             {
-              numeric: true
+              sensitivity: 'base'
             }
           );
-        });
 
-      for (
-        let i = 0;
-        i < sortedSignals.length;
-        i += 1
-      ) {
-        const signal =
-          sortedSignals[i];
+        if (symbolOrder !== 0) {
+          return symbolOrder;
+        }
+
+        return String(
+          a.root_tf || ''
+        ).localeCompare(
+          String(b.root_tf || ''),
+          undefined,
+          {
+            numeric: true
+          }
+        );
+      });
+
+      for (let i = 0; i < sortedSignals.length; i += 1) {
+        const signal = sortedSignals[i];
 
         await this.sendNewSignalSingleBlock(
           signal,
@@ -884,22 +782,19 @@ module.exports = {
       let openCount = 0;
 
       try {
-        const row =
-          dbModule
-            .get()
-            .prepare(
-              `
+        if (dbModule && typeof dbModule.get === 'function') {
+          const db = dbModule.get();
+          if (db && typeof db.prepare === 'function') {
+            const row =
+              db.prepare(`
                 SELECT COUNT(*) AS cnt
                 FROM trades
                 WHERE status = 'open'
-              `
-            )
-            .get();
+              `).get();
 
-        openCount =
-          row
-            ? Number(row.cnt || 0)
-            : 0;
+            openCount = row ? Number(row.cnt || 0) : 0;
+          }
+        }
       } catch (err) {
         logger.debug(
           { err },
@@ -909,10 +804,7 @@ module.exports = {
         openCount = 0;
       }
 
-      const maxOpenTrades =
-        Number(
-          config.MAX_OPEN_TRADES
-        ) || 0;
+      const maxOpenTrades = Number(config.MAX_OPEN_TRADES) || 0;
 
       const maxSlots =
         Math.max(
@@ -923,57 +815,53 @@ module.exports = {
       const recommendedHeader =
         `📈 Recommended to Open (${maxSlots} slots available):`;
 
-      await this._sendMessage(
-        recommendedHeader
-      );
+      await this._sendMessage(recommendedHeader);
 
       await this._sleep(delayMs);
 
-      const candidates =
-        signals
-          .map((signal) => {
-            return {
-              symbol:
-                signal.symbol,
-              root_tf:
-                signal.root_tf,
-              tvScore:
-                Number(
-                  signal.meta?.tvScore || 0
-                ),
-              mtfScore:
-                Number(
-                  signal.meta?.mtfScore || 0
-                ),
-              acceptDecision:
-                signal.meta?.decision ||
-                'monitor',
-              reason:
-                signal.meta?.acceptReason ||
-                'n/a'
-            };
-          })
-          .filter((candidate) => {
-            return (
-              candidate.acceptDecision ===
-              'accept'
-            );
-          })
-          .sort((a, b) => {
-            if (
-              b.tvScore !== a.tvScore
-            ) {
-              return b.tvScore - a.tvScore;
-            }
+      const candidates = signals
+        .map((signal) => {
+          return {
+            symbol:
+              signal.symbol,
+            root_tf:
+              signal.root_tf,
+            tvScore:
+              Number(
+                signal.meta?.tvScore || 0
+              ),
+            mtfScore:
+              Number(
+                signal.meta?.mtfScore || 0
+              ),
+            acceptDecision:
+              signal.meta?.decision ||
+              'monitor',
+            reason:
+              signal.meta?.acceptReason ||
+              'n/a'
+          };
+        })
+        .filter((candidate) => {
+          return (
+            candidate.acceptDecision ===
+            'accept'
+          );
+        })
+        .sort((a, b) => {
+          if (
+            b.tvScore !== a.tvScore
+          ) {
+            return b.tvScore - a.tvScore;
+          }
 
-            return b.mtfScore - a.mtfScore;
-          });
+          return b.mtfScore - a.mtfScore;
+        });
 
-      const recommended =
-        candidates.slice(
-          0,
-          Math.max(0, maxSlots)
-        );
+      const recommended = candidates.slice(
+        0,
+        Math.max(0, maxSlots)
+      );
 
       if (recommended.length === 0) {
         await this._sendMessage(
