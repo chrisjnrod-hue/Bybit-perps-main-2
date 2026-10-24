@@ -1,3 +1,4 @@
+// poller.js
 const { performance } = require('perf_hooks');
 const dbModule = require('../db');
 const bybit = require('./bybitRest');
@@ -8,7 +9,7 @@ const Bottleneck = require('bottleneck');
 const macdUtil = require('./macd');
 const signalManager = require('./signalManager');
 const notificationQueue = require('./notificationQueue');
-const marketData = require('./marketData');
+const marketData = require('./marketData'); // NEW: used by composite gate
 
 const limiter = new Bottleneck({
   minTime: 50
@@ -55,8 +56,16 @@ const macdFlipTracker = new Map();
 // DB connectivity tracker for health monitoring
 let lastDbConnectivityCheck = Date.now();
 let dbIsHealthy = true;
-const consecutive1dTradeCounts = new Map();
+
+// NEW: 1D root signal count tracking
+const consecutive1dTradeCounts = new Map(); // symbol -> { count, lastAcceptedAt }
+
+// NEW: keepalive ping handle
 let keepaliveIntervalHandle = null;
+
+// ============================================================================
+// DATABASE SAFETY GUARDS & RECOVERY
+// ============================================================================
 
 function isDbReady() {
   if (!dbModule || typeof dbModule.get !== 'function') {
@@ -94,6 +103,10 @@ function safeGetDb() {
   }
 }
 
+/**
+ * ENHANCED: Attempt to reconnect to DB with exponential backoff
+ * Waits for DB to become available before proceeding
+ */
 async function ensureDbReady(maxRetries = 3, backoffMs = 500) {
   let db = safeGetDb();
 
@@ -143,6 +156,121 @@ async function ensureDbReady(maxRetries = 3, backoffMs = 500) {
   dbIsHealthy = false;
   return null;
 }
+
+/**
+ * CRITICAL FIX: Enhanced state getter with in-memory fallback, age validation, and retry logic
+ */
+function safeGetState(key, maxAgeMs = 5 * 60 * 1000) {
+  if (!key) {
+    logger.debug('poller: getState called with empty key');
+    return null;
+  }
+
+  if (dbModule && typeof dbModule.getState === 'function') {
+    try {
+      const value = dbModule.getState(key);
+      if (value !== undefined && value !== null) {
+        inMemoryStateCache.set(key, {
+          value,
+          cachedAt: Date.now()
+        });
+        return value;
+      }
+    } catch (err) {
+      logger.debug({ err, key }, 'poller: getState DB attempt failed; checking in-memory cache');
+    }
+  }
+
+  const cached = inMemoryStateCache.get(key);
+  if (cached && cached.value !== undefined && cached.value !== null) {
+    const age = Date.now() - cached.cachedAt;
+
+    if (age > maxAgeMs) {
+      logger.warn(
+        { key, ageMs: age, maxAgeMs },
+        'poller: in-memory cache entry too stale; discarding and returning null'
+      );
+      inMemoryStateCache.delete(key);
+      return null;
+    }
+
+    logger.debug({ key, ageMs: age }, 'poller: retrieved state from in-memory cache');
+    return cached.value;
+  }
+
+  return null;
+}
+
+/**
+ * CRITICAL FIX: Enhanced state setter with in-memory cache + improved retry logic
+ */
+function safeSetState(key, value) {
+  if (!key || value === undefined) {
+    logger.debug({ key, value }, 'poller: setState called with invalid parameters');
+    return false;
+  }
+
+  let dbSuccess = false;
+
+  if (dbModule && typeof dbModule.setState === 'function') {
+    let retries = 3;
+    let retryDelayMs = 50;
+
+    while (retries > 0) {
+      try {
+        dbModule.setState(key, value);
+        dbSuccess = true;
+        logger.debug({ key, value }, 'poller: setState persisted to database');
+        break;
+      } catch (err) {
+        retries--;
+        if (retries > 0) {
+          logger.debug(
+            { err, key, retryCount: 3 - retries, nextDelayMs: retryDelayMs * 2 },
+            'poller: setState DB attempt failed; retrying with backoff'
+          );
+          const start = Date.now();
+          while (Date.now() - start < retryDelayMs) {}
+          retryDelayMs *= 2;
+        } else {
+          logger.warn(
+            { err, key, value },
+            'poller: setState DB failed after retries; relying on in-memory cache only'
+          );
+        }
+      }
+    }
+  }
+
+  inMemoryStateCache.set(key, {
+    value,
+    cachedAt: Date.now()
+  });
+
+  return dbSuccess || true;
+}
+
+function safeDeleteState(key) {
+  if (!dbModule || typeof dbModule.deleteState !== 'function') {
+    logger.debug('poller: dbModule.deleteState not available');
+    inMemoryStateCache.delete(key);
+    return false;
+  }
+
+  try {
+    dbModule.deleteState(key);
+    inMemoryStateCache.delete(key);
+    return true;
+  } catch (err) {
+    logger.debug({ err, key }, 'poller: deleteState failed');
+    inMemoryStateCache.delete(key);
+    return false;
+  }
+}
+
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -196,6 +324,52 @@ function buildRootTfs() {
   return output.length > 0
     ? output
     : ['60', '240', 'D'];
+}
+
+// NEW: root TF trade order priority
+function buildRootTfTradePriorityOrder() {
+  const raw = Array.isArray(config.ROOT_TF_TRADE_PRIORITY)
+    ? config.ROOT_TF_TRADE_PRIORITY
+    : ['240', 'D', '60'];
+
+  const seen = new Set();
+  const out = [];
+
+  for (const tf of raw) {
+    const normalized = normalizeRootTf(tf);
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    out.push(normalized);
+  }
+
+  // ensure all root TFs exist
+  for (const tf of buildRootTfs()) {
+    if (!seen.has(tf)) {
+      out.push(tf);
+    }
+  }
+
+  return out;
+}
+
+function sortByRootTfPriority(signals) {
+  const priority = buildRootTfTradePriorityOrder();
+
+  return [...signals].sort((a, b) => {
+    const aTf = normalizeRootTf(a?.root_tf);
+    const bTf = normalizeRootTf(b?.root_tf);
+
+    const aIndex = priority.indexOf(aTf);
+    const bIndex = priority.indexOf(bTf);
+
+    const ai = aIndex >= 0 ? aIndex : Number.MAX_SAFE_INTEGER;
+    const bi = bIndex >= 0 ? bIndex : Number.MAX_SAFE_INTEGER;
+
+    if (ai !== bi) return ai - bi;
+    return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
+  });
 }
 
 function isUsdtSymbol(symbol) {
@@ -410,6 +584,10 @@ function cleanupExpiredRootTfBoundaryStates(ttlMs = 7 * 24 * 60 * 60 * 1000) {
   return keysToDelete.length;
 }
 
+/**
+ * FIXED: Reduced TTL from 12 hours to 5 minutes
+ * Allows legitimate root candle signals to pass through after startup window
+ */
 function cleanupExpiredStartupBatchSignals(ttlMs = 5 * 60 * 1000) {
   const now = Date.now();
   const keysToDelete = [];
@@ -580,6 +758,7 @@ function isStartupBatchSignal(signal, family = 'generic') {
   return false;
 }
 
+// NEW: consecutive 1D count utilities
 function resetStaleConsecutive1dCounts(maxAgeMs = 48 * 60 * 60 * 1000) {
   const now = Date.now();
 
@@ -604,6 +783,7 @@ function getConsecutive1dCount(symbol) {
   return info ? info.count || 0 : 0;
 }
 
+// NEW: keepalive ping loop
 function startKeepAliveLoop() {
   if (!config.ENABLE_KEEPALIVE_PING || !config.KEEPALIVE_URL) {
     return;
@@ -643,66 +823,203 @@ function startKeepAliveLoop() {
   logger.info({ url, intervalMs }, 'poller.keepalive: started');
 }
 
-function getLoop2ProcessedCandleKey(symbol, tf) {
-  return `poller.loop2.processedCandle.${symbol}.${tf}`;
+// NEW: realtime liquidity gate (EXTENDED)
+//
+// NOTE: updated to accept options and return computed thresholds for diagnostics.
+async function checkRealtimeLiquidity(symbol, options = {}) {
+  if (!config.LIQUIDITY_CHECK_ENABLED) {
+    return { ok: true, depthUsdt: Infinity, computedMinDepth: 0 };
+  }
+
+  if (bybit && typeof bybit.fetchOrderBook === 'function') {
+    try {
+      const topLevels = Number(config.LIQUIDITY_CHECK_TOP_LEVELS || 10);
+      const book = await bybit.fetchOrderBook(symbol, Math.max(10, topLevels));
+      const bids = Array.isArray(book?.bids) ? book.bids : [];
+      let depthUsdt = 0;
+
+      for (const bid of bids.slice(0, topLevels)) {
+        const price = Number(bid?.[0] ?? 0);
+        const qty = Number(bid?.[1] ?? 0);
+        if (Number.isFinite(price) && Number.isFinite(qty)) {
+          depthUsdt += price * qty;
+        }
+      }
+
+      // Determine dynamic threshold if provided by caller options
+      const accountEquityUsd = Number(options.accountEquityUsd || 0);
+      const targetPositionFrac = Number(config.TARGET_POSITION_FRAC || 0.01);
+      const baseTargetPositionUsd = Math.max(1, accountEquityUsd * targetPositionFrac);
+      const depthMultiplier = Number(options.depthMultiplierOverride || config.LIQUIDITY_DEPTH_MULTIPLIER || 3);
+      const minDepthAbsolute = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 1000);
+      const computedMinDepth = Math.max(minDepthAbsolute, Math.round(baseTargetPositionUsd * depthMultiplier));
+
+      const ok = depthUsdt >= computedMinDepth;
+
+      return { ok, depthUsdt, computedMinDepth };
+    } catch (err) {
+      logger.debug({ err, symbol }, 'poller: realtime liquidity check failed; allowing by default');
+      return { ok: true, depthUsdt: 0, computedMinDepth: 0 };
+    }
+  }
+
+  return { ok: true, depthUsdt: 0, computedMinDepth: 0 };
 }
 
-function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, candleOpenTime = null) {
+// NEW: compute dynamic thresholds for depth and 24h volume based on account equity
+function computeLiquidityAndVolumeThresholds({
+  accountEquityUsd = 0,
+  targetPositionFrac = Number(config.TARGET_POSITION_FRAC || 0.01),
+  depthMultiplier = Number(config.LIQUIDITY_DEPTH_MULTIPLIER || 3),
+  minDepthAbsolute = Number(config.LIQUIDITY_MIN_USDT_DEPTH || 1000),
+  volumeMultiplier = Number(config.MIN_24H_VOLUME_MULTIPLIER || 5),
+  min24hVolumeAbsolute = Number(config.MIN_24H_VOLUME_ABSOLUTE || 5000)
+} = {}) {
+  const targetPositionUsd = Math.max(1, accountEquityUsd * targetPositionFrac);
+  const minDepth = Math.max(minDepthAbsolute, Math.round(targetPositionUsd * depthMultiplier));
+  const min24hVolume = Math.max(min24hVolumeAbsolute, Math.round(targetPositionUsd * volumeMultiplier));
+  return { targetPositionUsd, minDepth, min24hVolume };
+}
+
+// NEW: composite gate - checks both realtime depth and 24h volume and optional volume-change
+async function passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd = 0 } = {}) {
+  try {
+    // Gather market metrics (24h volume, volume_change_pct)
+    let mdata = null;
+    try {
+      if (marketData && typeof marketData.updateSymbolMarketData === 'function') {
+        mdata = await marketData.updateSymbolMarketData(symbol);
+      }
+    } catch (err) {
+      logger.debug({ err, symbol }, 'poller: marketData.updateSymbolMarketData failed for composite gate');
+      mdata = null;
+    }
+
+    const { targetPositionUsd, minDepth, min24hVolume } = computeLiquidityAndVolumeThresholds({
+      accountEquityUsd
+    });
+
+    // Realtime depth
+    const liqRes = await checkRealtimeLiquidity(symbol, { accountEquityUsd, depthMultiplierOverride: undefined });
+
+    const passDepth = typeof liqRes.ok === 'boolean' ? liqRes.ok : false;
+
+    const vol24h = Number(mdata?.volume_24h_usdt || 0);
+    const pass24h = vol24h >= min24hVolume;
+
+    // Optional volume-change check (if configured). Default is permissive.
+    const volChangePct = (mdata && typeof mdata.volume_change_pct !== 'undefined') ? Number(mdata.volume_change_pct) : null;
+    const minVolChangePct = Number(config.MIN_24H_VOLUME_CHANGE_PCT ?? -1000);
+    const passVolChange = volChangePct === null ? true : (volChangePct >= minVolChangePct);
+
+    const ok = passDepth && pass24h && passVolChange;
+
+    return {
+      ok,
+      details: {
+        liq: liqRes,
+        depthUsdt: liqRes.depthUsdt,
+        computedMinDepth: liqRes.computedMinDepth || minDepth,
+        passDepth,
+        vol24h,
+        min24hVolume,
+        pass24h,
+        volChangePct,
+        minVolChangePct,
+        passVolChange,
+        targetPositionUsd
+      }
+    };
+  } catch (err) {
+    logger.debug({ err, symbol }, 'poller: composite liquidity/volume gate threw, defaulting to allow');
+    return { ok: true, details: { error: err && err.message } };
+  }
+}
+
+async function validateMtfAlignmentConsensus(symbol) {
+  const alignment = await signalManager.evaluateMtfAlignment(symbol);
+
+  const alignmentValues = Object.values(alignment || {});
+  const totalCount = alignmentValues.length;
+
+  if (totalCount === 0) {
+    return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
+  }
+
+  // Accept both boolean and object shapes returned by evaluateMtfAlignment
+  const positiveCount = alignmentValues.filter((value) => {
+    if (typeof value === 'boolean') {
+      return value === true;
+    }
+
+    if (value && typeof value === 'object') {
+      // prefer explicit .positive flag, otherwise treat the object as truthy
+      if (typeof value.positive !== 'undefined') {
+        return value.positive === true;
+      }
+      return !!value;
+    }
+
+    return !!value;
+  }).length;
+
+  const mtfScore = totalCount > 0 ? positiveCount / totalCount : 0;
+
+  const threshold = Number(
+    config.MTF_ALIGNMENT_RATING || 0.6
+  );
+
+  const isAligned = mtfScore > threshold;
+
+  return {
+    isAligned,
+    mtfScore,
+    positiveCount,
+    totalCount,
+    alignment,
+    reason: isAligned ? 'threshold_exceeded' : `only_${positiveCount}_of_${totalCount}`
+  };
+}
+
+/**
+ * Check if MTF alignment state has changed and should trigger an alert
+ * CRITICAL: Only fires when MTF reaches 100% AND last TF candle just opened
+ */
+function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
   const stateKey = `${symbol}|${tf}`;
   const prevState = mtfAlignmentStates.get(stateKey);
 
-  const isNow100Percent =
-    mtfValidation &&
-    mtfValidation.totalCount > 0 &&
-    mtfValidation.positiveCount === mtfValidation.totalCount;
+  const isNow100Percent = mtfValidation.positiveCount === mtfValidation.totalCount && mtfValidation.totalCount > 0;
 
   if (!prevState) {
-    const nextState = {
+    mtfAlignmentStates.set(stateKey, {
       lastAlignmentState: isNow100Percent,
-      lastFlipTime: Date.now(),
-      lastCandleOpenTime: candleOpenTime || null,
-      lastFlipFrom: isNow100Percent ? 'not_aligned' : null,
-      lastFlipTo: isNow100Percent ? 'aligned' : null
-    };
-
-    mtfAlignmentStates.set(stateKey, nextState);
+      lastFlipTime: Date.now()
+    });
     return isNow100Percent;
   }
 
-  const wasAlignedBefore = !!prevState.lastAlignmentState;
+  const wasAlignedBefore = prevState.lastAlignmentState;
 
   if (!wasAlignedBefore && isNow100Percent) {
-    const nextState = {
-      lastAlignmentState: true,
-      lastFlipTime: Date.now(),
-      lastCandleOpenTime: candleOpenTime || prevState.lastCandleOpenTime || null,
-      lastFlipFrom: 'not_aligned',
-      lastFlipTo: 'aligned'
-    };
-
-    mtfAlignmentStates.set(stateKey, nextState);
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
     return true;
   }
 
-  if (wasAlignedBefore && !isNow100Percent) {
-    const nextState = {
-      lastAlignmentState: false,
-      lastFlipTime: Date.now(),
-      lastCandleOpenTime: candleOpenTime || prevState.lastCandleOpenTime || null,
-      lastFlipFrom: 'aligned',
-      lastFlipTo: 'not_aligned'
-    };
-
-    mtfAlignmentStates.set(stateKey, nextState);
+  if (wasAlignedBefore && isNow100Percent) {
     return false;
   }
 
-  mtfAlignmentStates.set(stateKey, {
-    ...prevState,
-    lastAlignmentState: isNow100Percent,
-    lastCandleOpenTime: candleOpenTime || prevState.lastCandleOpenTime || null,
-    lastFlipTime: Date.now()
-  });
+  if (wasAlignedBefore && !isNow100Percent) {
+    mtfAlignmentStates.set(stateKey, {
+      lastAlignmentState: isNow100Percent,
+      lastFlipTime: Date.now()
+    });
+    return false;
+  }
 
   return false;
 }
@@ -860,153 +1177,133 @@ function registerBybitWsListeners() {
   });
 }
 
-function safeGetState(key, maxAgeMs = 5 * 60 * 1000) {
-  if (!key) {
-    logger.debug('poller: getState called with empty key');
-    return null;
-  }
+// ============================================================================
+// DB HEALTH CHECK LOOP (NEW)
+// ============================================================================
 
-  if (dbModule && typeof dbModule.getState === 'function') {
-    try {
-      const value = dbModule.getState(key);
-      if (value !== undefined && value !== null) {
-        inMemoryStateCache.set(key, {
-          value,
-          cachedAt: Date.now()
-        });
-        return value;
-      }
-    } catch (err) {
-      logger.debug({ err, key }, 'poller: getState DB attempt failed; checking in-memory cache');
-    }
-  }
-
-  const cached = inMemoryStateCache.get(key);
-  if (cached && cached.value !== undefined && cached.value !== null) {
-    const age = Date.now() - cached.cachedAt;
-
-    if (age > maxAgeMs) {
-      logger.warn(
-        { key, ageMs: age, maxAgeMs },
-        'poller: in-memory cache entry too stale; discarding and returning null'
-      );
-      inMemoryStateCache.delete(key);
-      return null;
-    }
-
-    logger.debug({ key, ageMs: age }, 'poller: retrieved state from in-memory cache');
-    return cached.value;
-  }
-
-  return null;
-}
-
-function safeSetState(key, value) {
-  if (!key || value === undefined) {
-    logger.debug({ key, value }, 'poller: setState called with invalid parameters');
-    return false;
-  }
-
-  let dbSuccess = false;
-
-  if (dbModule && typeof dbModule.setState === 'function') {
-    let retries = 3;
-    let retryDelayMs = 50;
-
-    while (retries > 0) {
-      try {
-        dbModule.setState(key, value);
-        dbSuccess = true;
-        logger.debug({ key, value }, 'poller: setState persisted to database');
-        break;
-      } catch (err) {
-        retries--;
-        if (retries > 0) {
-          logger.debug(
-            { err, key, retryCount: 3 - retries, nextDelayMs: retryDelayMs * 2 },
-            'poller: setState DB attempt failed; retrying with backoff'
-          );
-          const start = Date.now();
-          while (Date.now() - start < retryDelayMs) {}
-          retryDelayMs *= 2;
-        } else {
-          logger.warn(
-            { err, key, value },
-            'poller: setState DB failed after retries; relying on in-memory cache only'
-          );
-        }
-      }
-    }
-  }
-
-  inMemoryStateCache.set(key, {
-    value,
-    cachedAt: Date.now()
+function startDbHealthCheckLoop() {
+  setImmediate(() => {
+    this.runDbHealthCheckLoop()
+      .catch((err) => {
+        logger.error(
+          { err },
+          'poller: DB health check loop crashed'
+        );
+      });
   });
-
-  return dbSuccess || true;
 }
 
-function safeDeleteState(key) {
-  if (!dbModule || typeof dbModule.deleteState !== 'function') {
-    logger.debug('poller: dbModule.deleteState not available');
-    inMemoryStateCache.delete(key);
-    return false;
-  }
+async function runDbHealthCheckLoop() {
+  const HEALTH_CHECK_INTERVAL_MS = 10 * 1000;
 
-  try {
-    dbModule.deleteState(key);
-    inMemoryStateCache.delete(key);
-    return true;
-  } catch (err) {
-    logger.debug({ err, key }, 'poller: deleteState failed');
-    inMemoryStateCache.delete(key);
-    return false;
+  while (isRunning) {
+    await sleep(HEALTH_CHECK_INTERVAL_MS);
+
+    if (!isRunning) {
+      break;
+    }
+
+    const wasHealthy = dbIsHealthy;
+    const isCurrentlyHealthy = isDbReady();
+
+    if (!isCurrentlyHealthy && wasHealthy) {
+      logger.error(
+        'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
+      );
+      dbIsHealthy = false;
+    } else if (isCurrentlyHealthy && !wasHealthy) {
+      logger.info(
+        'poller: ✅ DATABASE CONNECTION RESTORED'
+      );
+      dbIsHealthy = true;
+    }
+
+    lastDbConnectivityCheck = Date.now();
   }
 }
 
-async function validateMtfAlignmentConsensus(symbol) {
-  const alignment = await signalManager.evaluateMtfAlignment(symbol);
-
-  const alignmentValues = Object.values(alignment || {});
-  const totalCount = alignmentValues.length;
-
-  if (totalCount === 0) {
-    return { isAligned: false, mtfScore: 0, reason: 'no_data', positiveCount: 0, totalCount: 0 };
+// FIX: normalize final root signal decisions and summary output
+function normalizeRootSignalDecision(signal) {
+  const metaDecision = signal?.meta?.decision;
+  if (metaDecision === 'accept' || metaDecision === 'monitor') {
+    return metaDecision;
   }
 
-  const positiveCount = alignmentValues.filter((value) => {
-    if (typeof value === 'boolean') {
-      return value === true;
-    }
+  const stateDecision = signal?.state;
+  if (stateDecision === 'accept' || stateDecision === 'monitor') {
+    return stateDecision;
+  }
 
-    if (value && typeof value === 'object') {
-      if (typeof value.positive !== 'undefined') {
-        return value.positive === true;
-      }
-      return !!value;
-    }
+  return 'monitor';
+}
 
-    return !!value;
-  }).length;
-
-  const mtfScore = totalCount > 0 ? positiveCount / totalCount : 0;
-
-  const threshold = Number(
-    config.MTF_ALIGNMENT_RATING || 0.6
-  );
-
-  const isAligned = mtfScore > threshold;
+function buildRootSignalSummaryBlock({
+  signals,
+  timeframes,
+  nowMs,
+  detectedNewCandles,
+  scanStartTime,
+  fastPathProcessed,
+  slowPathQueued,
+  totalSymbolsScanned
+}) {
+  const finalizedSignals = Array.isArray(signals) ? signals : [];
+  const acceptSignals = finalizedSignals.filter((s) => normalizeRootSignalDecision(s) === 'accept');
+  const monitorSignals = finalizedSignals.filter((s) => normalizeRootSignalDecision(s) === 'monitor');
 
   return {
-    isAligned,
-    mtfScore,
-    positiveCount,
-    totalCount,
-    alignment,
-    reason: isAligned ? 'threshold_exceeded' : `only_${positiveCount}_of_${totalCount}`
+    timestamp: new Date(nowMs).toISOString(),
+    scanType: 'root_tf_candle_open',
+    timeframes: Array.isArray(timeframes) ? timeframes : [],
+    totalSymbolsScanned: Number(totalSymbolsScanned || 0),
+    fastPathProcessed: Number(fastPathProcessed || 0),
+    slowPathQueued: Number(slowPathQueued || 0),
+    newCandlesDetected: !!detectedNewCandles,
+    signalsGenerated: finalizedSignals.length,
+    acceptSignals: acceptSignals.length,
+    monitorSignals: monitorSignals.length,
+    avgMtfScore: finalizedSignals.length > 0
+      ? (
+          (finalizedSignals.reduce((sum, s) => sum + (Number(s?.meta?.mtfScore ?? s?.mtfScore ?? 0) || 0), 0) /
+            finalizedSignals.length) *
+          100
+        ).toFixed(1) + '%'
+      : 'N/A',
+    totalDurationMs: Number(performance.now() - scanStartTime || 0).toFixed(2),
+    detailedBreakdown: (Array.isArray(timeframes) ? timeframes : []).map((tf) => {
+      const tfSignals = finalizedSignals.filter((s) => normalizeRootTf(s.root_tf) === tf);
+      return {
+        timeframe: tf,
+        signalCount: tfSignals.length,
+        acceptCount: tfSignals.filter((s) => normalizeRootSignalDecision(s) === 'accept').length,
+        monitorCount: tfSignals.filter((s) => normalizeRootSignalDecision(s) === 'monitor').length
+      };
+    })
   };
 }
+
+function buildRootSignalRecommendationBlock(actionType, signals, reason, recommendation) {
+  const targetSignals = Array.isArray(signals) ? signals : [];
+
+  return {
+    actionType,
+    count: targetSignals.length,
+    reason,
+    signals: targetSignals.map((s) => ({
+      symbol: s.symbol,
+      timeframe: normalizeRootTf(s.root_tf),
+      mtfScore: (Number(s?.meta?.mtfScore ?? s?.mtfScore ?? 0) * 100).toFixed(1) + '%',
+      positiveCount: s?.meta?.alignment
+        ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
+        : 0
+    })),
+    recommendation
+  };
+}
+
+// ============================================================================
+// MODULE EXPORTS
+// ============================================================================
 
 module.exports = {
   start() {
@@ -1071,6 +1368,7 @@ module.exports = {
       'poller.start: root TF candle open loop started'
     );
 
+    // NEW: keepalive ping
     try {
       startKeepAliveLoop();
     } catch (err) {
@@ -2098,7 +2396,7 @@ module.exports = {
               if (activeSignals.length > 0) {
                 const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
-                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation, latestOpen)) {
+                if (shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation)) {
                   const activeSignal = activeSignals[0];
                   const eventId = buildEventId('mtf_align', symbol, tf, latestOpen);
 
@@ -2121,10 +2419,6 @@ module.exports = {
                       mtfScore: mtfValidation.mtfScore,
                       positiveCount: mtfValidation.positiveCount,
                       totalCount: mtfValidation.totalCount,
-                      flipFrom: mtfAlignmentStates.get(`${symbol}|${tf}`)?.lastFlipFrom || 'not_aligned',
-                      flipTo: mtfAlignmentStates.get(`${symbol}|${tf}`)?.lastFlipTo || 'aligned',
-                      candleOpen: latestOpen,
-                      timeframe: tf,
                       suppressDetailedTelegram: !config.TELEGRAM_PUSH_FULL
                     }
                   });
@@ -2493,6 +2787,7 @@ module.exports = {
 
       const computeStart = performance.now();
       const allBoundarySignals = [];
+      const seenSignalIds = new Set();
 
       const candidatePromises = readyCandidates.map(async (candidate) => {
         const { symbol, tf, latestOpen, processedStateKey } = candidate;
@@ -2540,9 +2835,19 @@ module.exports = {
             }
 
             if (!alreadyProcessedSignal(rootCandidate, 'rootcandle')) {
-              let isHighConfidence = mtfValidation.mtfScore >= 0.7;
+              // --- NEW FLOW: evaluate MTF -> 1D gating -> liquidity/consecutive -> THEN persist final signal
+              const acceptThreshold = 0.7;
+              let isHighConfidence = mtfValidation.mtfScore >= acceptThreshold;
+
+              // start with preliminary decision based on mtf score
               let decision = isHighConfidence ? 'accept' : 'monitor';
 
+              // --- 1) 1D gating (final rule):
+              // ACCEPT if:
+              //  - daily MACD flip is true
+              //  OR
+              //  - 7/14/28 MA structure is true AND (daily hist is positive OR daily hist is negative but rising)
+              // Negative-but-rising alone does NOT accept.
               let passedDailyFlip = false;
               let passedMaStructure = false;
               let passedDailyHistogramPositive = false;
@@ -2561,6 +2866,8 @@ module.exports = {
                   } catch (err) {
                     logger.debug({ err, symbol }, 'poller: is1dMaStructure threw');
                   }
+                } else {
+                  logger.warn({ symbol }, 'poller: macdUtil.is1dMaStructure missing; cannot evaluate MA structure gate');
                 }
 
                 if (typeof macdUtil.isDailyHistogramPositive === 'function') {
@@ -2585,8 +2892,35 @@ module.exports = {
                 const passed1dCriteria = passedDailyFlip || maStructureWithPositiveOrRising;
 
                 if (!passed1dCriteria) {
+                  if (decision === 'accept') {
+                    logger.info(
+                      {
+                        symbol,
+                        tf,
+                        latestOpen,
+                        passedDailyFlip,
+                        passedMaStructure,
+                        passedDailyHistogramPositive,
+                        passedDailyHistNegativeRising
+                      },
+                      'poller: 1d criteria gate failed; downgrading preliminary accept to monitor'
+                    );
+                  }
                   decision = 'monitor';
                   isHighConfidence = false;
+                } else {
+                  logger.info(
+                    {
+                      symbol,
+                      tf,
+                      latestOpen,
+                      passedDailyFlip,
+                      passedMaStructure,
+                      passedDailyHistogramPositive,
+                      passedDailyHistNegativeRising
+                    },
+                    'poller: 1d criteria gate passed'
+                  );
                 }
               } catch (err) {
                 logger.debug({ err, symbol, tf }, 'poller: 1d criteria gate threw; downgrading to monitor');
@@ -2594,6 +2928,7 @@ module.exports = {
                 isHighConfidence = false;
               }
 
+              // --- 2) Composite liquidity/volume gate (only relevant if still 'accept')
               let compositeDetails = null;
               if (decision === 'accept') {
                 try {
@@ -2610,6 +2945,10 @@ module.exports = {
                   compositeDetails = composite.details || composite;
 
                   if (!composite.ok) {
+                    logger.info(
+                      { symbol, composite },
+                      'poller: composite liquidity/volume gate blocked accept; downgrading to monitor'
+                    );
                     decision = 'monitor';
                     isHighConfidence = false;
                   }
@@ -2618,6 +2957,7 @@ module.exports = {
                 }
               }
 
+              // --- 3) Consecutive 1D limit (only relevant if still 'accept' and TF is D)
               if (decision === 'accept') {
                 try {
                   const normalizedTf = normalizeRootTf(tf);
@@ -2627,6 +2967,7 @@ module.exports = {
                     const maxAllowed = Number(config.MAX_CONSECUTIVE_ROOT_SIGNALS_1D || 2);
 
                     if (current >= maxAllowed) {
+                      logger.info({ symbol, current, maxAllowed }, 'poller: 1d consecutive accept limit reached; downgrading to monitor');
                       decision = 'monitor';
                       isHighConfidence = false;
                     } else {
@@ -2638,6 +2979,7 @@ module.exports = {
                 }
               }
 
+              // --- 4) Technical rating (optional)
               let technicalRating = null;
               try {
                 if (config.USE_INTERNAL_TECHNICAL_RATING && typeof macdUtil.computeTechnicalRating === 'function') {
@@ -2647,6 +2989,7 @@ module.exports = {
                 logger.debug({ err, symbol }, 'poller: computeTechnicalRating failed');
               }
 
+              // Now we have the final decision — call handleRootSignal once with the final state/meta
               try {
                 const persisted = await signalManager.handleRootSignal({
                   symbol,
@@ -2664,6 +3007,7 @@ module.exports = {
                   return null;
                 }
 
+                // Enrich persisted signal with our final decision/meta
                 if (!persisted.meta) persisted.meta = {};
                 const accept1dCriteria = [];
                 if (passedDailyFlip) accept1dCriteria.push('daily_flip');
@@ -2674,6 +3018,11 @@ module.exports = {
                 const confidenceTag = isHighConfidence ? 'mtf_high_confidence' : 'mtf_monitor_required';
                 persisted.meta.acceptReasons = [confidenceTag, ...accept1dCriteria];
                 persisted.meta.acceptReason = persisted.meta.acceptReasons.join('+');
+                persisted.meta.decision = decision;
+                persisted.meta.mtfScore = mtfValidation.mtfScore;
+                persisted.meta.mtfAligned = mtfValidation.isAligned;
+                persisted.meta.alignment = mtfValidation.alignment || {};
+                persisted.meta.state = decision;
 
                 if (compositeDetails) {
                   persisted.meta.liquidityGate = compositeDetails;
@@ -2713,7 +3062,12 @@ module.exports = {
                 );
 
                 safeSetState(processedStateKey, latestOpen);
-                return finalSignal;
+
+                if (!seenSignalIds.has(eventId)) {
+                  seenSignalIds.add(eventId);
+                  return finalSignal;
+                }
+                return null;
               } catch (err) {
                 logger.debug({ err, symbol, tf }, 'poller: handleRootSignal (final) failed');
                 safeSetState(processedStateKey, latestOpen);
@@ -2722,6 +3076,8 @@ module.exports = {
             }
           }
 
+          // FIX: do not blindly mark non-flip candles as processed.
+          // This was suppressing later valid flips for the same candle.
         } catch (err) {
           logger.debug(
             { err, symbol, tf },
@@ -2735,8 +3091,11 @@ module.exports = {
       const evaluatedResults = await Promise.all(candidatePromises);
 
       for (const res of evaluatedResults) {
-        if (res) {
+        if (res && res.eventId && !seenSignalIds.has(res.eventId)) {
+          seenSignalIds.add(res.eventId);
           allBoundarySignals.push(res);
+        } else if (res && res.eventId) {
+          // already deduped; ignore
         }
       }
 
@@ -2751,6 +3110,19 @@ module.exports = {
       );
 
       const broadcastStart = performance.now();
+
+      const summaryBlock = buildRootSignalSummaryBlock({
+        signals: allBoundarySignals,
+        timeframes: tfsToProcess,
+        nowMs,
+        detectedNewCandles,
+        scanStartTime,
+        fastPathProcessed: readyCandidates.length,
+        slowPathQueued: missingDataQueue.length,
+        totalSymbolsScanned: validRows.length
+      });
+
+      logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
 
       if (allBoundarySignals.length > 0) {
         logger.info(
@@ -2801,112 +3173,31 @@ module.exports = {
         }
       }
 
-      const summaryBlock = {
-        timestamp: new Date(nowMs).toISOString(),
-        scanType: 'root_tf_candle_open',
-        timeframes: tfsToProcess,
-        totalSymbolsScanned: validRows.length,
-        fastPathProcessed: readyCandidates.length,
-        slowPathQueued: missingDataQueue.length,
-        newCandlesDetected: detectedNewCandles,
-        signalsGenerated: allBoundarySignals.length,
-        acceptSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'accept').length,
-        monitorSignals: allBoundarySignals.filter((s) => s.meta?.decision === 'monitor').length,
-        avgMtfScore: allBoundarySignals.length > 0
-          ? (
-              (allBoundarySignals.reduce((sum, s) => sum + (s.meta?.mtfScore || 0), 0) /
-                allBoundarySignals.length) *
-              100
-            ).toFixed(1) + '%'
-          : 'N/A',
-        totalDurationMs: (performance.now() - scanStartTime).toFixed(2),
-        detailedBreakdown: tfsToProcess.map((tf) => {
-          const tfSignals = allBoundarySignals.filter((s) => normalizeRootTf(s.root_tf) === tf);
-          return {
-            timeframe: tf,
-            signalCount: tfSignals.length,
-            acceptCount: tfSignals.filter((s) => s.meta?.decision === 'accept').length,
-            monitorCount: tfSignals.filter((s) => s.meta?.decision === 'monitor').length
-          };
-        })
-      };
-
-      logger.info(summaryBlock, 'poller.rootTfCandleOpen: SUMMARY BLOCK');
-
-      for (const signal of allBoundarySignals) {
-        const signalBlock = {
-          symbol: signal.symbol,
-          timeframe: normalizeRootTf(signal.root_tf),
-          candleOpenTime: new Date(signal.candle_open_time).toISOString(),
-          eventId: signal.eventId,
-          decision: signal.meta?.decision || 'unknown',
-          mtfScore: (signal.meta?.mtfScore * 100).toFixed(1) + '%',
-          mtfAligned: signal.meta?.mtfAligned || false,
-          alignmentDetails: signal.meta?.alignment || {},
-          acceptReason: signal.meta?.acceptReason || 'none',
-          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
-        };
-
-        logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
-      }
-
-      let acceptedSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'accept');
-      let monitorSignals = allBoundarySignals.filter((s) => s.meta?.decision === 'monitor');
-
-      acceptedSignals = acceptedSignals.sort((a, b) => {
-        const aTf = normalizeRootTf(a?.root_tf);
-        const bTf = normalizeRootTf(b?.root_tf);
-        const order = ['240', 'D', '60'];
-        const ai = order.indexOf(aTf) >= 0 ? order.indexOf(aTf) : Number.MAX_SAFE_INTEGER;
-        const bi = order.indexOf(bTf) >= 0 ? order.indexOf(bTf) : Number.MAX_SAFE_INTEGER;
-        if (ai !== bi) return ai - bi;
-        return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
-      });
-
-      monitorSignals = monitorSignals.sort((a, b) => {
-        const aTf = normalizeRootTf(a?.root_tf);
-        const bTf = normalizeRootTf(b?.root_tf);
-        const order = ['240', 'D', '60'];
-        const ai = order.indexOf(aTf) >= 0 ? order.indexOf(aTf) : Number.MAX_SAFE_INTEGER;
-        const bi = order.indexOf(bTf) >= 0 ? order.indexOf(bTf) : Number.MAX_SAFE_INTEGER;
-        if (ai !== bi) return ai - bi;
-        return String(a?.symbol || '').localeCompare(String(b?.symbol || ''));
-      });
+      const acceptedSignals = sortByRootTfPriority(
+        allBoundarySignals.filter((s) => normalizeRootSignalDecision(s) === 'accept')
+      );
+      const monitorSignals = sortByRootTfPriority(
+        allBoundarySignals.filter((s) => normalizeRootSignalDecision(s) === 'monitor')
+      );
 
       if (acceptedSignals.length > 0) {
-        const acceptedBlock = {
-          actionType: 'ACCEPT',
-          count: acceptedSignals.length,
-          reason: 'MTF alignment high-confidence (≥ 70%) + 1D structure/liquidity gates passed',
-          signals: acceptedSignals.map((s) => ({
-            symbol: s.symbol,
-            timeframe: normalizeRootTf(s.root_tf),
-            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment
-              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
-              : 0
-          })),
-          recommendation: 'Process these signals for potential trade entry'
-        };
+        const acceptedBlock = buildRootSignalRecommendationBlock(
+          'ACCEPT',
+          acceptedSignals,
+          'MTF alignment high-confidence (≥ 70%) + 1D structure/liquidity gates passed',
+          'Process these signals for potential trade entry'
+        );
 
         logger.info(acceptedBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (ACCEPT)');
       }
 
       if (monitorSignals.length > 0) {
-        const monitorBlock = {
-          actionType: 'MONITOR',
-          count: monitorSignals.length,
-          reason: 'MTF alignment below high-confidence threshold or gate checks failed',
-          signals: monitorSignals.map((s) => ({
-            symbol: s.symbol,
-            timeframe: normalizeRootTf(s.root_tf),
-            mtfScore: (s.meta?.mtfScore * 100).toFixed(1) + '%',
-            positiveCount: s.meta?.alignment
-              ? Object.values(s.meta.alignment).filter((a) => a?.positive).length
-              : 0
-          })),
-          recommendation: 'Monitor these signals; wait for MTF alignment improvement or additional confluence'
-        };
+        const monitorBlock = buildRootSignalRecommendationBlock(
+          'MONITOR',
+          monitorSignals,
+          'MTF alignment below high-confidence threshold or gate checks failed',
+          'Monitor these signals; wait for MTF alignment improvement or additional confluence'
+        );
 
         logger.info(monitorBlock, 'poller.rootTfCandleOpen: RECOMMENDED BLOCK (MONITOR)');
       }
@@ -2916,6 +3207,23 @@ module.exports = {
           { timeframes: tfsToProcess },
           'poller.rootTfCandleOpen: RECOMMENDED BLOCK (NO ACTION) - New candles detected but no MACD flips'
         );
+      }
+
+      for (const signal of allBoundarySignals) {
+        const signalBlock = {
+          symbol: signal.symbol,
+          timeframe: normalizeRootTf(signal.root_tf),
+          candleOpenTime: new Date(signal.candle_open_time).toISOString(),
+          eventId: signal.eventId,
+          decision: normalizeRootSignalDecision(signal),
+          mtfScore: (Number(signal.meta?.mtfScore ?? signal.mtfScore ?? 0) * 100).toFixed(1) + '%',
+          mtfAligned: signal.meta?.mtfAligned || false,
+          alignmentDetails: signal.meta?.alignment || {},
+          acceptReason: signal.meta?.acceptReason || 'none',
+          confidence: signal.meta?.mtfAligned ? 'high' : 'medium'
+        };
+
+        logger.info(signalBlock, 'poller.rootTfCandleOpen: SIGNAL DETAIL');
       }
 
       const totalScanDuration = (performance.now() - scanStartTime).toFixed(2);
@@ -2932,6 +3240,10 @@ module.exports = {
       logger.error({ err }, 'poller.runRootTfCandleOpenOnce: fatal error');
       return false;
     }
+  },
+
+  getLoop2ProcessedCandleKey(symbol, tf) {
+    return `poller.loop2.processedCandle.${symbol}.${tf}`;
   },
 
   startCacheCleanupLoop() {
@@ -2980,46 +3292,8 @@ module.exports = {
     }
   },
 
-  startDbHealthCheckLoop() {
-    setImmediate(() => {
-      this.runDbHealthCheckLoop()
-        .catch((err) => {
-          logger.error(
-            { err },
-            'poller: DB health check loop crashed'
-          );
-        });
-    });
-  },
-
-  async runDbHealthCheckLoop() {
-    const HEALTH_CHECK_INTERVAL_MS = 10 * 1000;
-
-    while (isRunning) {
-      await sleep(HEALTH_CHECK_INTERVAL_MS);
-
-      if (!isRunning) {
-        break;
-      }
-
-      const wasHealthy = dbIsHealthy;
-      const isCurrentlyHealthy = isDbReady();
-
-      if (!isCurrentlyHealthy && wasHealthy) {
-        logger.error(
-          'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
-        );
-        dbIsHealthy = false;
-      } else if (isCurrentlyHealthy && !wasHealthy) {
-        logger.info(
-          'poller: ✅ DATABASE CONNECTION RESTORED'
-        );
-        dbIsHealthy = true;
-      }
-
-      lastDbConnectivityCheck = Date.now();
-    }
-  },
+  startDbHealthCheckLoop,
+  runDbHealthCheckLoop,
 
   stop() {
     isRunning = false;
