@@ -68,9 +68,7 @@ module.exports = {
     if (!bot) {
       bot = new TelegramBot(
         config.TELEGRAM_BOT_TOKEN,
-        {
-          polling: false
-        }
+        { polling: false }
       );
 
       logger.info('Telegram bot initialized');
@@ -104,21 +102,13 @@ module.exports = {
 
     while (i > 0) {
       i -= 1;
-
-      chars.unshift(
-        String.fromCharCode(
-          (i % 26) + 65
-        )
-      );
-
+      chars.unshift(String.fromCharCode((i % 26) + 65));
       i = Math.floor(i / 26);
     }
 
     const label = chars.join('');
 
-    return lowercase
-      ? label.toLowerCase()
-      : label;
+    return lowercase ? label.toLowerCase() : label;
   },
 
   _sleep(ms) {
@@ -127,17 +117,12 @@ module.exports = {
     });
   },
 
-  async _sendMessage(
-    text,
-    options = {}
-  ) {
+  async _sendMessage(text, options = {}) {
     this.ensureInitialized();
 
     const delayMs = Math.max(
       500,
-      Number(
-        config.TELEGRAM_SEND_DELAY_MS
-      ) || 1000
+      Number(config.TELEGRAM_SEND_DELAY_MS) || 1000
     );
 
     try {
@@ -153,17 +138,13 @@ module.exports = {
         0;
 
       const errorMessage =
-        String(
-          err?.message || ''
-        ).toLowerCase();
+        String(err?.message || '').toLowerCase();
 
       const isRateLimit =
         err?.response?.statusCode === 429 ||
         retryAfter > 0 ||
         errorMessage.includes('429') ||
-        errorMessage.includes(
-          'too many requests'
-        );
+        errorMessage.includes('too many requests');
 
       if (!isRateLimit) {
         throw err;
@@ -182,8 +163,7 @@ module.exports = {
           retryAfter,
           symbol: options?.symbol || null,
           root_tf: options?.root_tf || null,
-          notificationType:
-            options?.notificationType || null
+          notificationType: options?.notificationType || null
         },
         'Telegram: rate limited; backing off before retry'
       );
@@ -203,9 +183,7 @@ module.exports = {
     let positiveCount = 0;
     let total = 0;
 
-    for (
-      const tf of Object.keys(alignment || {})
-    ) {
+    for (const tf of Object.keys(alignment || {})) {
       const info = alignment[tf];
 
       total += 1;
@@ -215,53 +193,29 @@ module.exports = {
         typeof info.histogram !== 'undefined';
 
       const positiveSymbol = ok
-        ? (
-            info.positive
-              ? '🟢'
-              : '🔴'
-          )
+        ? (info.positive ? '🟢' : '🔴')
         : '⚪';
 
-      if (
-        info &&
-        info.positive
-      ) {
+      if (info && info.positive) {
         positiveCount += 1;
       }
 
       const histogram =
         ok
-          ? `hist=${Number(
-              info.histogram
-            ).toFixed(6)}`
+          ? `hist=${Number(info.histogram).toFixed(6)}`
           : '';
 
       const rising =
         ok
-          ? (
-              info.rising
-                ? '↑'
-                : '↓'
-            )
+          ? (info.rising ? '↑' : '↓')
           : '';
 
       lines.push(
-        `${tf}: ${positiveSymbol} ${
-          ok
-            ? (
-                info.positive
-                  ? 'POS'
-                  : 'NEG'
-              )
-            : 'unknown'
-        } ${histogram} ${rising}`.trim()
+        `${tf}: ${positiveSymbol} ${ok ? (info.positive ? 'POS' : 'NEG') : 'unknown'} ${histogram} ${rising}`.trim()
       );
     }
 
-    const mtfScore =
-      total > 0
-        ? positiveCount / total
-        : 0;
+    const mtfScore = total > 0 ? positiveCount / total : 0;
 
     return {
       lines: lines.join('\n'),
@@ -303,22 +257,12 @@ module.exports = {
     const lines = [
       `💰 Price: ${
         price !== null && price > 0
-          ? '$' + price.toLocaleString(
-              'en-US',
-              {
-                maximumFractionDigits: 8
-              }
-            )
+          ? '$' + price.toLocaleString('en-US', { maximumFractionDigits: 8 })
           : '0'
       }`,
       `💵 24h Volume: ${
         volume24 !== null && volume24 > 0
-          ? '$' + volume24.toLocaleString(
-              'en-US',
-              {
-                maximumFractionDigits: 2
-              }
-            ) + ' USDT'
+          ? '$' + volume24.toLocaleString('en-US', { maximumFractionDigits: 2 }) + ' USDT'
           : '0 USDT'
       }`,
       `📈 Volume Change: ${
@@ -328,12 +272,7 @@ module.exports = {
       }`,
       `💎 Market Cap: ${
         marketCap && marketCap > 0
-          ? '$' + marketCap.toLocaleString(
-              'en-US',
-              {
-                maximumFractionDigits: 0
-              }
-            )
+          ? '$' + marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 })
           : 'n/a'
       }`
     ];
@@ -351,13 +290,10 @@ module.exports = {
 
     const timeStr =
       detected_at
-        ? new Date(
-            detected_at
-          ).toISOString()
+        ? new Date(detected_at).toISOString()
         : new Date().toISOString();
 
-    const alignment =
-      meta.alignment || {};
+    const alignment = meta.alignment || {};
 
     const tvRaw =
       Number(
@@ -376,8 +312,7 @@ module.exports = {
         )
       : 0;
 
-    const tvSource =
-      meta.tvSource || 'error';
+    const tvSource = meta.tvSource || 'error';
 
     const mtfScore =
       typeof meta.mtfScore === 'number'
@@ -395,9 +330,7 @@ module.exports = {
     const {
       lines: alignmentLines,
       mtfScore: computedMtfScore
-    } = this.buildAlignmentLines(
-      alignment
-    );
+    } = this.buildAlignmentLines(alignment);
 
     const usedMtfScore =
       mtfScore !== null
@@ -405,49 +338,28 @@ module.exports = {
         : computedMtfScore;
 
     const mtfPercent =
-      Math.round(
-        (usedMtfScore || 0) * 100
-      );
+      Math.round((usedMtfScore || 0) * 100);
 
     const scoringLine =
       `📊 Scoring:\nTV: ${tvPercent}% (${tvSource}) • MTF: ${mtfPercent}%`;
 
-    const mtfHeader =
-      '🛰️ MTF Status:';
+    const mtfHeader = '🛰️ MTF Status:';
 
     const marketBlock =
-      `💱 Market Data:\n${
-        this.formatMarketData(
-          meta.marketData || {}
-        )
-      }`;
+      `💱 Market Data:\n${this.formatMarketData(meta.marketData || {})}`;
 
-    const notificationType =
-      normalizeNotificationType(signal);
+    const notificationType = normalizeNotificationType(signal);
 
     const eventTitle =
       notificationType
-        ? (
-            SUMMARY_TITLE_MAP[
-              notificationType
-            ] || null
-          )
+        ? (SUMMARY_TITLE_MAP[notificationType] || null)
         : null;
 
     const msgParts = [
-      ...(eventTitle
-        ? [
-            eventTitle,
-            ''
-          ]
-        : []),
+      ...(eventTitle ? [eventTitle, ''] : []),
       `🎯 Signal: ${symbol} (${root_tf})`,
       `⏰ Time: ${timeStr}`,
-      `${
-        decision === 'accept'
-          ? '✅ Decision'
-          : '⚠️ Decision'
-      }: ${decision} (reason: ${reason})`,
+      `${decision === 'accept' ? '✅ Decision' : '⚠️ Decision'}: ${decision} (reason: ${reason})`,
       '',
       scoringLine,
       '',
@@ -460,10 +372,7 @@ module.exports = {
     return msgParts.join('\n');
   },
 
-  async sendNewSignalSingleBlock(
-    signal,
-    forcedType = null
-  ) {
+  async sendNewSignalSingleBlock(signal, forcedType = null) {
     const normalizedSignal = signal
       ? {
           ...signal,
@@ -476,44 +385,27 @@ module.exports = {
       : null;
 
     if (!normalizedSignal) {
-      throw new Error(
-        'Telegram: cannot send an empty signal'
-      );
+      throw new Error('Telegram: cannot send an empty signal');
     }
 
-    const message =
-      this.buildSignalMessage(
-        normalizedSignal
-      );
+    const message = this.buildSignalMessage(normalizedSignal);
 
     await this._sendMessage(
       message,
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        notificationType:
-          normalizedSignal.notificationType ||
-          null,
-        eventId:
-          normalizedSignal.eventId ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        notificationType: normalizedSignal.notificationType || null,
+        eventId: normalizedSignal.eventId || null
       }
     );
 
     logger.debug(
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        eventId:
-          normalizedSignal.eventId ||
-          null,
-        notificationType:
-          normalizedSignal.notificationType ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        eventId: normalizedSignal.eventId || null,
+        notificationType: normalizedSignal.notificationType || null
       },
       'Telegram: signal detail block sent'
     );
@@ -523,49 +415,32 @@ module.exports = {
 
   async sendMidCandleUpdateBlock(signal) {
     if (!signal) {
-      throw new Error(
-        'Telegram: cannot send an empty mid-candle signal'
-      );
+      throw new Error('Telegram: cannot send an empty mid-candle signal');
     }
 
     const normalizedSignal = {
       ...signal,
-      notificationType:
-        'midcandle_update',
-      signalType:
-        signal.signalType ||
-        'midcandle_update'
+      notificationType: 'midcandle_update',
+      signalType: signal.signalType || 'midcandle_update'
     };
 
-    const message =
-      this.buildSignalMessage(
-        normalizedSignal
-      );
+    const message = this.buildSignalMessage(normalizedSignal);
 
     await this._sendMessage(
       message,
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        notificationType:
-          'midcandle_update',
-        eventId:
-          normalizedSignal.eventId ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        notificationType: 'midcandle_update',
+        eventId: normalizedSignal.eventId || null
       }
     );
 
     logger.info(
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        eventId:
-          normalizedSignal.eventId ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        eventId: normalizedSignal.eventId || null
       },
       'Telegram: mid-candle update sent'
     );
@@ -575,51 +450,34 @@ module.exports = {
 
   async sendMtfAlignmentAlert(signal) {
     if (!signal) {
-      throw new Error(
-        'Telegram: cannot send an empty MTF alignment alert'
-      );
+      throw new Error('Telegram: cannot send an empty MTF alignment alert');
     }
 
     this.ensureInitialized();
 
     const normalizedSignal = {
       ...signal,
-      notificationType:
-        'mtf_alignment',
-      signalType:
-        signal.signalType ||
-        'mtf_alignment'
+      notificationType: 'mtf_alignment',
+      signalType: signal.signalType || 'mtf_alignment'
     };
 
-    const message =
-      this.buildSignalMessage(
-        normalizedSignal
-      );
+    const message = this.buildSignalMessage(normalizedSignal);
 
     await this._sendMessage(
       message,
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        notificationType:
-          'mtf_alignment',
-        eventId:
-          normalizedSignal.eventId ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        notificationType: 'mtf_alignment',
+        eventId: normalizedSignal.eventId || null
       }
     );
 
     logger.info(
       {
-        symbol:
-          normalizedSignal.symbol,
-        root_tf:
-          normalizedSignal.root_tf,
-        eventId:
-          normalizedSignal.eventId ||
-          null
+        symbol: normalizedSignal.symbol,
+        root_tf: normalizedSignal.root_tf,
+        eventId: normalizedSignal.eventId || null
       },
       'Telegram: MTF alignment alert sent'
     );
@@ -640,7 +498,6 @@ module.exports = {
 
       if (timeframeFilter) {
         const targetTf = String(timeframeFilter);
-
         signals = signals.filter((signal) => {
           return String(signal.root_tf || '') === targetTf;
         });
@@ -648,10 +505,7 @@ module.exports = {
 
       if (signals.length === 0) {
         logger.warn(
-          {
-            title,
-            timeframeFilter
-          },
+          { title, timeframeFilter },
           'Telegram: no signals provided to summary block'
         );
         return false;
@@ -667,7 +521,6 @@ module.exports = {
 
       for (const signal of signals) {
         const tf = String(signal.root_tf || 'unknown');
-
         tfCounts[tf] = (tfCounts[tf] || 0) + 1;
 
         if (signal.symbol) {
@@ -676,8 +529,7 @@ module.exports = {
       }
 
       const configuredRootTfs =
-        Array.isArray(config.ROOT_TFS) &&
-        config.ROOT_TFS.length > 0
+        Array.isArray(config.ROOT_TFS) && config.ROOT_TFS.length > 0
           ? config.ROOT_TFS.map(String)
           : [];
 
@@ -687,9 +539,7 @@ module.exports = {
           : Object.keys(tfCounts);
 
       if (timeframeFilter) {
-        const targetTf = String(timeframeFilter);
-
-        orderedRootTfs = [targetTf];
+        orderedRootTfs = [String(timeframeFilter)];
       } else {
         for (const tf of Object.keys(tfCounts)) {
           if (!orderedRootTfs.includes(tf)) {
@@ -703,13 +553,7 @@ module.exports = {
       });
 
       const allSymbols = Array.from(symbolSet).sort((a, b) => {
-        return a.localeCompare(
-          b,
-          undefined,
-          {
-            sensitivity: 'base'
-          }
-        );
+        return a.localeCompare(b, undefined, { sensitivity: 'base' });
       });
 
       const symbolLines = allSymbols.length > 0 ? allSymbols.join('\n') : 'n/a';
@@ -737,33 +581,23 @@ module.exports = {
           String(a.symbol || '').localeCompare(
             String(b.symbol || ''),
             undefined,
-            {
-              sensitivity: 'base'
-            }
+            { sensitivity: 'base' }
           );
 
         if (symbolOrder !== 0) {
           return symbolOrder;
         }
 
-        return String(
-          a.root_tf || ''
-        ).localeCompare(
+        return String(a.root_tf || '').localeCompare(
           String(b.root_tf || ''),
           undefined,
-          {
-            numeric: true
-          }
+          { numeric: true }
         );
       });
 
       for (let i = 0; i < sortedSignals.length; i += 1) {
         const signal = sortedSignals[i];
-
-        await this.sendNewSignalSingleBlock(
-          signal,
-          signalType
-        );
+        await this.sendNewSignalSingleBlock(signal, signalType);
 
         logger.debug(
           {
@@ -796,127 +630,62 @@ module.exports = {
           }
         }
       } catch (err) {
-        logger.debug(
-          { err },
-          'Telegram: failed to read open trades count'
-        );
-
+        logger.debug({ err }, 'Telegram: failed to read open trades count');
         openCount = 0;
       }
 
       const maxOpenTrades = Number(config.MAX_OPEN_TRADES) || 0;
-
-      const maxSlots =
-        Math.max(
-          0,
-          maxOpenTrades - openCount
-        );
+      const maxSlots = Math.max(0, maxOpenTrades - openCount);
 
       const recommendedHeader =
         `📈 Recommended to Open (${maxSlots} slots available):`;
 
       await this._sendMessage(recommendedHeader);
-
       await this._sleep(delayMs);
 
       const candidates = signals
         .map((signal) => {
           return {
-            symbol:
-              signal.symbol,
-            root_tf:
-              signal.root_tf,
-            tvScore:
-              Number(
-                signal.meta?.tvScore || 0
-              ),
-            mtfScore:
-              Number(
-                signal.meta?.mtfScore || 0
-              ),
-            acceptDecision:
-              signal.meta?.decision ||
-              'monitor',
-            reason:
-              signal.meta?.acceptReason ||
-              'n/a'
+            symbol: signal.symbol,
+            root_tf: signal.root_tf,
+            tvScore: Number(signal.meta?.tvScore || 0),
+            mtfScore: Number(signal.meta?.mtfScore || 0),
+            acceptDecision: signal.meta?.decision || 'monitor',
+            reason: signal.meta?.acceptReason || 'n/a'
           };
         })
         .filter((candidate) => {
-          return (
-            candidate.acceptDecision ===
-            'accept'
-          );
+          return candidate.acceptDecision === 'accept';
         })
         .sort((a, b) => {
-          if (
-            b.tvScore !== a.tvScore
-          ) {
+          if (b.tvScore !== a.tvScore) {
             return b.tvScore - a.tvScore;
           }
-
           return b.mtfScore - a.mtfScore;
         });
 
-      const recommended = candidates.slice(
-        0,
-        Math.max(0, maxSlots)
-      );
+      const recommended = candidates.slice(0, Math.max(0, maxSlots));
 
       if (recommended.length === 0) {
-        await this._sendMessage(
-          'No recommended signals (all rejections or filtered)'
-        );
+        await this._sendMessage('No recommended signals (all rejections or filtered)');
       } else {
-        for (
-          let i = 0;
-          i < recommended.length;
-          i += 1
-        ) {
-          const recommendation =
-            recommended[i];
+        for (let i = 0; i < recommended.length; i += 1) {
+          const recommendation = recommended[i];
+          const label = this.getLabel(i, { lowercase: true });
 
-          const label =
-            this.getLabel(i, {
-              lowercase: true
-            });
-
-          const tvPercent =
-            Math.round(
-              (recommendation.tvScore || 0) *
-              100
-            );
-
-          const mtfPercent =
-            Math.round(
-              (recommendation.mtfScore || 0) *
-              100
-            );
-
-          const simulatedNote =
-            config.OPENTRADE
-              ? ''
-              : ' [SIMULATED]';
+          const tvPercent = Math.round((recommendation.tvScore || 0) * 100);
+          const mtfPercent = Math.round((recommendation.mtfScore || 0) * 100);
 
           const line =
-            `${label}) ` +
-            `${recommendation.symbol} ` +
-            `${recommendation.root_tf} - ` +
-            `TV:${tvPercent}% ` +
-            `MTF:${mtfPercent}% - ` +
-            `${recommendation.reason}` +
-            simulatedNote;
+            `${label}) ${recommendation.symbol} ${recommendation.root_tf} - ` +
+            `TV:${tvPercent}% MTF:${mtfPercent}% - ${recommendation.reason}`;
 
-          await this._sendMessage(
-            line
-          );
+          await this._sendMessage(line);
 
           logger.debug(
             {
-              symbol:
-                recommendation.symbol,
-              root_tf:
-                recommendation.root_tf,
+              symbol: recommendation.symbol,
+              root_tf: recommendation.root_tf,
               index: i + 1,
               total: recommended.length
             },
@@ -950,34 +719,24 @@ module.exports = {
     }
   },
 
-  async sendStartupSummary({
-    snapshot = []
-  } = {}) {
+  async sendStartupSummary({ snapshot = [] } = {}) {
     await this.sendSummaryBlock({
       snapshot,
-      title:
-        SUMMARY_TITLE_MAP.startup,
+      title: SUMMARY_TITLE_MAP.startup,
       signalType: null
     });
 
     return true;
   },
 
-  async sendRootCandleSummary({
-    snapshot = [],
-    tf = null
-  } = {}) {
+  async sendRootCandleSummary({ snapshot = [], tf = null } = {}) {
     const filtered =
       Array.isArray(snapshot)
-        ? (
-            tf
-              ? snapshot.filter((signal) => {
-                  return String(
-                    signal.root_tf || ''
-                  ) === String(tf);
-                })
-              : snapshot
-          )
+        ? (tf
+            ? snapshot.filter((signal) => {
+                return String(signal.root_tf || '') === String(tf);
+              })
+            : snapshot)
         : [];
 
     const title =
@@ -988,24 +747,16 @@ module.exports = {
     await this.sendSummaryBlock({
       snapshot: filtered,
       title,
-      signalType:
-        'new_root_candle',
-      timeframeFilter:
-        tf || null
+      signalType: 'new_root_candle',
+      timeframeFilter: tf || null
     });
 
     return true;
   },
 
-  async sendRootCandleOpenSummary({
-    snapshot = [],
-    tf = null
-  } = {}) {
+  async sendRootCandleOpenSummary({ snapshot = [], tf = null } = {}) {
     if (!Array.isArray(snapshot)) {
-      logger.warn(
-        { tf },
-        'Telegram: sendRootCandleOpenSummary received invalid snapshot'
-      );
+      logger.warn({ tf }, 'Telegram: sendRootCandleOpenSummary received invalid snapshot');
       return false;
     }
 
@@ -1029,5 +780,26 @@ module.exports = {
     });
 
     return true;
+  },
+
+  // compatibility aliases for notificationQueue.js
+  async sendSignal(signal) {
+    return this.sendNewSignalSingleBlock(signal);
+  },
+
+  async sendRealtimeSignal(signal) {
+    return this.sendNewSignalSingleBlock(signal);
+  },
+
+  async sendMtfAlignment(signal) {
+    return this.sendMtfAlignmentAlert(signal);
+  },
+
+  async sendMidCandleUpdate(signal) {
+    return this.sendMidCandleUpdateBlock(signal);
+  },
+
+  async sendCandleUpdate(signal) {
+    return this.sendNewSignalSingleBlock(signal, 'candle_update');
   }
 };
