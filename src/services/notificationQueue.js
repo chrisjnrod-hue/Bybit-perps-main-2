@@ -17,9 +17,14 @@ function getNotificationType(signal) {
     return 'signal';
   }
 
-  const candidate = signal.notificationType || signal.signalType;
+  const candidate =
+    signal.notificationType ||
+    signal.signalType;
 
-  if (typeof candidate === 'string' && candidate.trim()) {
+  if (
+    typeof candidate === 'string' &&
+    candidate.trim()
+  ) {
     return candidate.trim();
   }
 
@@ -46,7 +51,8 @@ function getSignalId(signal) {
   const type = getNotificationType(signal);
 
   const candleValue =
-    signal.candle_open_time !== undefined && signal.candle_open_time !== null
+    signal.candle_open_time !== undefined &&
+    signal.candle_open_time !== null
       ? Number(signal.candle_open_time)
       : null;
 
@@ -55,7 +61,8 @@ function getSignalId(signal) {
   }
 
   const detectedValue =
-    signal.detected_at !== undefined && signal.detected_at !== null
+    signal.detected_at !== undefined &&
+    signal.detected_at !== null
       ? Number(signal.detected_at)
       : 0;
 
@@ -68,21 +75,21 @@ function resolveQueueItemType(type, signal = null) {
     .toLowerCase();
 
   const aliasMap = {
-    new_root_candle_open: 'root_candle_open_batch',
-    root_tf_candle_open: 'root_candle_open_batch',
-    newroottfcandleopen: 'root_candle_open_batch',
-    root_candle_open_batch: 'root_candle_open_batch',
-    new_root_candle: 'realtime',
-    root_candle_update: 'realtime',
-    rootcandle_update: 'realtime',
-    startup_batch: 'startup_batch',
-    root_candle_batch: 'root_candle_batch',
-    realtime: 'realtime',
-    mtf_alignment: 'mtf_alignment',
-    mtfalign: 'mtf_alignment',
-    midcandle_update: 'midcandle_update',
-    candle_update: 'candle_update',
-    startup: 'startup_batch'
+    'new_root_candle_open': 'root_candle_open_batch',
+    'root_tf_candle_open': 'root_candle_open_batch',
+    'newroottfcandleopen': 'root_candle_open_batch',
+    'root_candle_open_batch': 'root_candle_open_batch',
+    'new_root_candle': 'realtime',
+    'root_candle_update': 'realtime',
+    'rootcandle_update': 'realtime',
+    'startup_batch': 'startup_batch',
+    'root_candle_batch': 'root_candle_batch',
+    'realtime': 'realtime',
+    'mtf_alignment': 'mtf_alignment',
+    'mtfalign': 'mtf_alignment',
+    'midcandle_update': 'midcandle_update',
+    'candle_update': 'candle_update',
+    'startup': 'startup_batch'
   };
 
   if (aliasMap[rawType]) {
@@ -95,36 +102,36 @@ function resolveQueueItemType(type, signal = null) {
       .toLowerCase();
 
     const signalMap = {
-      new_root_candle_open: 'root_candle_open_batch',
-      root_tf_candle_open: 'root_candle_open_batch',
-      newroottfcandleopen: 'root_candle_open_batch',
-      new_root_candle: 'realtime',
-      root_candle_update: 'realtime',
-      rootcandle_update: 'realtime',
-      mtf_alignment: 'mtf_alignment',
-      mtfalign: 'mtf_alignment',
-      midcandle_update: 'midcandle_update',
-      candle_update: 'candle_update'
+      'new_root_candle_open': 'root_candle_open_batch',
+      'root_tf_candle_open': 'root_candle_open_batch',
+      'newroottfcandleopen': 'root_candle_open_batch',
+      'new_root_candle': 'realtime',
+      'root_candle_update': 'realtime',
+      'rootcandle_update': 'realtime',
+      'mtf_alignment': 'mtf_alignment',
+      'mtfalign': 'mtf_alignment',
+      'midcandle_update': 'midcandle_update',
+      'candle_update': 'candle_update'
     };
 
     return signalMap[notificationType] || 'realtime';
   }
 
   const map = {
-    new_root_candle: 'realtime',
-    root_candle_update: 'realtime',
-    rootcandle_update: 'realtime',
-    root_candle_open_batch: 'root_candle_open_batch',
-    new_root_candle_open: 'root_candle_open_batch',
-    root_tf_candle_open: 'root_candle_open_batch',
-    newroottfcandleopen: 'root_candle_open_batch',
-    root_candle_batch: 'root_candle_batch',
-    startup_batch: 'startup_batch',
-    realtime: 'realtime',
-    mtf_alignment: 'mtf_alignment',
-    mtfalign: 'mtf_alignment',
-    midcandle_update: 'midcandle_update',
-    candle_update: 'candle_update'
+    'new_root_candle': 'realtime',
+    'root_candle_update': 'realtime',
+    'rootcandle_update': 'realtime',
+    'root_candle_open_batch': 'root_candle_open_batch',
+    'new_root_candle_open': 'root_candle_open_batch',
+    'root_tf_candle_open': 'root_candle_open_batch',
+    'newroottfcandleopen': 'root_candle_open_batch',
+    'root_candle_batch': 'root_candle_batch',
+    'startup_batch': 'startup_batch',
+    'realtime': 'realtime',
+    'mtf_alignment': 'mtf_alignment',
+    'mtfalign': 'mtf_alignment',
+    'midcandle_update': 'midcandle_update',
+    'candle_update': 'candle_update'
   };
 
   return map[rawType] || rawType;
@@ -184,7 +191,6 @@ class NotificationQueue {
 
     const signalId = getSignalId(signal);
 
-    // CRITICAL FIX:
     // Missing signalId means the signal is not dedupable yet.
     // It must NOT be treated as "already known".
     if (!signalId) {
@@ -274,10 +280,7 @@ class NotificationQueue {
     );
 
     if (!normalized) {
-      logger.warn(
-        { signal, type },
-        'NotificationQueue: signal normalization failed'
-      );
+      logger.warn({ signal, type }, 'NotificationQueue: signal normalization failed');
       return false;
     }
 
@@ -334,9 +337,7 @@ class NotificationQueue {
     }
 
     if (this.startupSummaryInProgress) {
-      logger.info(
-        'NotificationQueue: startup summary already in progress, skipping duplicate batch'
-      );
+      logger.info('NotificationQueue: startup summary already in progress, skipping duplicate batch');
       return false;
     }
 
@@ -649,16 +650,9 @@ class NotificationQueue {
 
         for (const batch of pending) {
           try {
-            this.enqueueRootCandleOpenBatch(
-              batch.signals,
-              batch.tf,
-              batch.isStartupPhase
-            );
+            this.enqueueRootCandleOpenBatch(batch.signals, batch.tf, batch.isStartupPhase);
           } catch (err) {
-            logger.error(
-              { err, batch },
-              'NotificationQueue: failed to flush deferred root candle open batch'
-            );
+            logger.error({ err, batch }, 'NotificationQueue: failed to flush deferred root candle open batch');
           }
         }
       }
@@ -745,6 +739,7 @@ class NotificationQueue {
           snapshot: signals,
           tf
         });
+        return;
       } catch (err) {
         logger.error(
           { err, tf, count: signals.length },
@@ -752,7 +747,6 @@ class NotificationQueue {
         );
         throw err;
       }
-      return;
     }
 
     if (typeof telegram.sendSummaryBlock === 'function') {
@@ -764,6 +758,7 @@ class NotificationQueue {
             : '🕔 New Root Candle Open',
           tf
         });
+        return;
       } catch (err) {
         logger.error(
           { err, tf, count: signals.length },
@@ -771,12 +766,11 @@ class NotificationQueue {
         );
         throw err;
       }
-      return;
     }
 
     logger.warn(
       { tf, count: signals.length },
-      'NotificationQueue: no root-candle open summary sender available'
+      'NotificationQueue: no root-candle summary sender available'
     );
   }
 
