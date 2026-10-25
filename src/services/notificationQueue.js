@@ -17,14 +17,9 @@ function getNotificationType(signal) {
     return 'signal';
   }
 
-  const candidate =
-    signal.notificationType ||
-    signal.signalType;
+  const candidate = signal.notificationType || signal.signalType;
 
-  if (
-    typeof candidate === 'string' &&
-    candidate.trim()
-  ) {
+  if (typeof candidate === 'string' && candidate.trim()) {
     return candidate.trim();
   }
 
@@ -51,8 +46,7 @@ function getSignalId(signal) {
   const type = getNotificationType(signal);
 
   const candleValue =
-    signal.candle_open_time !== undefined &&
-    signal.candle_open_time !== null
+    signal.candle_open_time !== undefined && signal.candle_open_time !== null
       ? Number(signal.candle_open_time)
       : null;
 
@@ -61,8 +55,7 @@ function getSignalId(signal) {
   }
 
   const detectedValue =
-    signal.detected_at !== undefined &&
-    signal.detected_at !== null
+    signal.detected_at !== undefined && signal.detected_at !== null
       ? Number(signal.detected_at)
       : 0;
 
@@ -75,21 +68,21 @@ function resolveQueueItemType(type, signal = null) {
     .toLowerCase();
 
   const aliasMap = {
-    'new_root_candle_open': 'root_candle_open_batch',
-    'root_tf_candle_open': 'root_candle_open_batch',
-    'newroottfcandleopen': 'root_candle_open_batch',
-    'root_candle_open_batch': 'root_candle_open_batch',
-    'new_root_candle': 'realtime',
-    'root_candle_update': 'realtime',
-    'rootcandle_update': 'realtime',
-    'startup_batch': 'startup_batch',
-    'root_candle_batch': 'root_candle_batch',
-    'realtime': 'realtime',
-    'mtf_alignment': 'mtf_alignment',
-    'mtfalign': 'mtf_alignment',
-    'midcandle_update': 'midcandle_update',
-    'candle_update': 'candle_update',
-    'startup': 'startup_batch'
+    new_root_candle_open: 'root_candle_open_batch',
+    root_tf_candle_open: 'root_candle_open_batch',
+    newroottfcandleopen: 'root_candle_open_batch',
+    root_candle_open_batch: 'root_candle_open_batch',
+    new_root_candle: 'realtime',
+    root_candle_update: 'realtime',
+    rootcandle_update: 'realtime',
+    startup_batch: 'startup_batch',
+    root_candle_batch: 'root_candle_batch',
+    realtime: 'realtime',
+    mtf_alignment: 'mtf_alignment',
+    mtfalign: 'mtf_alignment',
+    midcandle_update: 'midcandle_update',
+    candle_update: 'candle_update',
+    startup: 'startup_batch'
   };
 
   if (aliasMap[rawType]) {
@@ -102,36 +95,36 @@ function resolveQueueItemType(type, signal = null) {
       .toLowerCase();
 
     const signalMap = {
-      'new_root_candle_open': 'root_candle_open_batch',
-      'root_tf_candle_open': 'root_candle_open_batch',
-      'newroottfcandleopen': 'root_candle_open_batch',
-      'new_root_candle': 'realtime',
-      'root_candle_update': 'realtime',
-      'rootcandle_update': 'realtime',
-      'mtf_alignment': 'mtf_alignment',
-      'mtfalign': 'mtf_alignment',
-      'midcandle_update': 'midcandle_update',
-      'candle_update': 'candle_update'
+      new_root_candle_open: 'root_candle_open_batch',
+      root_tf_candle_open: 'root_candle_open_batch',
+      newroottfcandleopen: 'root_candle_open_batch',
+      new_root_candle: 'realtime',
+      root_candle_update: 'realtime',
+      rootcandle_update: 'realtime',
+      mtf_alignment: 'mtf_alignment',
+      mtfalign: 'mtf_alignment',
+      midcandle_update: 'midcandle_update',
+      candle_update: 'candle_update'
     };
 
     return signalMap[notificationType] || 'realtime';
   }
 
   const map = {
-    'new_root_candle': 'realtime',
-    'root_candle_update': 'realtime',
-    'rootcandle_update': 'realtime',
-    'root_candle_open_batch': 'root_candle_open_batch',
-    'new_root_candle_open': 'root_candle_open_batch',
-    'root_tf_candle_open': 'root_candle_open_batch',
-    'newroottfcandleopen': 'root_candle_open_batch',
-    'root_candle_batch': 'root_candle_batch',
-    'startup_batch': 'startup_batch',
-    'realtime': 'realtime',
-    'mtf_alignment': 'mtf_alignment',
-    'mtfalign': 'mtf_alignment',
-    'midcandle_update': 'midcandle_update',
-    'candle_update': 'candle_update'
+    new_root_candle: 'realtime',
+    root_candle_update: 'realtime',
+    rootcandle_update: 'realtime',
+    root_candle_open_batch: 'root_candle_open_batch',
+    new_root_candle_open: 'root_candle_open_batch',
+    root_tf_candle_open: 'root_candle_open_batch',
+    newroottfcandleopen: 'root_candle_open_batch',
+    root_candle_batch: 'root_candle_batch',
+    startup_batch: 'startup_batch',
+    realtime: 'realtime',
+    mtf_alignment: 'mtf_alignment',
+    mtfalign: 'mtf_alignment',
+    midcandle_update: 'midcandle_update',
+    candle_update: 'candle_update'
   };
 
   return map[rawType] || rawType;
@@ -255,7 +248,10 @@ class NotificationQueue {
       nextSignal.eventId = String(signal.eventId);
     }
 
-    if (signal.candle_open_time !== undefined && signal.candle_open_time !== null) {
+    if (
+      signal.candle_open_time !== undefined &&
+      signal.candle_open_time !== null
+    ) {
       const candleOpenTime = Number(signal.candle_open_time);
 
       if (Number.isFinite(candleOpenTime)) {
@@ -278,7 +274,10 @@ class NotificationQueue {
     );
 
     if (!normalized) {
-      logger.warn({ signal, type }, 'NotificationQueue: signal normalization failed');
+      logger.warn(
+        { signal, type },
+        'NotificationQueue: signal normalization failed'
+      );
       return false;
     }
 
@@ -335,7 +334,9 @@ class NotificationQueue {
     }
 
     if (this.startupSummaryInProgress) {
-      logger.info('NotificationQueue: startup summary already in progress, skipping duplicate batch');
+      logger.info(
+        'NotificationQueue: startup summary already in progress, skipping duplicate batch'
+      );
       return false;
     }
 
@@ -648,9 +649,16 @@ class NotificationQueue {
 
         for (const batch of pending) {
           try {
-            this.enqueueRootCandleOpenBatch(batch.signals, batch.tf, batch.isStartupPhase);
+            this.enqueueRootCandleOpenBatch(
+              batch.signals,
+              batch.tf,
+              batch.isStartupPhase
+            );
           } catch (err) {
-            logger.error({ err, batch }, 'NotificationQueue: failed to flush deferred root candle open batch');
+            logger.error(
+              { err, batch },
+              'NotificationQueue: failed to flush deferred root candle open batch'
+            );
           }
         }
       }
@@ -690,7 +698,14 @@ class NotificationQueue {
 
     logger.info({ count: signals.length }, 'NotificationQueue: starting startup batch flow');
 
-    await telegram.sendStartupSummary({ snapshot: signals });
+    if (typeof telegram.sendStartupSummary === 'function') {
+      await telegram.sendStartupSummary({ snapshot: signals });
+    } else {
+      logger.warn(
+        { count: signals.length },
+        'NotificationQueue: telegram.sendStartupSummary is not available'
+      );
+    }
 
     logger.info('NotificationQueue: startup batch flow completed');
   }
@@ -702,7 +717,14 @@ class NotificationQueue {
 
     logger.info({ count: signals.length }, 'NotificationQueue: starting root candle batch flow');
 
-    await telegram.sendRootCandleSummary({ snapshot: signals });
+    if (typeof telegram.sendRootCandleSummary === 'function') {
+      await telegram.sendRootCandleSummary({ snapshot: signals });
+    } else {
+      logger.warn(
+        { count: signals.length },
+        'NotificationQueue: telegram.sendRootCandleSummary is not available'
+      );
+    }
 
     logger.info('NotificationQueue: root candle batch flow completed');
   }
@@ -726,12 +748,137 @@ class NotificationQueue {
       } catch (err) {
         logger.error(
           { err, tf, count: signals.length },
-          'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch flow failed'
+          'NotificationQueue: ⚠️ CRITICAL - root TF candle-open batch flow failed'
         );
         throw err;
       }
-    } else if (typeof telegram.sendSummaryBlock === 'function') {
+      return;
+    }
+
+    if (typeof telegram.sendSummaryBlock === 'function') {
       try {
         await telegram.sendSummaryBlock({
           snapshot: signals,
-          title: tf ? `🕔 New Root Candle Open (${
+          title: tf
+            ? `🕔 New Root Candle Open (${String(tf)})`
+            : '🕔 New Root Candle Open',
+          tf
+        });
+      } catch (err) {
+        logger.error(
+          { err, tf, count: signals.length },
+          'NotificationQueue: ⚠️ CRITICAL - summary block fallback failed'
+        );
+        throw err;
+      }
+      return;
+    }
+
+    logger.warn(
+      { tf, count: signals.length },
+      'NotificationQueue: no root-candle open summary sender available'
+    );
+  }
+
+  async _processRealtimeSignal(signal) {
+    const telegram = require('./telegram');
+    telegram.init();
+
+    logger.info(
+      { signalId: getSignalId(signal), symbol: signal && signal.symbol },
+      'NotificationQueue: processing realtime signal'
+    );
+
+    if (typeof telegram.sendSignal === 'function') {
+      await telegram.sendSignal({ signal });
+      return;
+    }
+
+    if (typeof telegram.sendRealtimeSignal === 'function') {
+      await telegram.sendRealtimeSignal({ signal });
+      return;
+    }
+
+    logger.warn(
+      { signalId: getSignalId(signal) },
+      'NotificationQueue: no realtime signal sender available'
+    );
+  }
+
+  async _processMtfAlignment(signal) {
+    const telegram = require('./telegram');
+    telegram.init();
+
+    logger.info(
+      { signalId: getSignalId(signal), symbol: signal && signal.symbol },
+      'NotificationQueue: processing MTF alignment signal'
+    );
+
+    if (typeof telegram.sendMtfAlignment === 'function') {
+      await telegram.sendMtfAlignment({ signal });
+      return;
+    }
+
+    if (typeof telegram.sendSignal === 'function') {
+      await telegram.sendSignal({ signal, context: 'mtf_alignment' });
+      return;
+    }
+
+    logger.warn(
+      { signalId: getSignalId(signal) },
+      'NotificationQueue: no MTF alignment sender available'
+    );
+  }
+
+  async _processMidCandleUpdate(signal) {
+    const telegram = require('./telegram');
+    telegram.init();
+
+    logger.info(
+      { signalId: getSignalId(signal), symbol: signal && signal.symbol },
+      'NotificationQueue: processing mid-candle update'
+    );
+
+    if (typeof telegram.sendMidCandleUpdate === 'function') {
+      await telegram.sendMidCandleUpdate({ signal });
+      return;
+    }
+
+    if (typeof telegram.sendSignal === 'function') {
+      await telegram.sendSignal({ signal, context: 'midcandle_update' });
+      return;
+    }
+
+    logger.warn(
+      { signalId: getSignalId(signal) },
+      'NotificationQueue: no mid-candle sender available'
+    );
+  }
+
+  async _processCandleUpdate(signal) {
+    const telegram = require('./telegram');
+    telegram.init();
+
+    logger.info(
+      { signalId: getSignalId(signal), symbol: signal && signal.symbol },
+      'NotificationQueue: processing candle update'
+    );
+
+    if (typeof telegram.sendCandleUpdate === 'function') {
+      await telegram.sendCandleUpdate({ signal });
+      return;
+    }
+
+    if (typeof telegram.sendSignal === 'function') {
+      await telegram.sendSignal({ signal, context: 'candle_update' });
+      return;
+    }
+
+    logger.warn(
+      { signalId: getSignalId(signal) },
+      'NotificationQueue: no candle update sender available'
+    );
+  }
+}
+
+module.exports = new NotificationQueue();
