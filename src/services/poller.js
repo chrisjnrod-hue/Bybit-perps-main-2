@@ -15,22 +15,33 @@ const limiter = new Bottleneck({
   minTime: 50
 });
 
-const SEED_CONCURRENCY = Number(
-  config.SEED_CONCURRENCY || 6
-);
-
+const SEED_CONCURRENCY = Number(config.SEED_CONCURRENCY || 6);
 const FIVE_MINUTES_MS = 5 * 60 * 1000;
 
 let isRunning = false;
 let startupComplete = false;
 let boundaryScanInProgress = false;
 
+// Signal de-dupe registry used across root TF and MTF alignment flows.
+// Key format: symbol|root_tf|candle_open_time|signal_family
 const processedEventKeys = new Map();
+
+// Startup batch dedupe tracker
 const startupBatchSignalKeys = new Map();
+
+// REST fallback cooldowns
 const restFallbackCooldowns = new Map();
+
+// Root TF state tracking
 const rootTfBoundaryStates = new Map();
+
+// MTF alignment alert tracking
 const mtfAlignmentStates = new Map();
+
+// In-memory fallback state cache
 const inMemoryStateCache = new Map();
+
+// MACD flip dedupe tracker
 const macdFlipTracker = new Map();
 
 let lastDbConnectivityCheck = Date.now();
@@ -38,6 +49,10 @@ let dbIsHealthy = true;
 
 const consecutive1dTradeCounts = new Map();
 let keepaliveIntervalHandle = null;
+
+// ============================================================
+// DB SAFETY GUARDS
+// ============================================================
 
 function isDbReady() {
   if (!dbModule || typeof dbModule.get !== 'function') {
@@ -101,10 +116,7 @@ async function ensureDbReady(maxRetries = 3, backoffMs = 500) {
     db = safeGetDb();
 
     if (db) {
-      logger.info(
-        { attempt },
-        'poller: database reconnected successfully'
-      );
+      logger.info({ attempt }, 'poller: database reconnected successfully');
       dbIsHealthy = true;
       return db;
     }
@@ -121,6 +133,7 @@ async function ensureDbReady(maxRetries = 3, backoffMs = 500) {
     { maxRetries },
     'poller: database connection failed after all reconnection attempts'
   );
+
   dbIsHealthy = false;
   return null;
 }
@@ -230,6 +243,10 @@ function safeDeleteState(key) {
   }
 }
 
+// ============================================================
+// UTILITIES
+// ============================================================
+
 function sleep(ms) {
   return new Promise((resolve) => {
     setTimeout(resolve, ms || 0);
@@ -308,6 +325,7 @@ function buildRootTfTradePriorityOrder() {
 
 function sortByRootTfPriority(signals) {
   const priority = buildRootTfTradePriorityOrder();
+
   return [...signals].sort((a, b) => {
     const aTf = normalizeRootTf(a?.root_tf);
     const bTf = normalizeRootTf(b?.root_tf);
@@ -403,6 +421,32 @@ function buildEventId(type, symbol, timeframe, candleOpenTime) {
   ].join(':');
 }
 
+// Hardened identity builder. This avoids duplicate false positives
+// when one flow has an eventId and another flows only have candle/open metadata.
+function buildSignalIdentity(signal, family = 'generic') {
+  if (!signal || !signal.symbol || !signal.root_tf) {
+    return null;
+  }
+
+  const symbol = String(signal.symbol).toUpperCase();
+  const rootTf = normalizeRootTf(signal.root_tf);
+  const eventId = signal.eventId ? String(signal.eventId).trim() : null;
+  const candleOpen = Number(
+    signal.candle_open_time ??
+    signal.candleOpenTime ??
+    signal.detected_at ??
+    0
+  );
+
+  const effectiveCandle = Number.isFinite(candleOpen) ? candleOpen : 0;
+
+  if (eventId) {
+    return `${symbol}|${rootTf}|event:${eventId}|${String(family).toLowerCase()}`;
+  }
+
+  return `${symbol}|${rootTf}|${effectiveCandle}|${String(family).toLowerCase()}`;
+}
+
 function startupBatchKeyFromSignal(signal) {
   if (!signal || !signal.symbol || !signal.root_tf) {
     return null;
@@ -410,6 +454,7 @@ function startupBatchKeyFromSignal(signal) {
 
   const symbol = String(signal.symbol).toUpperCase();
   const rootTf = normalizeRootTf(signal.root_tf);
+  const eventId = signal.eventId ? String(signal.eventId).trim() : null;
   const candleOpenTime = Number(
     signal.candle_open_time ??
     signal.candleOpenTime ??
@@ -418,27 +463,16 @@ function startupBatchKeyFromSignal(signal) {
   );
 
   const effectiveCandle = Number.isFinite(candleOpenTime) ? candleOpenTime : 0;
+
+  if (eventId) {
+    return `${symbol}|${rootTf}|event:${eventId}`;
+  }
 
   return `${symbol}|${rootTf}|${effectiveCandle}`;
 }
 
 function dedupKeyFromSignal(signal, family = 'generic') {
-  if (!signal || !signal.symbol || !signal.root_tf) {
-    return null;
-  }
-
-  const symbol = String(signal.symbol).toUpperCase();
-  const rootTf = normalizeRootTf(signal.root_tf);
-  const candleOpenTime = Number(
-    signal.candle_open_time ??
-    signal.candleOpenTime ??
-    signal.detected_at ??
-    0
-  );
-
-  const effectiveCandle = Number.isFinite(candleOpenTime) ? candleOpenTime : 0;
-
-  return `${symbol}|${rootTf}|${effectiveCandle}|${String(family).toLowerCase()}`;
+  return buildSignalIdentity(signal, family);
 }
 
 function alreadyProcessedSignal(signal, family = 'generic') {
@@ -611,6 +645,8 @@ function clearExpiredProcessedSignalKeys(ttlMs = 60 * 60 * 1000) {
   cleanupRestFallbackCooldowns(10 * 60 * 1000);
   cleanupInMemoryStateCache(2 * 60 * 60 * 1000);
   cleanupMacdFlipTracker(60 * 60 * 1000);
+
+  return true;
 }
 
 function registerStartupBatchSignal(signal, family = 'generic') {
@@ -644,12 +680,11 @@ function registerStartupBatchSignal(signal, family = 'generic') {
       'rootcandle_update',
       'mtf_alignment'
     ];
+
     for (const fam of families) {
-      startupBatchSignalKeys.set(
-        `${symbol}|${rootTf}|${effectiveCandle}|${fam}`,
-        { firedAt: Date.now() }
-      );
-      processedEventKeys.set(`${symbol}|${rootTf}|${effectiveCandle}|${fam}`, Date.now());
+      const derivedKey = `${symbol}|${rootTf}|${effectiveCandle}|${fam}`;
+      startupBatchSignalKeys.set(derivedKey, { firedAt: Date.now() });
+      processedEventKeys.set(derivedKey, Date.now());
     }
   }
 }
@@ -731,6 +766,10 @@ function startKeepAliveLoop() {
   logger.info({ url, intervalMs }, 'poller.keepalive: started');
 }
 
+// ============================================================
+// LIQUIDITY GATES
+// ============================================================
+
 async function checkRealtimeLiquidity(symbol, options = {}) {
   if (!config.LIQUIDITY_CHECK_ENABLED) {
     return { ok: true, depthUsdt: Infinity, computedMinDepth: 0 };
@@ -800,14 +839,21 @@ async function passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd = 0
       accountEquityUsd
     });
 
-    const liqRes = await checkRealtimeLiquidity(symbol, { accountEquityUsd, depthMultiplierOverride: undefined });
+    const liqRes = await checkRealtimeLiquidity(symbol, {
+      accountEquityUsd,
+      depthMultiplierOverride: undefined
+    });
 
     const passDepth = typeof liqRes.ok === 'boolean' ? liqRes.ok : false;
 
     const vol24h = Number(mdata?.volume_24h_usdt || 0);
     const pass24h = vol24h >= min24hVolume;
 
-    const volChangePct = (mdata && typeof mdata.volume_change_pct !== 'undefined') ? Number(mdata.volume_change_pct) : null;
+    const volChangePct =
+      mdata && typeof mdata.volume_change_pct !== 'undefined'
+        ? Number(mdata.volume_change_pct)
+        : null;
+
     const minVolChangePct = Number(config.MIN_24H_VOLUME_CHANGE_PCT ?? -1000);
     const passVolChange = volChangePct === null ? true : (volChangePct >= minVolChangePct);
 
@@ -834,6 +880,10 @@ async function passesCompositeLiquidityVolumeGate(symbol, { accountEquityUsd = 0
     return { ok: true, details: { error: err && err.message } };
   }
 }
+
+// ============================================================
+// MTF VALIDATION
+// ============================================================
 
 async function validateMtfAlignmentConsensus(symbol) {
   const alignment = await signalManager.evaluateMtfAlignment(symbol);
@@ -914,6 +964,10 @@ function shouldFireMtfAlignmentAlert(symbol, tf, mtfValidation) {
   return false;
 }
 
+// ============================================================
+// WS LISTENERS
+// ============================================================
+
 function registerBybitWsListeners() {
   if (!bybitWs || typeof bybitWs.on !== 'function') {
     return;
@@ -960,14 +1014,7 @@ function registerBybitWsListeners() {
       const processedOpen = Number(safeGetState(processedStateKey) || 0);
 
       logger.debug(
-        {
-          symbol,
-          tf,
-          openTime,
-          processedOpen,
-          processedStateKey,
-          isNewer: openTime > processedOpen
-        },
+        { symbol, tf, openTime, processedOpen, processedStateKey, isNewer: openTime > processedOpen },
         'poller.ws: root candle candidate gate'
       );
 
@@ -975,10 +1022,7 @@ function registerBybitWsListeners() {
         const flip = await macdUtil.isMacdFlip(symbol, tf);
 
         if (flip) {
-          logger.info(
-            { symbol, tf, openTime },
-            'poller.ws: MACD flip detected'
-          );
+          logger.info({ symbol, tf, openTime }, 'poller.ws: MACD flip detected');
 
           const mtfValidation = await validateMtfAlignmentConsensus(symbol);
 
@@ -1053,25 +1097,24 @@ function registerBybitWsListeners() {
             );
           }
         }
+
         safeSetState(processedStateKey, openTime);
       }
     } catch (err) {
-      logger.debug(
-        { err },
-        'poller.ws: ws kline event failed'
-      );
+      logger.debug({ err }, 'poller.ws: ws kline event failed');
     }
   });
 }
+
+// ============================================================
+// DB HEALTH LOOP
+// ============================================================
 
 function startDbHealthCheckLoop() {
   setImmediate(() => {
     this.runDbHealthCheckLoop()
       .catch((err) => {
-        logger.error(
-          { err },
-          'poller: DB health check loop crashed'
-        );
+        logger.error({ err }, 'poller: DB health check loop crashed');
       });
   });
 }
@@ -1090,20 +1133,20 @@ async function runDbHealthCheckLoop() {
     const isCurrentlyHealthy = isDbReady();
 
     if (!isCurrentlyHealthy && wasHealthy) {
-      logger.error(
-        'poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache'
-      );
+      logger.error('poller: ⚠️  DATABASE CONNECTION LOST - switching to in-memory cache');
       dbIsHealthy = false;
     } else if (isCurrentlyHealthy && !wasHealthy) {
-      logger.info(
-        'poller: ✅ DATABASE CONNECTION RESTORED'
-      );
+      logger.info('poller: ✅ DATABASE CONNECTION RESTORED');
       dbIsHealthy = true;
     }
 
     lastDbConnectivityCheck = Date.now();
   }
 }
+
+// ============================================================
+// ROOT SIGNAL SUMMARY HELPERS
+// ============================================================
 
 function normalizeRootSignalDecision(signal) {
   const metaDecision = signal?.meta?.decision;
@@ -1183,6 +1226,10 @@ function buildRootSignalRecommendationBlock(actionType, signals, reason, recomme
   };
 }
 
+// ============================================================
+// MODULE EXPORTS
+// ============================================================
+
 module.exports = {
   start() {
     if (isRunning) {
@@ -1252,10 +1299,7 @@ module.exports = {
       try {
         const wsTimeoutMs = config.WS_INITIAL_SCAN_TIMEOUT || 10000;
 
-        logger.info(
-          { timeoutMs: wsTimeoutMs },
-          'poller: attempting WS initial scan'
-        );
+        logger.info({ timeoutMs: wsTimeoutMs }, 'poller: attempting WS initial scan');
 
         allSymbols = await Promise.race([
           this.performWsInitialScan(),
@@ -1326,10 +1370,7 @@ module.exports = {
 
       insertMany(validSymbols);
 
-      logger.info(
-        { total: validSymbols.length },
-        'poller.initialScan: symbols persisted'
-      );
+      logger.info({ total: validSymbols.length }, 'poller.initialScan: symbols persisted');
 
       if (bybitWs && typeof bybitWs.start === 'function' && bybitWs.isEnabled()) {
         try {
@@ -1448,7 +1489,6 @@ module.exports = {
         : (Array.isArray(config.ROOT_TFS) ? config.ROOT_TFS : buildRootTfs());
 
       const mtfTfs = Array.isArray(config.MTF_TFS) ? config.MTF_TFS.map(String) : [];
-
       const timeframes = Array.from(new Set([...rootTfs, ...mtfTfs]));
 
       for (const tf of timeframes) {
@@ -1780,6 +1820,7 @@ module.exports = {
 
         if (!rows || rows.length < 2) {
           logger.debug({ symbol, tf }, 'scanSymbolRoots: insufficient klines; seeding');
+
           await this.seedKlinesForSymbol(symbol, tf);
           rows = selectStatement.all(symbol, tf);
 
@@ -2267,6 +2308,7 @@ module.exports = {
 
           if (flip) {
             logger.info({ symbol, tf, latestOpen }, 'poller: MACD flip detected');
+
             macdFlipTracker.set(flipKey, { firedAt: Date.now() });
 
             const mtfValidation = await validateMtfAlignmentConsensus(symbol);
@@ -2518,7 +2560,6 @@ module.exports = {
               }
             }
           }
-
         } catch (err) {
           logger.debug({ err, symbol, tf }, 'poller: error evaluating fast-path candidate');
         }
@@ -2562,10 +2603,7 @@ module.exports = {
 
       if (allBoundarySignals.length > 0) {
         logger.info(
-          {
-            count: allBoundarySignals.length,
-            timeframes: tfsToProcess
-          },
+          { count: allBoundarySignals.length, timeframes: tfsToProcess },
           'poller: enqueueing root TF candle open batch notifications'
         );
 
