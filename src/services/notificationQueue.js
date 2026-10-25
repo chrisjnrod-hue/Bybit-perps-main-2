@@ -64,13 +64,15 @@ function getSignalId(signal) {
     signal.detected_at !== undefined &&
     signal.detected_at !== null
       ? Number(signal.detected_at)
-      : Date.now();
+      : 0;
 
   return [signal.symbol, signal.root_tf, detectedValue, type].join('_');
 }
 
 function resolveQueueItemType(type, signal = null) {
-  const rawType = String(type || '').trim().toLowerCase();
+  const rawType = String(type || '')
+    .trim()
+    .toLowerCase();
 
   const aliasMap = {
     'new_root_candle_open': 'root_candle_open_batch',
@@ -95,7 +97,9 @@ function resolveQueueItemType(type, signal = null) {
   }
 
   if (!rawType) {
-    const notificationType = String(getNotificationType(signal) || '').trim().toLowerCase();
+    const notificationType = String(getNotificationType(signal) || '')
+      .trim()
+      .toLowerCase();
 
     const signalMap = {
       'new_root_candle_open': 'root_candle_open_batch',
@@ -187,8 +191,11 @@ class NotificationQueue {
 
     const signalId = getSignalId(signal);
 
+    // CRITICAL FIX:
+    // Missing signalId means the signal is not dedupable yet.
+    // It must NOT be treated as "already known".
     if (!signalId) {
-      return true;
+      return false;
     }
 
     return (
@@ -265,7 +272,10 @@ class NotificationQueue {
       return false;
     }
 
-    const normalized = this.normalizeSignal(signal, type === 'realtime' ? null : type);
+    const normalized = this.normalizeSignal(
+      signal,
+      type === 'realtime' ? null : type
+    );
 
     if (!normalized) {
       logger.warn({ signal, type }, 'NotificationQueue: signal normalization failed');
@@ -379,7 +389,11 @@ class NotificationQueue {
 
       const signalId = getSignalId(signalWithType);
 
-      if (!signalId || reservedIds.has(signalId)) {
+      if (
+        !signalId ||
+        reservedIds.has(signalId) ||
+        this.isKnownSignal(signalWithType)
+      ) {
         logger.debug({
           signalId,
           tf,
@@ -448,7 +462,11 @@ class NotificationQueue {
 
       const signalId = getSignalId(normalized);
 
-      if (!signalId || reservedIds.has(signalId) || this.isKnownSignal(normalized)) {
+      if (
+        !signalId ||
+        reservedIds.has(signalId) ||
+        this.isKnownSignal(normalized)
+      ) {
         logger.debug({
           signalId,
           notificationType: normalized.notificationType
@@ -616,7 +634,10 @@ class NotificationQueue {
       this.rootCandleSummaryInProgress = false;
       this.state = QUEUE_STATE.IDLE;
 
-      if (Array.isArray(this.pendingRootCandleOpenBatches) && this.pendingRootCandleOpenBatches.length > 0) {
+      if (
+        Array.isArray(this.pendingRootCandleOpenBatches) &&
+        this.pendingRootCandleOpenBatches.length > 0
+      ) {
         const pending = [...this.pendingRootCandleOpenBatches];
         this.pendingRootCandleOpenBatches = [];
 
@@ -696,122 +717,21 @@ class NotificationQueue {
       'NotificationQueue: starting root TF candle-open batch flow'
     );
 
-    if (typeof telegram.sendRootCandleOpenSummary !== 'function') {
-      logger.error(
-        { tf, count: signals.length },
-        'NotificationQueue: ⚠️  CRITICAL - missing telegram.sendRootCandleOpenSummary; aborting root TF candle-open dispatch'
-      );
-      throw new Error('telegram.sendRootCandleOpenSummary is not available');
-    }
-
-    try {
-      await telegram.sendRootCandleOpenSummary({
-        snapshot: signals,
-        tf
-      });
-    } catch (err) {
-      logger.error(
-        { err, tf, count: signals.length },
-        'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch flow failed'
-      );
-      throw err;
-    }
-
-    logger.info(
-      { tf, count: signals.length },
-      'NotificationQueue: root TF candle-open batch flow completed successfully'
-    );
-  }
-
-  async _processRealtimeSignal(signal) {
-    const telegram = require('./telegram');
-
-    telegram.init();
-
-    logger.debug({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: sending realtime signal block');
-
-    await telegram.sendNewSignalSingleBlock(signal);
-
-    logger.info({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: realtime signal block sent');
-  }
-
-  async _processMtfAlignment(signal) {
-    const telegram = require('./telegram');
-
-    telegram.init();
-
-    logger.debug({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      eventId: signal.eventId,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: sending MTF alignment alert');
-
-    await telegram.sendMtfAlignmentAlert(signal);
-
-    logger.info({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      eventId: signal.eventId,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: MTF alignment alert sent');
-  }
-
-  async _processMidCandleUpdate(signal) {
-    const telegram = require('./telegram');
-
-    telegram.init();
-
-    logger.debug({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: sending mid-candle update block');
-
-    await telegram.sendMidCandleUpdateBlock(signal);
-
-    logger.info({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf,
-      notificationType: signal.notificationType
-    }, 'NotificationQueue: mid-candle update block sent');
-  }
-
-  async _processCandleUpdate(signal) {
-    logger.info({
-      symbol: signal.symbol,
-      root_tf: signal.root_tf
-    }, 'NotificationQueue: candle update not implemented');
-  }
-
-  getStatus() {
-    return {
-      state: this.state,
-      processing: this.processing,
-      queueLength: this.queue.length,
-      startupInProgress: this.startupSummaryInProgress,
-      rootCandleInProgress: this.rootCandleSummaryInProgress,
-      pendingRootCandleOpenBatches: this.pendingRootCandleOpenBatches.length,
-      sentSignalCount: this.sentSignalIds.size,
-      pendingSignalCount: this.pendingSignalIds.size
-    };
-  }
-
-  resetSentSignals() {
-    this.sentSignalIds.clear();
-    this.pendingSignalIds.clear();
-    this.sentSignalTimestamps.clear();
-
-    logger.info('NotificationQueue: signal caches cleared');
-  }
-}
-
-module.exports = new NotificationQueue();
+    if (typeof telegram.sendRootCandleOpenSummary === 'function') {
+      try {
+        await telegram.sendRootCandleOpenSummary({
+          snapshot: signals,
+          tf
+        });
+      } catch (err) {
+        logger.error(
+          { err, tf, count: signals.length },
+          'NotificationQueue: ⚠️  CRITICAL - root TF candle-open batch flow failed'
+        );
+        throw err;
+      }
+    } else if (typeof telegram.sendSummaryBlock === 'function') {
+      try {
+        await telegram.sendSummaryBlock({
+          snapshot: signals,
+          title: tf ? `🕔 New Root Candle Open (${
